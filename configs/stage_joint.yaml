@@ -1,0 +1,7 @@
+training:
+  stage: joint
+  epochs: 20
+  learning_rate: 0.00002
+  output_dir: runs/joint
+  init_checkpoint: runs/diffusion/diffusion_epoch_0079.pt
+

@@ -1,0 +1,252 @@
+# GeoDiff-GAN
+
+Research implementation of prompt-guided 4x super-resolution for Sentinel-2 L2A RGB imagery.
+The primary experiment synthesizes 40 m low-resolution observations from native 10 m B4/B3/B2
+surface reflectance and reconstructs the 10 m target.
+
+New to the subject? Follow the sequential [GeoDiff-GAN learning course](learning/README.md). It
+starts with the mathematical, PyTorch, remote-sensing, GAN, and diffusion prerequisites before
+deriving this repository's architecture, training stages, diagnostics, and research methodology.
+
+![GeoDiff-GAN architecture](docs/images/geodiff-gan-architecture.png)
+
+Input/output and tensor-shape explainers:
+
+![GeoDiff-GAN input and output](docs/images/geodiff-input-output-explainer-v2.png)
+
+![GeoDiff-GAN tensor shapes](docs/images/geodiff-tensor-shapes.png)
+
+## Run on Kaggle
+
+Import [the Kaggle notebook](kaggle/GeoDiff_GAN_Kaggle.ipynb), enable Internet and a GPU
+accelerator, and attach a dataset containing extracted Sentinel-2 L2A `.SAFE` directories. The
+notebook clones this repository, installs it without replacing Kaggle's CUDA PyTorch, prepares
+patches, optionally runs Qwen3-VL-8B captioning, trains all selected stages, and exports metrics and
+checkpoints.
+
+After creating your GitHub repository, replace `OWNER` in the notebook's `REPOSITORY_URL` cell with
+your GitHub username or organization.
+
+The notebook defaults to `FAST_DEV_RUN = True`. This verifies the complete pipeline with a compact
+model and one epoch per stage; it is not a research result. Set it to `False` for the full
+architecture and paper-scale epoch schedule.
+
+## Model
+
+```text
+LR RGB
+  +--> compact SwinIR base --------------------------+
+  |                                                  |
+  +--> LR encoder --> latent residual diffusion      |
+                         |                            |
+                    GeoMapper                        |
+              (spatial content, FiLM, gate)          |
+                         |                            |
+                 residual GAN decoder ---------------+
+                         |
+          high-pass + sensor back-projection (SR)
+             or soft consistency projection (edit)
+```
+
+`sr` mode restricts generation to high-frequency residuals and applies three consistency
+projections. `edit` mode permits full-band prompt-guided residuals, applies only a soft projection,
+and writes `"synthetic_edit": true` to the output JSON.
+
+The implementation includes:
+
+- SwinIR-style base branch with six shifted-window blocks and 4x pixel shuffle.
+- Residual VAE with a four-channel latent at one-eighth HR resolution.
+- Conditional `v`-prediction U-Net with LR, degradation, mode, and text conditioning.
+- Four-block GeoMapper with a spatial prompt-evidence gate and per-stage FiLM styles.
+- Four-stage residual decoder and spatial plus Haar-wavelet discriminators.
+- Differentiable MTF degradation and iterative LR consistency projection.
+- Tile-level train/validation/test isolation, SCL cloud filtering, and windowed SAFE processing.
+- Five-stage training, DDP, AMP, gradient accumulation, checkpoint transfer, and uncertainty runs.
+
+## Installation
+
+```bash
+cd geodiff_gan
+pip install -e ".[geo]"
+```
+
+Captioning and optional perceptual metrics use separate extras:
+
+```bash
+pip install -e ".[caption,metrics]"
+```
+
+Qwen3-VL captioning should run in a separate Kaggle session or before SR training. The 8B model is
+loaded in 4-bit mode and is never part of the trainable SR graph.
+
+## Prepare Sentinel-2 Data
+
+Download Sentinel-2 **L2A** `.SAFE` products from Copernicus Data Space. Use several geographically
+separated MGRS tiles and land-cover types.
+
+```bash
+geodiff-prepare \
+  --input /kaggle/input/sentinel-safe \
+  --output /kaggle/working/geodiff-data/patches \
+  --manifest /kaggle/working/geodiff-data/manifest.jsonl \
+  --patch-size 512 \
+  --stride 384 \
+  --minimum-valid-fraction 0.95
+```
+
+The command reads each large product by raster window. It does not load a whole state or complete
+110 km tile into RAM. B4/B3/B2 are scaled by 10,000; invalid, cloud, cloud-shadow, cirrus, snow,
+no-data, and saturated patches are rejected using SCL. Every extracted patch records its MGRS tile,
+window location, split, source, and licence identifier.
+
+All windows from one MGRS tile receive the same split. A study with only a few tiles is invalid:
+collect enough complete tiles to represent train, validation, and test geography.
+
+## Generate Qwen3-VL Captions
+
+```bash
+geodiff-caption \
+  --manifest /kaggle/working/geodiff-data/manifest.jsonl \
+  --output /kaggle/working/geodiff-data/captions.jsonl \
+  --model Qwen/Qwen3-VL-8B-Instruct \
+  --split train
+```
+
+The instruction requests structured evidence-only descriptions and excludes place names and
+coordinates. Captioning is resumable. Generate captions for validation and test as separate files
+or combine JSONL outputs after checking for duplicate patch keys.
+
+## Train
+
+Update the manifest and caption paths in `configs/default.yaml`. On two 16 GB GPUs, batch size 1
+per GPU and accumulation 8 produce an effective batch of 16:
+
+```bash
+torchrun --standalone --nproc_per_node=2 -m geodiff_gan.cli.train \
+  --config configs/default.yaml
+
+torchrun --standalone --nproc_per_node=2 -m geodiff_gan.cli.train \
+  --defaults configs/default.yaml --config configs/stage_vae.yaml
+
+torchrun --standalone --nproc_per_node=2 -m geodiff_gan.cli.train \
+  --defaults configs/default.yaml --config configs/stage_diffusion.yaml
+
+torchrun --standalone --nproc_per_node=2 -m geodiff_gan.cli.train \
+  --defaults configs/default.yaml --config configs/stage_joint.yaml
+
+torchrun --standalone --nproc_per_node=2 -m geodiff_gan.cli.train \
+  --defaults configs/default.yaml --config configs/stage_edit.yaml
+```
+
+Change each overlay's `init_checkpoint` if an epoch count changes. Use `resume` only to continue the
+same stage because it restores optimizer and discriminator state.
+
+Training stages:
+
+1. `base`: Charbonnier, SSIM, gradient, and sensor-consistency losses.
+2. `vae`: residual VAE plus clean-latent GeoMapper/decoder reconstruction.
+3. `diffusion`: SNR-weighted latent velocity prediction with the decoder frozen.
+4. `joint`: diffusion, mapper, decoder, perceptual, wavelet, consistency, and hinge-GAN losses.
+5. `edit`: counterfactual/mismatched prompt tuning with SigLIP image-text alignment and softer
+   consistency.
+
+The hash text encoder in `configs/smoke.yaml` is only for tests. Research runs must use the frozen
+SigLIP encoder from the default configuration.
+
+## Inference and Evaluation
+
+```bash
+geodiff-infer \
+  --config configs/default.yaml \
+  --checkpoint runs/joint/joint_epoch_0019.pt \
+  --input example_lr.png \
+  --output outputs/example_sr.png \
+  --mode sr --steps 20 --seed 7
+
+geodiff-infer \
+  --config configs/default.yaml \
+  --checkpoint runs/edit/edit_epoch_0009.pt \
+  --input example_lr.png \
+  --output outputs/example_edit.png \
+  --prompt "dense planned urban blocks with narrow roads" \
+  --mode edit --steps 20 --guidance 3.0 --seed 7
+```
+
+Evaluate eight stochastic samples and save per-pixel variance:
+
+```bash
+geodiff-evaluate \
+  --config configs/default.yaml \
+  --checkpoint runs/joint/joint_epoch_0019.pt \
+  --output outputs/test_metrics \
+  --split test --samples 8 --steps 20 --mode sr
+```
+
+PSNR, SSIM, edge F1, and LR re-degradation error are always reported. LPIPS and DISTS are added when
+the metrics extra is installed. Edit evaluation also reports frozen vision-language alignment.
+
+Generate the built-in bicubic and trained base-branch baselines:
+
+```bash
+geodiff-baselines \
+  --config configs/default.yaml \
+  --base-checkpoint runs/base/base_epoch_0019.pt \
+  --output outputs/baselines.json \
+  --split test
+```
+
+## Debug and Visual Diagnostics
+
+Export a shareable diagnostic folder for one validation or test patch:
+
+```bash
+geodiff-debug \
+  --config configs/default.yaml \
+  --checkpoint runs/joint/joint_epoch_0019.pt \
+  --output outputs/debug_patch_0 \
+  --split test \
+  --index 0 \
+  --mode sr \
+  --steps 20 \
+  --diffusion-every 5
+```
+
+The folder contains:
+
+- `overview.png`: LR, base, residual, output, target, re-degraded output, and error maps.
+- `features.png`: all LR feature scales, denoised latent, mapper content, and evidence gate.
+- `diffusion_trajectory.png`: selected noisy and predicted-clean latent states.
+- `report.json`: shapes, ranges, NaN/Inf counts, losses, gate saturation, residual strength, and
+  LR consistency before and after back-projection.
+- `summary.txt`: compact text output suitable for sharing during debugging.
+
+Training diagnostics are opt-in through the `debug` section of `configs/default.yaml`. Keep
+`enabled: false` for normal training. When enabled, the trainer writes one diagnostic directory at
+the configured interval without changing the loss graph.
+
+## Ablations and Scientific Use
+
+The following `model` switches can be changed without code edits:
+
+- `use_text_conditioning`
+- `use_degradation_conditioning`
+- `use_evidence_gate`
+- `use_back_projection`
+
+Run each ablation from the same parent checkpoint and seed set. Also compare bicubic, the trained
+base branch, an established SwinIR implementation, ESRGAN, diffusion without adversarial
+fine-tuning, and the joint model.
+
+Sentinel-2-only 40 m to 10 m experiments have a real 10 m target. A claimed 10 m to 2.5 m result
+requires independently acquired, accurately registered 2.5 m imagery. Prompt-edit outputs are
+conditional synthesis and must not be presented as observed ground truth.
+
+## Tests
+
+```bash
+$env:PYTHONPATH="src"  # PowerShell
+python -m unittest discover -s tests -v
+```
+
+The CPU suite checks model shapes, both inference modes, DDIM sampling, degradation/projection, and
+stable tile-level splitting.

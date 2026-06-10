@@ -1,0 +1,73 @@
+seed: 42
+
+model:
+  scale: 4
+  base_embed_dim: 60
+  base_depth: 6
+  base_heads: 6
+  window_size: 8
+  latent_channels: 4
+  vae_channels: 64
+  lr_channels: 64
+  diffusion_widths: [128, 256, 384, 512]
+  context_dim: 768
+  degradation_dim: 4
+  mapper_channels: 128
+  style_dim: 256
+  decoder_channels: [128, 96, 64, 48]
+  diffusion_steps: 1000
+  use_text_conditioning: true
+  use_degradation_conditioning: true
+  use_evidence_gate: true
+  use_back_projection: true
+
+data:
+  manifest: data/manifest.jsonl
+  captions: data/captions.jsonl
+
+text_encoder:
+  kind: siglip
+  model_name: google/siglip-base-patch16-224
+  max_tokens: 64
+
+prompts:
+  null_probability: 0.4
+  paraphrase_probability: 0.2
+  mismatch_probability: 0.1
+
+debug:
+  enabled: false
+  output_dir: runs/debug
+  every_n_steps: 100
+  print_tensor_stats: true
+  fail_on_nonfinite: true
+
+training:
+  stage: base
+  epochs: 20
+  batch_size: 1
+  gradient_accumulation: 8
+  learning_rate: 0.0001
+  discriminator_learning_rate: 0.0001
+  weight_decay: 0.0001
+  num_workers: 4
+  amp: true
+  gradient_checkpointing: true
+  gradient_clip: 1.0
+  discriminator_channels: 64
+  output_dir: runs/base
+  init_checkpoint: null
+  resume: null
+  loss_weights:
+    charbonnier: 1.0
+    consistency: 1.0
+    ssim: 0.2
+    gradient: 0.1
+    perceptual: 0.1
+    wavelet: 0.05
+    kl: 0.0001
+    vae_reconstruction: 1.0
+    diffusion: 1.0
+    prompt_alignment: 0.05
+    prompt_gate: 0.05
+    adversarial: 0.01

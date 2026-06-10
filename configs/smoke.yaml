@@ -1,0 +1,28 @@
+model:
+  scale: 4
+  base_embed_dim: 16
+  base_depth: 2
+  base_heads: 4
+  window_size: 4
+  latent_channels: 4
+  vae_channels: 8
+  lr_channels: 8
+  diffusion_widths: [16, 32, 48]
+  context_dim: 32
+  degradation_dim: 4
+  mapper_channels: 16
+  style_dim: 16
+  decoder_channels: [16, 12, 8, 8]
+  diffusion_steps: 20
+
+text_encoder:
+  kind: hash
+  context_dim: 32
+  max_tokens: 8
+
+training:
+  amp: false
+  gradient_checkpointing: false
+  discriminator_channels: 8
+  num_workers: 0
+

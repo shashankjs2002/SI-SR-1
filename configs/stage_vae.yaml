@@ -1,0 +1,6 @@
+training:
+  stage: vae
+  epochs: 20
+  output_dir: runs/vae
+  init_checkpoint: runs/base/base_epoch_0019.pt
+

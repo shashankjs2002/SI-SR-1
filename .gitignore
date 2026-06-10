@@ -1,0 +1,10 @@
+/data/
+runs/
+outputs/
+*.pt
+*.pth
+__pycache__/
+.pytest_cache/
+*.egg-info/
+tools/
+.codex_tmp/

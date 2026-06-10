@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "geodiff-gan"
+version = "0.1.0"
+description = "Prompt-guided diffusion-GAN super-resolution for Sentinel-2 RGB imagery"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.26",
+  "Pillow>=10",
+  "PyYAML>=6",
+  "torch>=2.2",
+]
+
+[project.optional-dependencies]
+geo = ["rasterio>=1.3"]
+caption = [
+  "accelerate>=0.30",
+  "bitsandbytes>=0.43; platform_system != 'Windows'",
+  "qwen-vl-utils>=0.0.8",
+  "transformers>=4.57",
+]
+metrics = ["lpips>=0.1.4", "DISTS-pytorch>=0.1"]
+dev = ["pytest>=8", "ruff>=0.5"]
+
+[project.scripts]
+geodiff-prepare = "geodiff_gan.cli.prepare_sentinel:main"
+geodiff-caption = "geodiff_gan.cli.caption_qwen:main"
+geodiff-train = "geodiff_gan.cli.train:main"
+geodiff-infer = "geodiff_gan.cli.infer:main"
+geodiff-evaluate = "geodiff_gan.cli.evaluate:main"
+geodiff-baselines = "geodiff_gan.cli.baselines:main"
+geodiff-debug = "geodiff_gan.cli.debug:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"

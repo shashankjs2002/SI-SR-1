@@ -1,0 +1,13 @@
+cff-version: 1.2.0
+message: "If you use GeoDiff-GAN, cite this software repository."
+title: "GeoDiff-GAN: Prompt-Guided Diffusion-GAN Satellite Super-Resolution"
+type: software
+version: 0.1.0
+date-released: 2026-06-10
+license: MIT
+keywords:
+  - satellite image super-resolution
+  - diffusion
+  - generative adversarial network
+  - Sentinel-2
+  - remote sensing

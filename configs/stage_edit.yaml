@@ -1,0 +1,12 @@
+training:
+  stage: edit
+  epochs: 10
+  learning_rate: 0.00001
+  output_dir: runs/edit
+  init_checkpoint: runs/joint/joint_epoch_0019.pt
+  loss_weights:
+    consistency: 0.2
+    prompt_alignment: 0.05
+    prompt_gate: 0.05
+    adversarial: 0.01
+

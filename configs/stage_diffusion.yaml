@@ -1,0 +1,6 @@
+training:
+  stage: diffusion
+  epochs: 80
+  output_dir: runs/diffusion
+  init_checkpoint: runs/vae/vae_epoch_0019.pt
+
