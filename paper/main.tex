@@ -1,0 +1,449 @@
+\documentclass[10pt]{article}
+
+\usepackage[a4paper,margin=15mm,top=14mm,bottom=15mm]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{array}
+\usepackage{booktabs}
+\usepackage{caption}
+\usepackage{enumitem}
+\usepackage{fancyhdr}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{microtype}
+\usepackage{multicol}
+\usepackage[numbers,sort&compress]{natbib}
+\usepackage{siunitx}
+\usepackage{xcolor}
+
+\graphicspath{{figures/}}
+\captionsetup{font=small,labelfont=bf,skip=3pt}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{3.2pt}
+\setlist[itemize]{leftmargin=5mm,itemsep=1pt,topsep=2pt}
+\setlist[enumerate]{leftmargin=6mm,itemsep=1pt,topsep=2pt}
+\renewcommand{\arraystretch}{1.08}
+
+\definecolor{geoblue}{HTML}{143A66}
+\definecolor{geogreen}{HTML}{2F855A}
+\definecolor{geopurple}{HTML}{6B46C1}
+\definecolor{geoorange}{HTML}{DD6B20}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=geoblue,
+  citecolor=geopurple,
+  urlcolor=geogreen,
+  pdftitle={GeoDiff-GAN: Evidence-Constrained Prompt-Guided Diffusion-GAN for Sentinel-2 Super-Resolution}
+}
+
+\pagestyle{fancy}
+\fancyhf{}
+\lhead{\small GeoDiff-GAN}
+\rhead{\small Method and Experimental Design Draft}
+\cfoot{\thepage}
+\setlength{\headheight}{12pt}
+
+\newcommand{\figblock}[4]{%
+  \begin{center}
+    \includegraphics[width=#2\linewidth,height=#3\textheight,keepaspectratio]{#1}
+    \captionof{figure}{#4}
+  \end{center}
+}
+\newcommand{\Dtheta}{\mathcal{D}_{\boldsymbol{\theta}}}
+\newcommand{\vect}[1]{\boldsymbol{#1}}
+
+\begin{document}
+
+% ---------------------------------------------------------------------------
+% PAGE 1
+% ---------------------------------------------------------------------------
+\begin{center}
+{\LARGE\bfseries\color{geoblue}
+GeoDiff-GAN: Evidence-Constrained Prompt-Guided\\
+Diffusion-GAN for Sentinel-2 Super-Resolution\par}
+\vspace{4pt}
+{\large Anonymous Author(s)}\\
+{\small Research implementation draft, June 2026}
+\end{center}
+
+\begin{abstract}
+Fourfold satellite image super-resolution is fundamentally ill posed: many native-resolution
+scenes can produce nearly identical low-resolution observations after optical blur, sampling,
+noise, and quantization. Deterministic models often suppress uncertain high-frequency detail,
+whereas adversarial and diffusion models can produce perceptually plausible but spatially
+unsupported structure. We propose \emph{GeoDiff-GAN}, a prompt-optional architecture for synthetic
+\SI{40}{m}-to-\SI{10}{m} Sentinel-2 L2A RGB super-resolution. The model decomposes reconstruction
+into a deterministic SwinIR-style base and a stochastic residual path. A degradation-conditioned
+latent diffusion model samples a compact residual representation; a GeoMapper converts it into
+spatial content, four layer-wise FiLM controls, and a prompt evidence gate; and a conditional
+adversarial decoder predicts only the residual. In evidence-constrained SR mode, the residual is
+high-pass filtered and the output undergoes iterative sensor back-projection. A separate edit mode
+permits stronger prompt influence but labels its output as synthetic. This first part of the
+manuscript defines the data model, architecture, training curriculum, and pre-registered
+evaluation. Quantitative claims are deferred until geographically separated tile-level
+experiments and ablations are complete.
+\end{abstract}
+
+\section{Introduction}
+Sentinel-2 provides multispectral Earth observation with \SI{10}{m} sampling for visible RGB
+bands and systematic global coverage \citep{drusch2012sentinel}. Increased apparent spatial
+resolution can support visualization and downstream analysis, but a fourfold inverse problem
+cannot uniquely recover unobserved sub-pixel structure. Existing Sentinel-2 super-resolution
+methods demonstrate that learned priors can improve reconstruction under controlled degradations
+\citep{lanaras2018super}; however, fidelity and perceptual realism remain competing objectives.
+
+GeoDiff-GAN addresses this tension by separating \emph{stable evidence} from \emph{uncertain
+detail}. The deterministic branch estimates geometry and broad reflectance, while diffusion and
+adversarial learning operate on a residual whose influence is constrained by LR features, a
+spatial gate, high-pass filtering, and re-degradation consistency.
+
+\textbf{Proposed contributions.}
+\begin{itemize}
+  \item A deterministic--stochastic residual decomposition for satellite SR.
+  \item A GeoMapper interface that emits spatial content, FiLM styles, and an evidence gate.
+  \item Mode-aware separation of evidence-constrained reconstruction from labeled synthesis.
+  \item Dual spatial and Haar-frequency adversarial supervision used only during training.
+  \item A tile-isolated evaluation protocol combining fidelity, perception, consistency,
+        uncertainty, and prompt behavior.
+\end{itemize}
+
+\figblock{geodiff-gan-architecture.png}{1.0}{0.285}{Overall GeoDiff-GAN architecture. The GAN
+discriminators affect training gradients but are absent at inference.}
+
+\clearpage
+
+% ---------------------------------------------------------------------------
+% PAGE 2
+% ---------------------------------------------------------------------------
+\section{Background and Problem Formulation}
+\subsection{Super-resolution priors}
+Transformer restoration networks such as SwinIR exploit shifted-window attention to obtain strong
+deterministic reconstructions \citep{liang2021swinir}. Perceptual GAN methods such as ESRGAN
+encourage natural high-frequency statistics \citep{wang2018esrgan}, but adversarial objectives do
+not by themselves guarantee agreement with the observed LR image. Diffusion models provide a
+tractable stochastic prior \citep{ho2020ddpm}; SR3 applies iterative refinement to conditional
+super-resolution \citep{saharia2021sr3}, while latent diffusion reduces computation by denoising a
+compressed representation \citep{rombach2022ldm}. GeoDiff-GAN assigns these model families
+different roles instead of asking one unrestricted generator to solve all objectives.
+
+\subsection{Observation model}
+Let $\vect{x}\in[0,1]^{3\times512\times512}$ be a native \SI{10}{m} RGB patch and
+$\vect{y}\in[0,1]^{3\times128\times128}$ its synthetic \SI{40}{m} observation:
+\begin{equation}
+  \vect{y} =
+  Q_{\theta_q}\!\left[
+    \downarrow_4\!\left(k_{\theta_b} * \vect{x}\right)
+    + \vect{n}_{P,\theta_p} + \vect{n}_{G,\theta_g}
+  \right]
+  = \Dtheta(\vect{x}) + \vect{n}.
+  \label{eq:observation}
+\end{equation}
+Here $k_{\theta_b}$ represents a randomized modulation-transfer/point-spread blur,
+$\downarrow_4$ is area downsampling, and $\vect{\theta}$ records blur, Gaussian noise, Poisson
+strength, and quantization. The task is to estimate a plausible $\hat{\vect{x}}$ while minimizing
+both HR error and the evidence discrepancy
+\begin{equation}
+ E_{\mathrm{LR}}=\left\|\Dtheta(\hat{\vect{x}})-\vect{y}_{\mathrm{clean}}\right\|_1.
+\end{equation}
+Because $\Dtheta$ removes high frequencies, low $E_{\mathrm{LR}}$ is necessary but not sufficient:
+different HR details may share the same LR projection.
+
+\figblock{geodiff-input-output-explainer-v2.png}{0.94}{0.235}{Input/output interpretation. The
+primary task uses synthetic \SI{40}{m} inputs generated from native \SI{10}{m} Sentinel-2 targets.}
+
+\figblock{degradation_operator.png}{0.94}{0.225}{Parameterized degradation used for training and
+evaluation. The recorded vector is supplied to the diffusion network.}
+
+\textbf{Two output policies.} SR mode is evaluated as reconstruction and must remain strongly
+consistent with the input. Edit mode is a prompt-conditioned visualization policy, not an
+observation of the ground truth. This distinction is encoded in the network and output metadata.
+
+\clearpage
+
+% ---------------------------------------------------------------------------
+% PAGE 3
+% ---------------------------------------------------------------------------
+\section{Data Construction and Training Targets}
+\subsection{Sentinel-2 patch extraction}
+Complete Sentinel-2 L2A SAFE products are read by raster window rather than loaded as full tiles.
+B4, B3, and B2 are scaled by $10{,}000$ to surface-reflectance-like RGB values. Scene
+Classification Layer masks reject no-data, defective pixels, cloud shadow, medium/high cloud,
+cirrus, snow/ice, non-finite values, zeros, and saturation. Each accepted HR patch is
+$512\times512$ with stride 384, corresponding to approximately
+\SI{5.12}{km}$ by \SI{5.12}{km}. The \SI{20}{m} SCL window is obtained by mapping the
+\SI{10}{m} RGB bounds into the SCL transform, preventing right/bottom out-of-range reads.
+
+An additional auditable filter detects zero-filled edge and corner background. Rejected files are
+moved to quarantine, the original manifest is preserved, and rejection fractions are recorded.
+This avoids silently training on padded tile borders while keeping every exclusion reversible.
+
+\subsection{Geographic isolation}
+All windows from an MGRS tile receive the same deterministic split. The intended allocation is
+approximately 70\% train, 15\% validation, and 15\% test, but percentages are reported at both tile
+and patch level. Adjacent or overlapping patches must never cross splits. A research-scale corpus
+targets 40,000--100,000 valid patches across urban, agricultural, forest, coast, desert, and
+mountain environments; one tile is accepted only for software smoke testing.
+
+\subsection{Residual target and captions}
+The base prediction is
+\begin{equation}
+  \vect{b}=B_{\psi}(\vect{y}), \qquad
+  \vect{r}^{*}=\vect{x}-\vect{b}.
+\end{equation}
+Diffusion learns the distribution of $\vect{r}^{*}$ rather than the complete RGB image. Optional
+captions are generated offline from HR patches using Qwen3-VL and stripped of coordinates and
+place names. During SR training, a frozen SigLIP text encoder \citep{zhai2023siglip} provides token
+context; Qwen is never loaded into the SR optimization graph.
+
+\figblock{geodiff-gan-training-pipeline.png}{1.0}{0.39}{Dataset preparation and the five-stage
+training curriculum. Each stage initializes from the preceding checkpoint.}
+
+\begin{table}[h]
+\centering
+\small
+\caption{Primary data and task specification.}
+\begin{tabular}{@{}ll@{}}
+\toprule
+Property & Specification\\
+\midrule
+Sensor/product & Sentinel-2 L2A, RGB B4/B3/B2\\
+Target/input & Native \SI{10}{m} HR / synthetic \SI{40}{m} LR\\
+Patch sizes & $3\times512\times512$ HR, $3\times128\times128$ LR\\
+Masking & SCL, finite/positive, saturation, edge quarantine\\
+Split unit & Complete geographically separated MGRS tile\\
+Prompt policy & null 40\%, paraphrased 20\%, mismatched 10\%\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\clearpage
+
+% ---------------------------------------------------------------------------
+% PAGE 4
+% ---------------------------------------------------------------------------
+\section{GeoDiff-GAN Architecture}
+\subsection{Deterministic base and residual VAE}
+The base branch follows a compact SwinIR design \citep{liang2021swinir}: a 60-channel embedding,
+six shifted-window residual blocks, two PixelShuffle $\times2$ stages, and a bicubic skip. Its
+purpose is conservative radiometric and geometric reconstruction. A VAE
+\citep{kingma2014autoencoding} encodes $\vect{r}^{*}$ into a four-channel
+$64\times64$ latent:
+\begin{equation}
+ q_{\phi}(\vect{z}_0|\vect{r}^{*})
+ =\mathcal{N}\!\left(\vect{\mu}_{\phi},
+ \operatorname{diag}(\exp \vect{\ell}_{\phi})\right).
+\end{equation}
+This $8\times$ spatial compression makes stochastic denoising substantially cheaper than operating
+at $512\times512$ RGB resolution.
+
+\subsection{Conditional latent diffusion}
+The LR encoder produces feature grids
+$f_{128},f_{64},f_{32},f_{16}$ with channels $64,128,256,256$. The latent and $f_{64}$ share a
+$64\times64$ grid. At timestep $t$,
+\begin{equation}
+ \vect{z}_t=\sqrt{\bar{\alpha}_t}\vect{z}_0+
+ \sqrt{1-\bar{\alpha}_t}\vect{\epsilon},
+ \quad
+ \vect{v}_t=\sqrt{\bar{\alpha}_t}\vect{\epsilon}
+ -\sqrt{1-\bar{\alpha}_t}\vect{z}_0 .
+\end{equation}
+The U-Net predicts $\hat{\vect{v}}$ from $[\vect{z}_t;f_{64}]$, timestep, degradation vector, mode
+token, and text context. Channel widths are $[128,256,384,512]$ with cross-attention at the
+intermediate scales. Classifier-free guidance can combine conditional and null predictions
+\citep{ho2022classifierfree}.
+
+\figblock{geodiff-tensor-shapes.png}{0.98}{0.25}{Major tensor dimensions through residual
+encoding, latent diffusion, GeoMapper, and residual decoding.}
+
+\subsection{GeoMapper and decoder}
+GeoMapper receives $[\hat{\vect{z}}_0;f_{64}]$ and returns
+\begin{equation}
+ (\vect{c},\{\vect{s}_i\}_{i=1}^{4},\vect{g})
+ =M_{\omega}(\hat{\vect{z}}_0,f_{64},\vect{e}_{text},m),
+\end{equation}
+where $\vect{c}\in\mathbb{R}^{128\times64\times64}$ is spatial content,
+$\vect{s}_i\in\mathbb{R}^{256}$ are four FiLM controls \citep{perez2018film}, and
+$\vect{g}\in[0,1]^{1\times64\times64}$ is the evidence gate. The residual decoder upsamples through
+64, 128, 256, and 512 grids with channels $[128,96,64,48]$, fusing LR skips and stage-specific
+styles before a three-channel $\tanh$ head.
+
+\figblock{geomapper_detail.png}{0.94}{0.205}{GeoMapper converts denoising-space features into
+location-specific content, prompt-sensitive gating, and stage-wise channel modulation.}
+
+\clearpage
+
+% ---------------------------------------------------------------------------
+% PAGE 5
+% ---------------------------------------------------------------------------
+\section{Evidence Control and Adversarial Learning}
+\subsection{Residual output controller}
+The decoder is not allowed to replace the complete HR image. In SR mode its raw residual
+$\vect{r}$ is high-pass filtered:
+\begin{equation}
+ \vect{r}_{\mathrm{SR}}=\vect{r}-G_{\sigma}*\vect{r},\qquad
+ \hat{\vect{x}}_0=\operatorname{clip}(\vect{b}+\vect{r}_{\mathrm{SR}},0,1).
+\end{equation}
+Three approximate back-projection steps then reduce clean LR discrepancy:
+\begin{equation}
+ \hat{\vect{x}}_{k+1}=
+ \operatorname{clip}\!\left[
+ \hat{\vect{x}}_{k}
+ \eta\,\uparrow_4
+ \left(\vect{y}_{\mathrm{clean}}-\Dtheta(\hat{\vect{x}}_k)\right)
+ \right],
+ \quad \eta=0.5.
+\end{equation}
+This is a soft evidence constraint, not a proof of unique recovery. In edit mode the full-band
+residual is retained, one smaller update uses $\eta=0.15$, and
+\texttt{synthetic\_edit=true} is written to metadata.
+
+\subsection{Dual conditional discriminators}
+Conditional PatchGANs \citep{isola2017image} receive an HR candidate concatenated with resized LR
+evidence at three scales. A second discriminator operates on concatenated Haar LH, HL, and HH
+bands plus an LR condition. Spectral-normalized convolutions produce local logits. With real
+scores $D(x)$ and fake scores $D(\hat{x})$,
+\begin{align}
+ L_D &= \mathbb{E}[\max(0,1-D(x))]
+      +\mathbb{E}[\max(0,1+D(\hat{x}))],\\
+ L_{\mathrm{adv}} &= -\mathbb{E}[D(\hat{x})].
+\end{align}
+The adversarial generator weight begins at 0.01 so that realism cannot dominate reconstruction and
+sensor consistency.
+
+\figblock{dual_discriminator.png}{0.96}{0.205}{Spatial and Haar-frequency adversarial pathways.
+Both are conditional on the observed LR image and used only during optimization.}
+
+\figblock{geodiff-gan-sr-vs-edit.png}{0.93}{0.235}{Different policies are enforced for
+reconstruction and prompt-guided synthesis. Edit-mode imagery must not be presented as measured
+ground truth.}
+
+\textbf{Spatial-conservation mechanisms.} The model preserves evidence through the deterministic
+base, aligned LR features, residual prediction, high-pass control, degradation conditioning,
+back-projection, and conditional discriminators. Nevertheless, the inverse remains non-unique,
+learned skips may be underused, and the synthetic degradation may differ from a real sensor
+pipeline. Claims are therefore restricted to controlled synthetic \SI{40}{m}-to-\SI{10}{m}
+experiments.
+
+\clearpage
+
+% ---------------------------------------------------------------------------
+% PAGE 6
+% ---------------------------------------------------------------------------
+\section{Five-Stage Optimization}
+End-to-end random initialization would create moving interfaces: the base changes the residual
+target, the VAE changes the latent distribution, the decoder changes the image-space meaning of
+latent error, and discriminators immediately penalize untrained outputs. Training is therefore
+staged.
+
+\begin{enumerate}
+  \item \textbf{Base:} train SwinIR using Charbonnier, SSIM \citep{wang2004ssim}, gradient, and
+        degradation-consistency losses.
+  \item \textbf{Residual representation:} train the VAE, LR encoder, GeoMapper, and decoder without
+        adversarial loss; monitor reconstruction, KL, wavelet error, and latent statistics.
+  \item \textbf{Diffusion:} freeze the decoder path and train SNR-weighted velocity prediction:
+        \begin{equation}
+          L_{\mathrm{diff}}=
+          \mathbb{E}_{t}\!\left[
+          w(t)\|\hat{\vect{v}}-\vect{v}_t\|_2^2\right].
+        \end{equation}
+  \item \textbf{Joint refinement:} train diffusion, LR encoder, GeoMapper, decoder, and separate
+        discriminators with reconstruction, perceptual, frequency, consistency, and low-weight
+        GAN objectives.
+  \item \textbf{Edit tuning:} adapt diffusion/mapper/decoder using prompt alignment and softer LR
+        consistency; do not use edit output for reconstruction metrics.
+\end{enumerate}
+
+The initial joint generator objective is
+\begin{equation}
+\begin{split}
+ L_G={}&1.0L_{\mathrm{char}}+1.0L_{\mathrm{cons}}
+ +0.2L_{\mathrm{SSIM}}+0.1L_{\mathrm{LPIPS}}\\
+ &+0.05L_{\mathrm{wavelet}}+0.05L_{\mathrm{prompt}}
+ +0.01L_{\mathrm{adv}},
+\end{split}
+\end{equation}
+where LPIPS is a learned perceptual distance \citep{zhang2018unreasonable}. Mixed precision,
+gradient checkpointing, batch size 1--2 per GPU, accumulation to effective batch 16, and DDP are
+used for the full model.
+
+\subsection{Prompt and mode conditioning}
+Offline captions describe observable land cover, objects, density, terrain, and texture. Forty
+percent of batches use a null prompt to retain unconditional SR competence; paraphrases reduce
+surface-form dependence; mismatches test whether spatial evidence can override incompatible text.
+The mode token scales prompt injection in GeoMapper and selects the output policy. This mechanism
+is a research hypothesis: matched/null/mismatched gate responses must be measured before claiming
+that the gate prevents hallucination.
+
+\figblock{conditioning_policy.png}{0.98}{0.225}{Prompt conditioning is optional in SR mode and
+explicitly stronger in edit mode. The two outputs are subject to different scientific claims.}
+
+\begin{table}[h]
+\centering
+\small
+\caption{Stage transition criteria used instead of epoch count alone.}
+\begin{tabular}{@{}p{28mm}p{112mm}@{}}
+\toprule
+Transition & Required evidence\\
+\midrule
+Base $\rightarrow$ VAE & stable validation fidelity, no radiometric or consistency failure\\
+VAE $\rightarrow$ diffusion & finite latent statistics, meaningful residual reconstruction\\
+Diffusion $\rightarrow$ joint & stable denoising loss and plausible decoded samples\\
+Joint $\rightarrow$ edit & adversarial texture without unacceptable LR-consistency loss\\
+Edit $\rightarrow$ final & measurable prompt effect, synthetic labels, documented failure cases\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\clearpage
+
+% ---------------------------------------------------------------------------
+% PAGE 7
+% ---------------------------------------------------------------------------
+\section{Experimental Protocol and Falsifiable Novelty}
+The proposed novelty is the \emph{specific evidence-controlled integration}, not the independent
+existence of SwinIR, VAEs, diffusion, FiLM, GANs, wavelets, or back-projection. Each claim is tied
+to a controlled ablation:
+\begin{itemize}
+  \item deterministic base versus unrestricted full-image generation;
+  \item complete GeoMapper versus direct decode, content-only, styles-only, and no-gate variants;
+  \item spatial GAN, wavelet GAN, both, and no adversarial supervision;
+  \item fixed degradation, randomized unconditioned degradation, conditioned degradation, and
+        conditioned degradation with back-projection;
+  \item shared versus mode-specific residual/projection policies.
+\end{itemize}
+
+Baselines are bicubic, SwinIR, ESRGAN, diffusion-only, and GAN-only residual models. All methods
+must use identical tile splits, RGB scaling, masks, degradation draws, metric implementations, and
+documented compute budgets. Eight stochastic samples per test patch yield a mean prediction and
+pixelwise variance. Metrics include PSNR, SSIM, LPIPS, DISTS
+\citep{ding2020dists}, tolerance-aware edge F1, and clean LR re-degradation error. Edit mode is
+evaluated with image--text alignment, realism, edit magnitude, localization, and LR consistency,
+not target PSNR for counterfactual prompts.
+
+Patches within a tile are correlated; therefore, the statistical unit for geographic claims is the
+held-out tile. Paired method differences, dispersion, confidence intervals, and the number of
+tiles will be reported. Separate analyses cover unseen cities, unseen MGRS tiles, land-cover
+groups, degradation severity, uncertainty calibration, and failure cases.
+
+\figblock{evaluation_protocol.png}{0.98}{0.215}{Pre-registered evaluation flow. An architectural
+component is retained only if its intended metric improves without an unacceptable evidence
+trade-off.}
+
+\begin{center}
+\fcolorbox{geoorange}{orange!6}{%
+\parbox{0.94\linewidth}{\small
+\textbf{Current manuscript boundary.} Pages 1--7 define the problem, method, and evaluation.
+Pages 8--10 will be added only after complete experiment outputs are supplied. Until then, the
+paper makes no claim that GeoDiff-GAN outperforms any baseline.}}
+\end{center}
+
+\section*{References}
+\vspace{-4pt}
+\begin{multicols}{2}
+\scriptsize
+\renewcommand{\bibsection}{}
+\bibliographystyle{plainnat}
+\bibliography{references}
+\end{multicols}
+
+\end{document}
