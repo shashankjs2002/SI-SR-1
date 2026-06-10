@@ -49,7 +49,7 @@ def extract_product_patches(
     try:
         import rasterio
         from rasterio.enums import Resampling
-        from rasterio.windows import Window
+        from rasterio.windows import Window, bounds, from_bounds
     except ImportError as error:
         raise RuntimeError("Install rasterio to prepare Sentinel-2 products") from error
 
@@ -81,11 +81,17 @@ def extract_product_patches(
                 rgb = np.stack(
                     [dataset.read(1, window=window) for dataset in (red, green, blue)]
                 ).astype(np.float32)
+                scl_window = from_bounds(
+                    *bounds(window, red.transform),
+                    transform=scl.transform,
+                )
                 scl_values = scl.read(
                     1,
-                    window=window,
+                    window=scl_window,
                     out_shape=(patch_size, patch_size),
                     resampling=Resampling.nearest,
+                    boundless=True,
+                    fill_value=0,
                 )
                 valid = ~np.isin(scl_values, list(INVALID_SCL_CLASSES))
                 valid &= np.isfinite(rgb).all(axis=0)
@@ -114,4 +120,3 @@ def extract_product_patches(
                     )
                 )
     return records
-

@@ -125,6 +125,26 @@ class CoreTests(unittest.TestCase):
             loaded = load_manifest(manifest)
             self.assertEqual(loaded[0], record)
 
+    def test_rgb_window_maps_to_scl_resolution(self) -> None:
+        try:
+            from affine import Affine
+            from rasterio.windows import Window, bounds, from_bounds
+        except ImportError:
+            self.skipTest("rasterio is not installed")
+
+        rgb_window = Window(col_off=10752, row_off=0, width=228, height=512)
+        rgb_transform = Affine(10, 0, 600000, 0, -10, 2400000)
+        scl_transform = Affine(20, 0, 600000, 0, -20, 2400000)
+        scl_window = from_bounds(
+            *bounds(rgb_window, rgb_transform),
+            transform=scl_transform,
+        )
+
+        self.assertAlmostEqual(scl_window.col_off, 5376)
+        self.assertAlmostEqual(scl_window.row_off, 0)
+        self.assertAlmostEqual(scl_window.width, 114)
+        self.assertAlmostEqual(scl_window.height, 256)
+
 
 if __name__ == "__main__":
     unittest.main()
