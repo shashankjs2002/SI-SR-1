@@ -33,6 +33,8 @@ def main() -> None:
         scale=config["model"].get("scale", 4),
         caption_file=config["data"].get("captions"),
         augment=False,
+        degradation_seed=int(config["data"].get("degradation_seed", 0)),
+        degradation_severity=config["data"].get("degradation_severity", "mild"),
     )
     loader = DataLoader(dataset, batch_size=1, shuffle=False)
     model = None
@@ -51,6 +53,7 @@ def main() -> None:
             if args.limit is not None and index >= args.limit:
                 break
             lr = batch["lr"].to(device)
+            clean_lr = batch["clean_lr"].to(device)
             hr = batch["hr"].to(device)
             degradation = batch["degradation"].to(device)
             predictions = {
@@ -64,11 +67,17 @@ def main() -> None:
                 values = basic_metrics(
                     prediction,
                     hr,
-                    lr,
+                    clean_lr,
                     degradation,
                     scale=config["model"].get("scale", 4),
+                    severity=config["data"].get("degradation_severity", "mild"),
                 )
                 values.update(optional_metrics(prediction, hr))
+                values["observed_lr_noise_l1"] = float((lr - clean_lr).abs().mean())
+                values["observed_lr_noise_to_signal"] = float(
+                    (lr - clean_lr).abs().mean()
+                    / clean_lr.abs().mean().clamp_min(1e-8)
+                )
                 for metric, value in values.items():
                     totals[name][metric] += value
             count += 1

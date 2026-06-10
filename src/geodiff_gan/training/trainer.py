@@ -169,6 +169,8 @@ class Trainer:
             scale=self.config["model"].get("scale", 4),
             caption_file=data.get("captions"),
             augment=split == "train",
+            degradation_seed=int(data.get("degradation_seed", 0)),
+            degradation_severity=data.get("degradation_severity", "mild"),
         )
         sampler = DistributedSampler(dataset, shuffle=split == "train") if self.distributed else None
         return DataLoader(
@@ -209,6 +211,9 @@ class Trainer:
         model: GeoDiffGAN = unwrap(self.model)  # type: ignore[assignment]
         hr = batch["hr"].to(self.device, non_blocking=True)
         lr = batch["lr"].to(self.device, non_blocking=True)
+        consistency_lr = batch.get("clean_lr", batch["lr"]).to(
+            self.device, non_blocking=True
+        )
         degradation = batch["degradation"].to(self.device, non_blocking=True)
         losses: dict[str, torch.Tensor] = {}
         if diagnostics is not None:
@@ -225,7 +230,11 @@ class Trainer:
             losses["ssim"] = 1 - ssim(prediction, hr)
             losses["gradient"] = gradient_loss(prediction, hr)
             losses["consistency"] = degradation_consistency(
-                prediction, lr, degradation, scale=model.scale
+                prediction,
+                consistency_lr,
+                degradation,
+                scale=model.scale,
+                severity=model.degradation_severity,
             )
             return prediction, losses
 
@@ -318,6 +327,7 @@ class Trainer:
             degradation,
             mode=mode,
             base=base,
+            projection_lr=consistency_lr,
             back_projection_steps=0,
             diagnostics=diagnostics,
         )
@@ -327,7 +337,11 @@ class Trainer:
         losses["perceptual"] = self.perceptual(prediction, hr)
         losses["wavelet"] = wavelet_loss(prediction, hr)
         losses["consistency"] = degradation_consistency(
-            prediction, lr, degradation, scale=model.scale
+            prediction,
+            consistency_lr,
+            degradation,
+            scale=model.scale,
+            severity=model.degradation_severity,
         )
         if self.stage == "edit":
             # Strong edit mode gets softer data consistency and rewards prompt gate usage.

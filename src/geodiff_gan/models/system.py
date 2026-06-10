@@ -51,6 +51,7 @@ class GeoDiffGAN(nn.Module):
         use_degradation_conditioning: bool = True,
         use_evidence_gate: bool = True,
         use_back_projection: bool = True,
+        degradation_severity: str = "mild",
     ) -> None:
         super().__init__()
         self.scale = scale
@@ -59,6 +60,7 @@ class GeoDiffGAN(nn.Module):
         self.use_text_conditioning = use_text_conditioning
         self.use_degradation_conditioning = use_degradation_conditioning
         self.use_back_projection = use_back_projection
+        self.degradation_severity = degradation_severity
         self.base = SwinIRBase(
             embed_dim=base_embed_dim,
             depth=base_depth,
@@ -114,6 +116,9 @@ class GeoDiffGAN(nn.Module):
             use_degradation_conditioning=model.get("use_degradation_conditioning", True),
             use_evidence_gate=model.get("use_evidence_gate", True),
             use_back_projection=model.get("use_back_projection", True),
+            degradation_severity=config.get("data", {}).get(
+                "degradation_severity", "mild"
+            ),
         )
 
     def apply_ablation_inputs(
@@ -170,8 +175,10 @@ class GeoDiffGAN(nn.Module):
         base: torch.Tensor | None = None,
         back_projection_steps: int | None = None,
         diagnostics: DiagnosticRecorder | None = None,
+        projection_lr: torch.Tensor | None = None,
     ) -> GeoDiffOutput:
         base = self.base(lr) if base is None else base
+        consistency_lr = lr if projection_lr is None else projection_lr
         context, degradation = self.apply_ablation_inputs(context, degradation)
         lr_features = self.lr_encoder(lr)
         if diagnostics is not None:
@@ -219,11 +226,12 @@ class GeoDiffGAN(nn.Module):
             steps = steps if self.use_back_projection else 0
             image = back_project(
                 estimate,
-                lr,
+                consistency_lr,
                 degradation,
                 scale=self.scale,
                 iterations=steps,
                 step_size=0.5,
+                severity=self.degradation_severity,
             )
         else:
             estimate = (base + residual).clamp(0, 1)
@@ -233,11 +241,12 @@ class GeoDiffGAN(nn.Module):
             steps = steps if self.use_back_projection else 0
             image = back_project(
                 estimate,
-                lr,
+                consistency_lr,
                 degradation,
                 scale=self.scale,
                 iterations=steps,
                 step_size=0.15,
+                severity=self.degradation_severity,
             )
         if diagnostics is not None:
             diagnostics.capture("output.pre_projection", estimate, visual="rgb")
@@ -245,13 +254,27 @@ class GeoDiffGAN(nn.Module):
             diagnostics.scalar("output.back_projection_steps", steps)
             diagnostics.scalar("output.mode", mode)
             pre_degraded = sensor_degrade(
-                estimate, degradation, scale=self.scale, add_noise=False
+                estimate,
+                degradation,
+                scale=self.scale,
+                add_noise=False,
+                severity=self.degradation_severity,
             )
             post_degraded = sensor_degrade(
-                image, degradation, scale=self.scale, add_noise=False
+                image,
+                degradation,
+                scale=self.scale,
+                add_noise=False,
+                severity=self.degradation_severity,
             )
-            diagnostics.scalar("spatial.lr_error_before_projection", (pre_degraded - lr).abs().mean())
-            diagnostics.scalar("spatial.lr_error_after_projection", (post_degraded - lr).abs().mean())
+            diagnostics.scalar(
+                "spatial.lr_error_before_projection",
+                (pre_degraded - consistency_lr).abs().mean(),
+            )
+            diagnostics.scalar(
+                "spatial.lr_error_after_projection",
+                (post_degraded - consistency_lr).abs().mean(),
+            )
             diagnostics.scalar("spatial.projection_update_abs_mean", (image - estimate).abs().mean())
         metadata = [
             {
@@ -277,6 +300,7 @@ class GeoDiffGAN(nn.Module):
         generator: torch.Generator | None = None,
         diagnostics: DiagnosticRecorder | None = None,
         diffusion_debug_interval: int = 0,
+        projection_lr: torch.Tensor | None = None,
     ) -> GeoDiffOutput:
         degradation = (
             default_degradation(lr.shape[0], lr.device, lr.dtype)
@@ -312,5 +336,6 @@ class GeoDiffGAN(nn.Module):
             degradation,
             mode,
             base=base,
+            projection_lr=projection_lr,
             diagnostics=diagnostics,
         )

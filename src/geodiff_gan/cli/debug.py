@@ -40,11 +40,14 @@ def main() -> None:
         scale=model.scale,
         caption_file=config["data"].get("captions"),
         augment=False,
+        degradation_seed=int(config["data"].get("degradation_seed", 0)),
+        degradation_severity=config["data"].get("degradation_severity", "mild"),
     )
     if not dataset:
         raise RuntimeError(f"No samples found in split {args.split!r}")
     sample = dataset[args.index % len(dataset)]
     lr = sample["lr"].unsqueeze(0).to(device)
+    clean_lr = sample["clean_lr"].unsqueeze(0).to(device)
     target = sample["hr"].unsqueeze(0).to(device)
     degradation = sample["degradation"].unsqueeze(0).to(device)
     prompt = args.prompt if args.prompt is not None else str(sample["caption"])
@@ -61,6 +64,7 @@ def main() -> None:
             lr,
             context,
             degradation=degradation,
+            projection_lr=clean_lr,
             mode=args.mode,
             sample_steps=args.steps,
             guidance_scale=args.guidance,
@@ -77,6 +81,8 @@ def main() -> None:
         degradation,
         scale=model.scale,
         target=target,
+        consistency_lr=clean_lr,
+        degradation_severity=model.degradation_severity,
     )
     report = recorder.export(
         {

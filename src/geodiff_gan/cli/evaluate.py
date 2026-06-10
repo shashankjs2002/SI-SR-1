@@ -40,6 +40,8 @@ def main() -> None:
         scale=config["model"].get("scale", 4),
         caption_file=config["data"].get("captions"),
         augment=False,
+        degradation_seed=int(config["data"].get("degradation_seed", 0)),
+        degradation_severity=config["data"].get("degradation_severity", "mild"),
     )
     loader = DataLoader(dataset, batch_size=1, shuffle=False)
     output_dir = Path(args.output)
@@ -50,6 +52,7 @@ def main() -> None:
         if args.limit is not None and index >= args.limit:
             break
         lr = batch["lr"].to(device)
+        clean_lr = batch["clean_lr"].to(device)
         hr = batch["hr"].to(device)
         degradation = batch["degradation"].to(device)
         context = text_encoder(list(batch["caption"]))
@@ -62,6 +65,7 @@ def main() -> None:
                     lr,
                     context,
                     degradation=degradation,
+                    projection_lr=clean_lr,
                     mode=args.mode,
                     sample_steps=args.steps,
                     null_context=null_context,
@@ -71,7 +75,18 @@ def main() -> None:
         stack = torch.stack(predictions)
         mean = stack.mean(dim=0)
         uncertainty = stack.var(dim=0, unbiased=False).mean(dim=1)
-        values = basic_metrics(mean, hr, lr, degradation, scale=model.scale)
+        values = basic_metrics(
+            mean,
+            hr,
+            clean_lr,
+            degradation,
+            scale=model.scale,
+            severity=model.degradation_severity,
+        )
+        values["observed_lr_noise_l1"] = float((lr - clean_lr).abs().mean())
+        values["observed_lr_noise_to_signal"] = float(
+            (lr - clean_lr).abs().mean() / clean_lr.abs().mean().clamp_min(1e-8)
+        )
         values.update(optional_metrics(mean, hr))
         if args.mode == "edit":
             values["prompt_alignment"] = float(

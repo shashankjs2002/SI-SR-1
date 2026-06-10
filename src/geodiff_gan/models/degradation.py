@@ -6,6 +6,38 @@ import torch
 from torch.nn import functional as F
 
 
+DEGRADATION_PRESETS = {
+    "mild": {
+        "sigma": (0.50, 1.00),
+        "gaussian_std": (0.0002, 0.002),
+        "poisson_peak": (5000.0, 20000.0),
+        "quantization_levels": (2048.0, 10000.0),
+    },
+    "moderate": {
+        "sigma": (0.55, 1.25),
+        "gaussian_std": (0.0005, 0.006),
+        "poisson_peak": (1200.0, 6000.0),
+        "quantization_levels": (512.0, 4096.0),
+    },
+    "severe": {
+        "sigma": (0.70, 1.80),
+        "gaussian_std": (0.002, 0.015),
+        "poisson_peak": (200.0, 1500.0),
+        "quantization_levels": (64.0, 1024.0),
+    },
+}
+
+
+def _range_value(
+    unit_value: torch.Tensor,
+    bounds: tuple[float, float],
+    reverse: bool = False,
+) -> torch.Tensor:
+    low, high = bounds
+    fraction = 1 - unit_value if reverse else unit_value
+    return low + fraction.clamp(0, 1) * (high - low)
+
+
 def _gaussian_kernel(sigma: torch.Tensor, size: int = 9) -> torch.Tensor:
     coordinates = torch.arange(size, device=sigma.device, dtype=sigma.dtype) - size // 2
     grid_y, grid_x = torch.meshgrid(coordinates, coordinates, indexing="ij")
@@ -19,6 +51,8 @@ def sensor_degrade(
     parameters: torch.Tensor,
     scale: int = 4,
     add_noise: bool = False,
+    generator: torch.Generator | None = None,
+    severity: str = "mild",
 ) -> torch.Tensor:
     """Differentiable MTF blur and area downsample.
 
@@ -26,8 +60,14 @@ def sensor_degrade(
     and quantization/compression strength.
     """
 
+    if severity not in DEGRADATION_PRESETS:
+        raise ValueError(
+            f"Unknown degradation severity {severity!r}; "
+            f"expected one of {sorted(DEGRADATION_PRESETS)}"
+        )
+    preset = DEGRADATION_PRESETS[severity]
     batch, channels, _, _ = hr.shape
-    sigma = 0.35 + parameters[:, 0].clamp(0, 1) * 1.65
+    sigma = _range_value(parameters[:, 0], preset["sigma"])
     kernels = _gaussian_kernel(sigma)
     weight = kernels[:, None].repeat_interleave(channels, dim=0)
     flattened = hr.reshape(1, batch * channels, *hr.shape[-2:])
@@ -43,11 +83,26 @@ def sensor_degrade(
     ).reshape_as(hr)
     lr = F.interpolate(blurred, scale_factor=1 / scale, mode="area")
     if add_noise:
-        gaussian_std = parameters[:, 1, None, None, None] * 0.03
-        lr = lr + torch.randn_like(lr) * gaussian_std
-        poisson_strength = parameters[:, 2, None, None, None] * 80 + 20
-        lr = torch.poisson((lr.clamp_min(0) * poisson_strength)) / poisson_strength
-        levels = (256 - parameters[:, 3, None, None, None] * 192).clamp_min(16)
+        gaussian_std = _range_value(
+            parameters[:, 1], preset["gaussian_std"]
+        )[:, None, None, None]
+        gaussian_noise = torch.randn(
+            lr.shape,
+            device=lr.device,
+            dtype=lr.dtype,
+            generator=generator,
+        )
+        lr = lr + gaussian_noise * gaussian_std
+        poisson_strength = _range_value(
+            parameters[:, 2], preset["poisson_peak"]
+        )[:, None, None, None]
+        lr = torch.poisson(
+            lr.clamp_min(0) * poisson_strength,
+            generator=generator,
+        ) / poisson_strength
+        levels = _range_value(
+            parameters[:, 3], preset["quantization_levels"], reverse=True
+        )[:, None, None, None]
         lr = torch.round(lr * (levels - 1)) / (levels - 1)
     return lr.clamp(0, 1)
 
@@ -56,7 +111,9 @@ def random_degradation(
     hr: torch.Tensor,
     scale: int = 4,
     generator: torch.Generator | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    return_clean: bool = False,
+    severity: str = "mild",
+) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     parameters = torch.rand(
         hr.shape[0],
         4,
@@ -64,7 +121,24 @@ def random_degradation(
         dtype=hr.dtype,
         generator=generator,
     )
-    return sensor_degrade(hr, parameters, scale=scale, add_noise=True), parameters
+    clean_lr = sensor_degrade(
+        hr,
+        parameters,
+        scale=scale,
+        add_noise=False,
+        severity=severity,
+    )
+    observed_lr = sensor_degrade(
+        hr,
+        parameters,
+        scale=scale,
+        add_noise=True,
+        generator=generator,
+        severity=severity,
+    )
+    if return_clean:
+        return observed_lr, parameters, clean_lr
+    return observed_lr, parameters
 
 
 def back_project(
@@ -74,10 +148,16 @@ def back_project(
     scale: int = 4,
     iterations: int = 3,
     step_size: float = 0.5,
+    severity: str = "mild",
 ) -> torch.Tensor:
     result = estimate
     for _ in range(iterations):
-        error = observed_lr - sensor_degrade(result, parameters, scale=scale)
+        error = observed_lr - sensor_degrade(
+            result,
+            parameters,
+            scale=scale,
+            severity=severity,
+        )
         correction = F.interpolate(error, size=result.shape[-2:], mode="bicubic", align_corners=False)
         result = (result + step_size * correction).clamp(0, 1)
     return result

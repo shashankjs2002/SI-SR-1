@@ -24,6 +24,8 @@ model:
 data:
   manifest: data/manifest.jsonl
   captions: data/captions.jsonl
+  degradation_seed: 42
+  degradation_severity: mild
 
 text_encoder:
   kind: siglip

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -19,10 +20,14 @@ class SentinelPatchDataset(Dataset):
         scale: int = 4,
         caption_file: str | Path | None = None,
         augment: bool = True,
+        degradation_seed: int = 0,
+        degradation_severity: str = "mild",
     ) -> None:
         self.records = load_manifest(manifest, split=split)
         self.scale = scale
         self.augment = augment
+        self.degradation_seed = degradation_seed
+        self.degradation_severity = degradation_severity
         self.captions: dict[str, str] = {}
         if caption_file:
             with Path(caption_file).open("r", encoding="utf-8") as handle:
@@ -50,14 +55,32 @@ class SentinelPatchDataset(Dataset):
         if hr.ndim == 3 and hr.shape[-1] == 3:
             hr = hr.permute(2, 0, 1)
         hr = self._augment(hr.clamp(0, 1))
-        lr, degradation = random_degradation(hr.unsqueeze(0), scale=self.scale)
+        generator = None
+        if not self.augment:
+            key = (
+                f"{self.degradation_seed}:{record.tile_id}:"
+                f"{record.row}:{record.col}:{record.patch}"
+            )
+            seed = int.from_bytes(
+                hashlib.sha256(key.encode("utf-8")).digest()[:8],
+                byteorder="little",
+                signed=False,
+            )
+            generator = torch.Generator().manual_seed(seed)
+        lr, degradation, clean_lr = random_degradation(
+            hr.unsqueeze(0),
+            scale=self.scale,
+            generator=generator,
+            return_clean=True,
+            severity=self.degradation_severity,
+        )
         caption = self.captions.get(record.patch, record.caption)
         return {
             "hr": hr,
             "lr": lr[0],
+            "clean_lr": clean_lr[0],
             "degradation": degradation[0],
             "caption": caption,
             "patch": record.patch,
             "tile_id": record.tile_id,
         }
-

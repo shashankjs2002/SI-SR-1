@@ -4,11 +4,14 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import numpy as np
 import torch
 
 from geodiff_gan.config import load_config
+from geodiff_gan.data import SentinelPatchDataset
 from geodiff_gan.data.manifest import ManifestRecord, deterministic_split, load_manifest, write_manifest
 from geodiff_gan.diagnostics import DiagnosticRecorder, tensor_statistics
+from geodiff_gan.metrics import edge_f1
 from geodiff_gan.models.blocks import high_pass
 from geodiff_gan.models.degradation import back_project, random_degradation, sensor_degrade
 from geodiff_gan.models.system import GeoDiffGAN
@@ -103,6 +106,70 @@ class CoreTests(unittest.TestCase):
         projected = back_project(hr, clean_lr, parameters, scale=4, iterations=1)
         self.assertEqual(projected.shape, hr.shape)
         self.assertTrue(torch.isfinite(projected).all())
+
+    def test_mild_degradation_is_quieter_than_severe(self) -> None:
+        hr = torch.full((1, 3, 128, 128), 0.2)
+        mild, _, mild_clean = random_degradation(
+            hr,
+            scale=4,
+            generator=torch.Generator().manual_seed(7),
+            return_clean=True,
+            severity="mild",
+        )
+        severe, _, severe_clean = random_degradation(
+            hr,
+            scale=4,
+            generator=torch.Generator().manual_seed(7),
+            return_clean=True,
+            severity="severe",
+        )
+        mild_ratio = (mild - mild_clean).abs().mean() / mild_clean.mean()
+        severe_ratio = (severe - severe_clean).abs().mean() / severe_clean.mean()
+        self.assertLess(float(mild_ratio), 0.04)
+        self.assertLess(float(mild_ratio), float(severe_ratio))
+
+    def test_evaluation_degradation_is_deterministic(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            patch = root / "patch.npz"
+            np.savez_compressed(
+                patch,
+                hr=np.random.default_rng(3).random((3, 64, 64)).astype(np.float32),
+            )
+            manifest = root / "manifest.jsonl"
+            write_manifest(
+                manifest,
+                [
+                    ManifestRecord(
+                        patch=str(patch),
+                        tile_id="TEST_TILE",
+                        split="test",
+                        row=10,
+                        col=20,
+                        valid_fraction=1.0,
+                    )
+                ],
+            )
+            dataset = SentinelPatchDataset(
+                manifest,
+                split="test",
+                augment=False,
+                degradation_seed=42,
+                degradation_severity="mild",
+            )
+            first = dataset[0]
+            second = dataset[0]
+            self.assertTrue(torch.equal(first["lr"], second["lr"]))
+            self.assertTrue(torch.equal(first["clean_lr"], second["clean_lr"]))
+            self.assertTrue(torch.equal(first["degradation"], second["degradation"]))
+
+    def test_adaptive_edge_f1_handles_low_contrast_edges(self) -> None:
+        target = torch.full((1, 3, 32, 32), 0.2)
+        target[:, :, :, 16:] = 0.22
+        shifted = torch.full_like(target, 0.2)
+        shifted[:, :, :, 17:] = 0.22
+        self.assertGreater(float(edge_f1(target, target)), 0.99)
+        self.assertGreater(float(edge_f1(shifted, target, tolerance=1)), 0.9)
 
     def test_high_pass_does_not_create_constant_border_edges(self) -> None:
         constant = torch.ones(1, 3, 32, 32)

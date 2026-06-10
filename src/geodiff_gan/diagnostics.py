@@ -209,15 +209,40 @@ class DiagnosticRecorder:
         degradation: torch.Tensor,
         scale: int,
         target: torch.Tensor | None = None,
+        consistency_lr: torch.Tensor | None = None,
+        degradation_severity: str = "mild",
     ) -> None:
         with torch.no_grad():
-            degraded_base = sensor_degrade(base, degradation, scale=scale)
-            degraded_output = sensor_degrade(output, degradation, scale=scale)
+            consistency_lr = lr if consistency_lr is None else consistency_lr
+            degraded_base = sensor_degrade(
+                base,
+                degradation,
+                scale=scale,
+                severity=degradation_severity,
+            )
+            degraded_output = sensor_degrade(
+                output,
+                degradation,
+                scale=scale,
+                severity=degradation_severity,
+            )
             self.capture("consistency.degraded_base", degraded_base, visual="rgb")
             self.capture("consistency.degraded_output", degraded_output, visual="rgb")
-            self.capture("consistency.lr_error", (degraded_output - lr).abs(), visual="heatmap")
-            self.scalar("spatial.lr_base_l1", F.l1_loss(degraded_base, lr))
-            self.scalar("spatial.lr_output_l1", F.l1_loss(degraded_output, lr))
+            self.capture("consistency.clean_lr", consistency_lr, visual="rgb")
+            self.capture("consistency.observed_noise", lr - consistency_lr, visual="residual")
+            self.capture(
+                "consistency.lr_error",
+                (degraded_output - consistency_lr).abs(),
+                visual="heatmap",
+            )
+            self.scalar("spatial.lr_base_l1", F.l1_loss(degraded_base, consistency_lr))
+            self.scalar("spatial.lr_output_l1", F.l1_loss(degraded_output, consistency_lr))
+            self.scalar("degradation.observed_noise_l1", F.l1_loss(lr, consistency_lr))
+            self.scalar(
+                "degradation.noise_to_signal_ratio",
+                (lr - consistency_lr).abs().mean()
+                / consistency_lr.abs().mean().clamp_min(1e-8),
+            )
             self.scalar("spatial.residual_abs_mean", residual.abs().mean())
             self.scalar(
                 "spatial.residual_to_base_ratio",
@@ -249,6 +274,7 @@ class DiagnosticRecorder:
             "decoder.residual",
             "output.hr",
             "target.hr",
+            "consistency.clean_lr",
             "consistency.degraded_output",
             "consistency.lr_error",
             "target.absolute_error",

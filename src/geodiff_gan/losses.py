@@ -61,8 +61,17 @@ def degradation_consistency(
     lr: torch.Tensor,
     parameters: torch.Tensor,
     scale: int = 4,
+    severity: str = "mild",
 ) -> torch.Tensor:
-    return charbonnier(sensor_degrade(prediction, parameters, scale=scale), lr)
+    return charbonnier(
+        sensor_degrade(
+            prediction,
+            parameters,
+            scale=scale,
+            severity=severity,
+        ),
+        lr,
+    )
 
 
 def snr_weighted_velocity_loss(
@@ -112,4 +121,3 @@ class OptionalPerceptualLoss(nn.Module):
         if self.model is None:
             return prediction.new_zeros(())
         return self.model(prediction * 2 - 1, target * 2 - 1).mean()
-
