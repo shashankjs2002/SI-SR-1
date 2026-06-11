@@ -75,10 +75,12 @@ unsupported structure. We propose \emph{GeoDiff-GAN}, a prompt-optional architec
 \SI{40}{m}-to-\SI{10}{m} Sentinel-2 L2A RGB super-resolution. The model decomposes reconstruction
 into a deterministic SwinIR-style base and a stochastic residual path. A degradation-conditioned
 latent diffusion model samples a compact residual representation; a GeoMapper converts it into
-spatial content, four layer-wise FiLM controls, and a prompt evidence gate; and a conditional
-adversarial decoder predicts only the residual. In evidence-constrained SR mode, the residual is
-high-pass filtered and the output undergoes iterative sensor back-projection. A separate edit mode
-permits stronger prompt influence but labels its output as synthetic. This first part of the
+spatial content, four layer-wise FiLM controls, an LR-supported evidence-confidence map, and a
+separate prompt-conditioned edit-permission map. A dual-head adversarial decoder predicts
+high-frequency reconstruction detail independently from full-band synthetic edits. In SR mode,
+detail is confidence-gated and the output undergoes iterative sensor back-projection. Across
+stochastic samples, disagreement triggers abstention toward the deterministic base. Edit mode
+activates only the permission-gated edit head and labels its output as synthetic. This first part of the
 manuscript defines the data model, architecture, training curriculum, and pre-registered
 evaluation. Quantitative claims are deferred until geographically separated tile-level
 experiments and ablations are complete.
@@ -100,17 +102,17 @@ spatial gate, high-pass filtering, and re-degradation consistency.
 \textbf{Proposed contributions.}
 \begin{itemize}
   \item A deterministic--stochastic residual decomposition for satellite SR.
-  \item A GeoMapper interface that emits spatial content, FiLM styles, and an evidence gate.
-  \item Mode-aware separation of evidence-constrained reconstruction from labeled synthesis.
+  \item A dual-policy GeoMapper that separates reconstruction confidence from edit authority.
+  \item A dual-head residual decoder separating high-pass evidence detail from full-band edits.
+  \item Confidence calibration and stochastic uncertainty abstention toward the deterministic base.
   \item Dual spatial and Haar-frequency adversarial supervision used only during training.
   \item A tile-isolated evaluation protocol combining fidelity, perception, consistency,
         uncertainty, and prompt behavior.
 \end{itemize}
 
-\figblock{infographic_architecture.png}{1.0}{0.285}{Image-led overview of GeoDiff-GAN. The upper
-optical path reconstructs stable structure, the lower latent path synthesizes uncertain residual
-detail, and the two transparent layers are merged before evidence correction. The red inspection
-instruments at the bottom represent training-only adversarial critics.}
+\figblock{geodiff-dual-policy-architecture.png}{1.0}{0.51}{Implemented dual-policy architecture.
+Evidence confidence controls reconstruction detail, edit permission controls a separate synthetic
+residual head, and stochastic disagreement drives abstention toward the deterministic base.}
 
 \clearpage
 
@@ -257,20 +259,16 @@ intermediate scales. Classifier-free guidance can combine conditional and null p
 \subsection{GeoMapper and decoder}
 GeoMapper receives $[\hat{\vect{z}}_0;f_{64}]$ and returns
 \begin{equation}
- (\vect{c},\{\vect{s}_i\}_{i=1}^{4},\vect{g})
+ (\vect{c},\{\vect{s}_i\}_{i=1}^{4},\vect{c}_e,\vect{c}_p)
  =M_{\omega}(\hat{\vect{z}}_0,f_{64},\vect{e}_{text},m),
 \end{equation}
 where $\vect{c}\in\mathbb{R}^{128\times64\times64}$ is spatial content,
 $\vect{s}_i\in\mathbb{R}^{256}$ are four FiLM controls \citep{perez2018film}, and
-$\vect{g}\in[0,1]^{1\times64\times64}$ is the evidence gate. The residual decoder upsamples through
-64, 128, 256, and 512 grids with channels $[128,96,64,48]$, fusing LR skips and stage-specific
-styles before a three-channel $\tanh$ head.
-
-\figblock{architecture_detailed.png}{1.0}{0.49}{Code-derived layer-level architecture of
-GeoDiff-GAN. Every chip reports its output tensor size. Solid connectors carry inference tensors;
-purple dashed connectors carry text, timestep, degradation, mode, or training targets; red paths
-terminate at critics removed during inference. Orthogonal buses preserve the distinct base,
-$f_{64}$, $f_{128}$, latent, and degradation routes.}
+$\vect{c}_e,\vect{c}_p\in[0,1]^{1\times64\times64}$ are evidence confidence and edit permission.
+The evidence head receives latent content and projected LR evidence but no text context. The edit
+head receives content, text context, and confidence, and is forced to zero in SR mode. The decoder
+upsamples through 64, 128, 256, and 512 grids with channels $[128,96,64,48]$, fusing LR skips and
+stage-specific styles before independent detail and edit $\tanh$ heads.
 
 \clearpage
 
@@ -279,10 +277,11 @@ $f_{64}$, $f_{128}$, latent, and degradation routes.}
 % ---------------------------------------------------------------------------
 \section{Evidence Control and Adversarial Learning}
 \subsection{Residual output controller}
-The decoder is not allowed to replace the complete HR image. In SR mode its raw residual
-$\vect{r}$ is high-pass filtered:
+The decoder is not allowed to replace the complete HR image. In SR mode the detail residual
+$\vect{r}_d$ is high-pass filtered and confidence gated:
 \begin{equation}
- \vect{r}_{\mathrm{SR}}=\vect{r}-G_{\sigma}*\vect{r},\qquad
+ \vect{r}_{\mathrm{SR}}=
+ \left(\vect{r}_d-G_{\sigma}*\vect{r}_d\right)\odot\vect{c}_e,\qquad
  \hat{\vect{x}}_0=\operatorname{clip}(\vect{b}+\vect{r}_{\mathrm{SR}},0,1).
 \end{equation}
 Three approximate back-projection steps then reduce clean LR discrepancy:
@@ -295,9 +294,24 @@ Three approximate back-projection steps then reduce clean LR discrepancy:
  \right],
  \quad \eta=0.5.
 \end{equation}
-This is a soft evidence constraint, not a proof of unique recovery. In edit mode the full-band
-residual is retained, one smaller update uses $\eta=0.15$, and
+This is a soft evidence constraint, not a proof of unique recovery. In edit mode,
+\begin{equation}
+ \vect{r}_{\mathrm{edit}}=
+ \left(\vect{r}_d-G_{\sigma}*\vect{r}_d\right)\odot\vect{c}_e+
+ \vect{r}_e\odot\vect{c}_p.
+\end{equation}
+One smaller update uses $\eta=0.15$, and
 \texttt{synthetic\_edit=true} is written to metadata.
+
+\subsection{Confidence calibration and abstention}
+For paired synthetic training, evidence confidence targets an exponential transform of smoothed
+local ungated reconstruction error. At evaluation, stochastic pixel variance $u$ yields agreement
+$a=\exp(-u/s_u)$ and combined confidence $\vect{c}_e a$. Because each sample is already
+evidence-gated, only the additional agreement factor blends the stochastic mean toward the base:
+\begin{equation}
+ \hat{\vect{x}}_{\mathrm{abstain}}=
+ \vect{b}+a(\hat{\vect{x}}_{\mathrm{mean}}-\vect{b}).
+\end{equation}
 
 \subsection{Dual conditional discriminators}
 Conditional PatchGANs \citep{isola2017image} receive an HR candidate concatenated with resized LR
@@ -353,8 +367,9 @@ staged.
   \item \textbf{Joint refinement:} train diffusion, LR encoder, GeoMapper, decoder, and separate
         discriminators with reconstruction, perceptual, frequency, consistency, and low-weight
         GAN objectives.
-  \item \textbf{Edit tuning:} adapt diffusion/mapper/decoder using prompt alignment and softer LR
-        consistency; do not use edit output for reconstruction metrics.
+  \item \textbf{Edit tuning:} adapt diffusion/mapper/decoder using prompt alignment, permission
+        supervision, localization, and softer LR consistency. Paired-HR reconstruction losses are
+        omitted for counterfactual prompts.
 \end{enumerate}
 
 The initial joint generator objective is
@@ -362,7 +377,8 @@ The initial joint generator objective is
 \begin{split}
  L_G={}&1.0L_{\mathrm{char}}+1.0L_{\mathrm{cons}}
  +0.2L_{\mathrm{SSIM}}+0.1L_{\mathrm{LPIPS}}\\
- &+0.05L_{\mathrm{wavelet}}+0.05L_{\mathrm{prompt}}
+ &+0.05L_{\mathrm{wavelet}}+0.1L_{\mathrm{cal}}
+ +0.05L_{\mathrm{prompt}}
  +0.01L_{\mathrm{adv}},
 \end{split}
 \end{equation}
@@ -374,9 +390,11 @@ used for the full model.
 Offline captions describe observable land cover, objects, density, terrain, and texture. Forty
 percent of batches use a null prompt to retain unconditional SR competence; paraphrases reduce
 surface-form dependence; mismatches test whether spatial evidence can override incompatible text.
-The mode token scales prompt injection in GeoMapper and selects the output policy. This mechanism
-is a research hypothesis: matched/null/mismatched gate responses must be measured before claiming
-that the gate prevents hallucination.
+Batch-size-one training draws mismatches from a coordinate-free counterfactual prompt pool. The
+mode token selects the output policy. Null, matched, and paraphrased prompts suppress edit
+permission; mismatches target sparse permission coverage. This mechanism is a research hypothesis:
+confidence calibration and permission localization must be measured before claiming reduced
+hallucination.
 
 \figblock{infographic_conditioning.png}{0.98}{0.24}{Prompt evidence is visualized as a spatial
 field over the observed satellite image. Null, matched, paraphrased, and mismatched prompts create
@@ -416,7 +434,10 @@ existence of SwinIR, VAEs, diffusion, FiLM, GANs, wavelets, or back-projection. 
 to a controlled ablation:
 \begin{itemize}
   \item deterministic base versus unrestricted full-image generation;
-  \item complete GeoMapper versus direct decode, content-only, styles-only, and no-gate variants;
+  \item dual-policy GeoMapper versus one shared gate, no confidence calibration, and no permission
+        supervision;
+  \item dual residual heads versus one shared residual and an edit head exposed in SR mode;
+  \item confidence-only, uncertainty-only, combined abstention, and variance visualization only;
   \item spatial GAN, wavelet GAN, both, and no adversarial supervision;
   \item fixed degradation, randomized unconditioned degradation, conditioned degradation, and
         conditioned degradation with back-projection;

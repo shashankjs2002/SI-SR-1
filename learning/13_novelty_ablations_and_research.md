@@ -38,32 +38,44 @@ Test against:
 - diffusion-only full-image prediction;
 - residual prediction without high-pass control.
 
-### Contribution B: GeoMapper interface
+### Contribution B: dual-policy GeoMapper interface
 
-**Hypothesis:** Jointly producing spatial content, layer-wise FiLM styles, and a spatial prompt gate
-is more effective than directly decoding the diffusion latent.
+**Hypothesis:** Separating LR-supported evidence confidence from prompt-conditioned edit permission
+reduces prompt leakage into reconstruction while preserving localized counterfactual control.
 
 Test:
 
 - remove mapper;
-- content only;
-- styles only;
-- content + styles without gate;
-- complete mapper.
+- replace both policies with one shared gate;
+- remove evidence-confidence calibration;
+- remove edit-permission supervision;
+- complete dual-policy mapper.
 
-### Contribution C: mode-aware prompt evidence control
+### Contribution C: policy-separated dual-head residual decoding
 
-**Hypothesis:** Combining mode conditioning, evidence gating, high-pass SR residuals, and separate
-projection strengths produces a meaningful separation between reconstruction and synthetic editing.
+**Hypothesis:** A dedicated high-pass evidence-detail head and a separate full-band edit head create
+a stronger reconstruction/edit boundary than one residual decoder controlled only by a mode token.
 
 Test:
 
-- no mode token;
-- no evidence gate;
-- same projection policy for both modes;
-- prompt conditioning without mismatched examples.
+- one shared residual head;
+- full-band residual in SR mode;
+- edit head enabled in SR mode;
+- dual-head policy-gated decoder.
 
-### Contribution D: dual spatial-frequency adversarial supervision
+### Contribution D: calibrated uncertainty abstention
+
+**Hypothesis:** Combining learned evidence confidence with stochastic sample disagreement improves
+selective reconstruction risk by returning unsupported regions toward the deterministic base.
+
+Test:
+
+- variance visualization only;
+- learned confidence only;
+- uncertainty only;
+- confidence plus uncertainty abstention.
+
+### Contribution E: dual spatial-frequency adversarial supervision
 
 **Hypothesis:** Multi-scale spatial PatchGAN plus high-frequency Haar discrimination improves edge
 and texture quality at a lower consistency cost than spatial GAN alone.
@@ -75,7 +87,7 @@ Test:
 - wavelet GAN only;
 - both.
 
-### Contribution E: degradation-aware consistency
+### Contribution F: degradation-aware consistency
 
 **Hypothesis:** Explicit degradation conditioning and iterative projection improve robustness over
 unknown blur/noise variation.
@@ -91,13 +103,13 @@ Test:
 
 Change one mechanism at a time:
 
-| ID | Base | Diffusion | Mapper | Gate | Wavelet D | Deg. cond. | Back-proj. |
+| ID | Base | Diffusion | Dual policy | Dual head | Abstain | Wavelet D | Back-proj. |
 |---|---|---|---|---|---|---|---|
 | A0 | yes | yes | yes | yes | yes | yes | yes |
 | A1 | no | yes | yes | yes | yes | yes | yes |
 | A2 | yes | no | yes | yes | yes | yes | yes |
-| A3 | yes | yes | direct decode | no | yes | yes | yes |
-| A4 | yes | yes | yes | no | yes | yes | yes |
+| A3 | yes | yes | shared gate | yes | yes | yes | yes |
+| A4 | yes | yes | yes | shared residual | yes | yes | yes |
 | A5 | yes | yes | yes | yes | no | yes | yes |
 | A6 | yes | yes | yes | yes | yes | no | yes |
 | A7 | yes | yes | yes | yes | yes | yes | no |
@@ -133,11 +145,12 @@ Use explicit questions:
 
 1. Does the hybrid improve perceptual metrics at matched LR consistency?
 2. Does GeoMapper improve spatial structure and prompt controllability?
-3. Does the evidence gate suppress mismatched prompts in SR mode?
-4. Does the wavelet discriminator improve edge F1 without increasing hallucination?
-5. Does degradation conditioning improve performance under held-out degradations?
-6. Is stochastic variance correlated with reconstruction error?
-7. Do gains persist on unseen cities and tiles?
+3. Does evidence confidence suppress unsupported detail without responding to prompt wording?
+4. Does edit permission remain near zero for null/matched prompts and localize counterfactual edits?
+5. Does uncertainty abstention reduce error at fixed retained coverage?
+6. Does the wavelet discriminator improve edge F1 without increasing hallucination?
+7. Does degradation conditioning improve performance under held-out degradations?
+8. Do gains persist on unseen cities and tiles?
 
 Each question maps to a table or figure.
 
@@ -182,9 +195,10 @@ flowchart TD
 ### Current evidence-informed priorities
 
 1. Verify whether \(f_{32}\) and \(f_{16}\) add value when explicitly fused.
-2. Measure gate response to matched/mismatched/null prompts.
+2. Measure evidence confidence and edit permission separately for matched, mismatched, and null
+   prompts.
 3. Compare approximate bicubic correction with a degradation-adjoint-inspired update.
-4. Evaluate uncertainty calibration before using uncertainty to scale residuals.
+4. Evaluate confidence-error and uncertainty-error correlation plus selective risk curves.
 5. Add radiometric/spectral constraints only if color drift is measured.
 
 ## 8. Claims to Avoid
@@ -204,8 +218,8 @@ Avoid:
 
 Use:
 
-> The gate is designed to modulate prompt influence; its behavior is evaluated with matched,
-> mismatched, and null-prompt ablations.
+> Evidence confidence limits reconstruction detail, while edit permission localizes synthetic
+> prompt changes; both policies are evaluated with calibration and prompt-type ablations.
 
 Avoid:
 

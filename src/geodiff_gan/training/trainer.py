@@ -22,6 +22,8 @@ from ..losses import (
     charbonnier,
     degradation_consistency,
     discriminator_hinge,
+    edit_localization_loss,
+    evidence_calibration_loss,
     generator_hinge,
     gradient_loss,
     kl_loss,
@@ -29,10 +31,11 @@ from ..losses import (
     ssim,
     wavelet_loss,
 )
+from ..models.blocks import high_pass
 from ..models.degradation import sensor_degrade
 from ..models.discriminators import MultiScaleDiscriminator, WaveletDiscriminator
 from ..models.system import GeoDiffGAN
-from ..text import TextEncoder, augment_prompts, build_text_encoder
+from ..text import PromptBatch, TextEncoder, augment_prompts, build_text_encoder
 from .checkpoint import load_checkpoint, save_checkpoint, unwrap
 
 STAGES = ("base", "vae", "diffusion", "joint", "edit")
@@ -197,22 +200,32 @@ class Trainer:
 
     def _contexts(
         self, captions: list[str], training: bool = True
-    ) -> tuple[torch.Tensor, torch.Tensor, list[str]]:
+    ) -> tuple[torch.Tensor, torch.Tensor, list[str], list[str]]:
         prompt_config = self.config.get("prompts", {})
+        prompt_kinds = ["original"] * len(captions)
         if training:
-            captions = augment_prompts(
+            augmented = augment_prompts(
                 captions,
                 null_probability=float(prompt_config.get("null_probability", 0.4)),
                 paraphrase_probability=float(
                     prompt_config.get("paraphrase_probability", 0.2)
                 ),
                 mismatch_probability=float(prompt_config.get("mismatch_probability", 0.1)),
+                return_metadata=True,
             )
+            assert isinstance(augmented, PromptBatch)
+            captions = augmented.prompts
+            prompt_kinds = augmented.kinds
         if self.text_encoder is None:
             raise RuntimeError(f"Stage {self.stage} requires a configured text encoder")
         context = self.text_encoder(captions)
         null_context = self.text_encoder([""] * len(captions))
-        return context.to(self.device), null_context.to(self.device), captions
+        return (
+            context.to(self.device),
+            null_context.to(self.device),
+            captions,
+            prompt_kinds,
+        )
 
     def _forward_stage(
         self,
@@ -249,7 +262,9 @@ class Trainer:
             )
             return prediction, losses
 
-        context, _, used_prompts = self._contexts(list(batch["caption"]))
+        context, _, used_prompts, prompt_kinds = self._contexts(
+            list(batch["caption"])
+        )
         with torch.no_grad():
             base = model.base(lr)
             target_residual = hr - base
@@ -266,7 +281,15 @@ class Trainer:
             mode_values = model.mode_tensor("sr", hr.shape[0], hr.device)
             mapped = model.mapper(latent, lr_features[1], context, mode_values)
             decoded = model.decoder(mapped, lr_features)
-            prediction = (base + decoded).clamp(0, 1)
+            detail = high_pass(decoded.detail_residual)
+            evidence = model._resize_policy(
+                mapped.evidence_confidence, base.shape[-2:]
+            )
+            detail = detail * model._effective_confidence(evidence)
+            prediction = (base + detail).clamp(0, 1)
+            ungated_prediction = (base + high_pass(decoded.detail_residual)).clamp(
+                0, 1
+            )
             if diagnostics is not None:
                 diagnostics.capture("vae.latent", latent, visual="features")
                 diagnostics.capture("vae.mean", mean, visual="features")
@@ -276,14 +299,26 @@ class Trainer:
                 )
                 diagnostics.capture("mapper.content", mapped.content, visual="features")
                 diagnostics.capture(
-                    "mapper.evidence_gate", mapped.evidence_gate, visual="heatmap"
+                    "mapper.evidence_confidence",
+                    mapped.evidence_confidence,
+                    visual="heatmap",
                 )
-                diagnostics.capture("decoder.residual", decoded, visual="residual")
+                diagnostics.capture("decoder.residual", detail, visual="residual")
                 diagnostics.capture("output.hr", prediction, visual="rgb")
             losses["vae_reconstruction"] = charbonnier(reconstruction, target_residual)
             losses["kl"] = kl_loss(mean, log_variance)
             losses["charbonnier"] = charbonnier(prediction, hr)
             losses["wavelet"] = wavelet_loss(prediction, hr)
+            losses["evidence_calibration"] = evidence_calibration_loss(
+                mapped.evidence_confidence,
+                ungated_prediction,
+                hr,
+                temperature=float(
+                    self.config["training"].get(
+                        "evidence_calibration_temperature", 0.05
+                    )
+                ),
+            )
             return prediction, losses
 
         with torch.no_grad():
@@ -343,10 +378,35 @@ class Trainer:
             diagnostics=diagnostics,
         )
         prediction = output.image
-        losses["charbonnier"] = charbonnier(prediction, hr)
-        losses["ssim"] = 1 - ssim(prediction, hr)
-        losses["perceptual"] = self.perceptual(prediction, hr)
-        losses["wavelet"] = wavelet_loss(prediction, hr)
+        counterfactual = torch.tensor(
+            [kind == "mismatch" for kind in prompt_kinds],
+            device=prediction.device,
+            dtype=torch.bool,
+        )
+        reconstruction_mask = (
+            ~counterfactual
+            if self.stage == "edit"
+            else torch.ones_like(counterfactual)
+        )
+        if reconstruction_mask.any():
+            reconstruction = prediction[reconstruction_mask]
+            reconstruction_target = hr[reconstruction_mask]
+            losses["charbonnier"] = charbonnier(
+                reconstruction, reconstruction_target
+            )
+            losses["ssim"] = 1 - ssim(reconstruction, reconstruction_target)
+            losses["perceptual"] = self.perceptual(
+                reconstruction, reconstruction_target
+            )
+            losses["wavelet"] = wavelet_loss(
+                reconstruction, reconstruction_target
+            )
+        else:
+            zero = prediction.new_zeros(())
+            losses["charbonnier"] = zero
+            losses["ssim"] = zero
+            losses["perceptual"] = zero
+            losses["wavelet"] = zero
         losses["consistency"] = degradation_consistency(
             prediction,
             consistency_lr,
@@ -354,9 +414,37 @@ class Trainer:
             scale=model.scale,
             severity=model.degradation_severity,
         )
+        losses["evidence_calibration"] = evidence_calibration_loss(
+            output.evidence_confidence,
+            output.ungated_sr,
+            hr,
+            temperature=float(
+                self.config["training"].get(
+                    "evidence_calibration_temperature", 0.05
+                )
+            ),
+        )
         if self.stage == "edit":
-            # Strong edit mode gets softer data consistency and rewards prompt gate usage.
-            losses["prompt_gate"] = 1 - output.evidence_gate.mean()
+            losses["edit_localization"] = edit_localization_loss(
+                output.raw_edit_residual,
+                output.edit_permission,
+            )
+            permission_mean = output.edit_permission.flatten(1).mean(dim=1)
+            permission_loss = permission_mean.new_zeros(())
+            if (~counterfactual).any():
+                permission_loss = permission_loss + permission_mean[
+                    ~counterfactual
+                ].mean()
+            if counterfactual.any():
+                target_coverage = float(
+                    self.config["training"].get(
+                        "counterfactual_edit_coverage", 0.15
+                    )
+                )
+                permission_loss = permission_loss + (
+                    permission_mean[counterfactual] - target_coverage
+                ).square().mean()
+            losses["edit_permission"] = permission_loss
             assert self.text_encoder is not None
             losses["prompt_alignment"] = self.text_encoder.alignment_loss(
                 prediction, used_prompts
@@ -375,7 +463,9 @@ class Trainer:
             "kl": 1e-4,
             "vae_reconstruction": 1.0,
             "diffusion": 1.0,
-            "prompt_gate": 0.05,
+            "evidence_calibration": 0.1,
+            "edit_localization": 0.05,
+            "edit_permission": 0.05,
             "prompt_alignment": 0.05,
             "adversarial": 0.01,
         }

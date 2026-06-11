@@ -41,7 +41,19 @@ class LREncoder(nn.Module):
 class MapperOutput:
     content: torch.Tensor
     styles: list[torch.Tensor]
-    evidence_gate: torch.Tensor
+    evidence_confidence: torch.Tensor
+    edit_permission: torch.Tensor
+
+    @property
+    def evidence_gate(self) -> torch.Tensor:
+        """Backward-compatible alias for checkpoints and external callers."""
+        return self.evidence_confidence
+
+
+@dataclass
+class DecoderOutput:
+    detail_residual: torch.Tensor
+    edit_residual: torch.Tensor
 
 
 class GeoMapper(nn.Module):
@@ -54,13 +66,22 @@ class GeoMapper(nn.Module):
         style_dim: int = 256,
         stages: int = 4,
         use_evidence_gate: bool = True,
+        use_edit_gate: bool = True,
     ) -> None:
         super().__init__()
         self.input = nn.Conv2d(latent_channels + lr_channels, content_channels, 3, padding=1)
         self.blocks = nn.Sequential(*(ResidualBlock(content_channels) for _ in range(4)))
         self.context = nn.Linear(context_dim, content_channels)
+        self.evidence_projection = nn.Conv2d(lr_channels, content_channels, 1)
+        # Keep this module name and input shape compatible with earlier checkpoints.
         self.gate = nn.Sequential(
             nn.Conv2d(content_channels * 2, content_channels, 1),
+            nn.SiLU(),
+            nn.Conv2d(content_channels, 1, 1),
+            nn.Sigmoid(),
+        )
+        self.edit_gate = nn.Sequential(
+            nn.Conv2d(content_channels * 2 + 1, content_channels, 1),
             nn.SiLU(),
             nn.Conv2d(content_channels, 1, 1),
             nn.Sigmoid(),
@@ -74,6 +95,7 @@ class GeoMapper(nn.Module):
             for _ in range(stages)
         )
         self.use_evidence_gate = use_evidence_gate
+        self.use_edit_gate = use_edit_gate
 
     def forward(
         self,
@@ -88,15 +110,37 @@ class GeoMapper(nn.Module):
         content = self.blocks(self.input(torch.cat((latent, lr_feature), dim=1)))
         pooled_context = context.mean(dim=1)
         context_map = self.context(pooled_context)[:, :, None, None].expand_as(content)
-        evidence_gate = self.gate(torch.cat((content, context_map), dim=1))
+        lr_evidence = self.evidence_projection(lr_feature)
+        evidence_confidence = self.gate(torch.cat((content, lr_evidence), dim=1))
         if not self.use_evidence_gate:
-            evidence_gate = torch.ones_like(evidence_gate)
+            evidence_confidence = torch.ones_like(evidence_confidence)
         mode_strength = mode.float()[:, None, None, None]
-        gated_content = content + context_map * evidence_gate * (0.25 + 0.75 * mode_strength)
+        edit_permission = self.edit_gate(
+            torch.cat((content, context_map, evidence_confidence), dim=1)
+        )
+        if not self.use_edit_gate:
+            edit_permission = torch.ones_like(edit_permission)
+        edit_permission = edit_permission * mode_strength
+
+        # SR receives weak, evidence-constrained semantics. Edit mode receives
+        # spatial prompt injection only where the edit policy grants permission.
+        prompt_strength = (
+            0.15 * evidence_confidence * (1 - mode_strength)
+            + edit_permission * mode_strength
+        )
+        gated_content = content + context_map * prompt_strength
         pooled_content = gated_content.mean(dim=(-2, -1))
-        style_input = torch.cat((pooled_content, pooled_context), dim=1)
+        style_prompt_strength = prompt_strength.mean(dim=(-2, -1))
+        style_input = torch.cat(
+            (pooled_content, pooled_context * style_prompt_strength), dim=1
+        )
         styles = [head(style_input) for head in self.style_heads]
-        return MapperOutput(gated_content, styles, evidence_gate)
+        return MapperOutput(
+            gated_content,
+            styles,
+            evidence_confidence,
+            edit_permission,
+        )
 
 
 class ResidualSRDecoder(nn.Module):
@@ -133,10 +177,16 @@ class ResidualSRDecoder(nn.Module):
             nn.Conv2d(current, 3, 3, padding=1),
             nn.Tanh(),
         )
+        self.edit_output = nn.Sequential(
+            nn.Conv2d(current, current, 3, padding=1),
+            nn.LeakyReLU(0.1, inplace=True),
+            nn.Conv2d(current, 3, 3, padding=1),
+            nn.Tanh(),
+        )
 
     def forward(
         self, mapped: MapperOutput, lr_features: list[torch.Tensor]
-    ) -> torch.Tensor:
+    ) -> DecoderOutput:
         x = self.input(mapped.content)
         source_skips = [lr_features[1], lr_features[0], lr_features[0], lr_features[0]]
         for index, block in enumerate(self.blocks):
@@ -147,4 +197,7 @@ class ResidualSRDecoder(nn.Module):
             )
             x = x + self.skip_projections[index](skip)
             x = block(x, mapped.styles[index])
-        return self.output(x)
+        return DecoderOutput(
+            detail_residual=self.output(x),
+            edit_residual=self.edit_output(x),
+        )

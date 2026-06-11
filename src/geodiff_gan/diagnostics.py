@@ -293,7 +293,9 @@ class DiagnosticRecorder:
             "lr_features.f16",
             "latent.denoised",
             "mapper.content",
-            "mapper.evidence_gate",
+            "mapper.evidence_confidence",
+            "mapper.edit_permission",
+            "output.abstention_map",
         ]
         features = []
         for name in feature_order:

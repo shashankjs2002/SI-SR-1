@@ -101,6 +101,9 @@ def main() -> None:
                 "f32_and_f16_lr_features_are_recorded_but_not_consumed": True,
                 "training_back_projection_steps_are_configurable": True,
                 "inference_sr_mode_uses_three_back_projection_steps": True,
+                "evidence_and_edit_policies_are_separate": True,
+                "sr_abstains_toward_the_deterministic_base": True,
+                "edit_residual_has_a_dedicated_decoder_head": True,
             },
         }
     )

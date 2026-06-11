@@ -144,6 +144,29 @@ class TrainingSmokeTest(unittest.TestCase):
                 trainer.train()
             self.assertEqual(discriminator_loss.call_count, 2)
 
+    def test_counterfactual_edit_does_not_use_paired_reconstruction(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, config = self._fixture(root)
+            config["training"].update(
+                {
+                    "stage": "edit",
+                    "output_dir": str(root / "counterfactual"),
+                }
+            )
+            config["prompts"] = {
+                "null_probability": 0.0,
+                "paraphrase_probability": 0.0,
+                "mismatch_probability": 1.0,
+            }
+            trainer = Trainer(config)
+            batch = next(iter(trainer._loader("train")))
+            _, losses = trainer._forward_stage(batch)
+            self.assertEqual(float(losses["charbonnier"]), 0.0)
+            self.assertEqual(float(losses["ssim"]), 0.0)
+            self.assertIn("edit_permission", losses)
+            self.assertIn("edit_localization", losses)
+
 
 if __name__ == "__main__":
     unittest.main()

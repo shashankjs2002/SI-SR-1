@@ -24,7 +24,7 @@ from geodiff_gan.models.base import WindowTransformerBlock
 from geodiff_gan.models.blocks import CrossAttention2d, high_pass
 from geodiff_gan.models.degradation import back_project, random_degradation, sensor_degrade
 from geodiff_gan.models.system import GeoDiffGAN
-from geodiff_gan.text import HashTextEncoder
+from geodiff_gan.text import HashTextEncoder, PromptBatch, augment_prompts
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -63,11 +63,59 @@ class CoreTests(unittest.TestCase):
             latent, lr, context, degradation, mode="sr", base=base, back_projection_steps=1
         )
         self.assertEqual(output.image.shape, base.shape)
+        self.assertEqual(output.evidence_confidence.shape, (1, 1, 8, 8))
+        self.assertEqual(output.edit_permission.shape, (1, 1, 8, 8))
+        self.assertTrue(
+            torch.equal(
+                output.edit_permission,
+                torch.zeros_like(output.edit_permission),
+            )
+        )
+        self.assertEqual(output.raw_detail_residual.shape, base.shape)
+        self.assertEqual(output.raw_edit_residual.shape, base.shape)
+        self.assertEqual(output.abstention_map.shape, (1, 1, 64, 64))
         self.assertFalse(output.metadata[0]["synthetic_edit"])
         edit = model.decode_latent(
             latent, lr, context, degradation, mode="edit", base=base, back_projection_steps=0
         )
         self.assertTrue(edit.metadata[0]["synthetic_edit"])
+        self.assertGreater(float(edit.edit_permission.detach().mean()), 0.0)
+
+    def test_uncertainty_abstention_returns_to_base(self) -> None:
+        model = GeoDiffGAN.from_config(self.config).eval()
+        image = torch.ones(1, 3, 32, 32)
+        base = torch.zeros_like(image)
+        evidence = torch.ones(1, 1, 4, 4)
+        uncertainty = torch.full((1, 32, 32), 1.0)
+        abstained, confidence, abstention = model.apply_uncertainty_abstention(
+            image, base, evidence, uncertainty
+        )
+        self.assertLess(float(abstained.abs().max()), 1e-5)
+        self.assertLess(float(confidence.max()), 1e-5)
+        self.assertGreater(float(abstention.min()), 0.99999)
+
+    def test_prompt_augmentation_reports_policy_labels(self) -> None:
+        augmented = augment_prompts(
+            ["coastal settlement"],
+            null_probability=1.0,
+            paraphrase_probability=0.0,
+            mismatch_probability=0.0,
+            return_metadata=True,
+        )
+        self.assertIsInstance(augmented, PromptBatch)
+        assert isinstance(augmented, PromptBatch)
+        self.assertEqual(augmented.prompts, [""])
+        self.assertEqual(augmented.kinds, ["null"])
+        mismatch = augment_prompts(
+            ["coastal settlement"],
+            null_probability=0.0,
+            paraphrase_probability=0.0,
+            mismatch_probability=1.0,
+            return_metadata=True,
+        )
+        assert isinstance(mismatch, PromptBatch)
+        self.assertEqual(mismatch.kinds, ["mismatch"])
+        self.assertNotEqual(mismatch.prompts, ["coastal settlement"])
 
     def test_short_ddim_sample(self) -> None:
         model = GeoDiffGAN.from_config(self.config).eval()

@@ -25,8 +25,19 @@ class GeoDiffOutput:
     base: torch.Tensor
     residual: torch.Tensor
     latent: torch.Tensor
-    evidence_gate: torch.Tensor
+    evidence_confidence: torch.Tensor
+    edit_permission: torch.Tensor
+    abstention_map: torch.Tensor
+    raw_detail_residual: torch.Tensor
+    raw_edit_residual: torch.Tensor
+    ungated_sr: torch.Tensor
+    sr_anchor: torch.Tensor
     metadata: list[dict[str, Any]]
+
+    @property
+    def evidence_gate(self) -> torch.Tensor:
+        """Backward-compatible alias for pre-dual-policy callers."""
+        return self.evidence_confidence
 
 
 class GeoDiffGAN(nn.Module):
@@ -50,6 +61,10 @@ class GeoDiffGAN(nn.Module):
         use_text_conditioning: bool = True,
         use_degradation_conditioning: bool = True,
         use_evidence_gate: bool = True,
+        use_edit_gate: bool = True,
+        use_uncertainty_abstention: bool = True,
+        abstention_confidence_floor: float = 0.0,
+        uncertainty_scale: float = 0.0025,
         use_back_projection: bool = True,
         degradation_severity: str = "mild",
     ) -> None:
@@ -59,6 +74,9 @@ class GeoDiffGAN(nn.Module):
         self.context_dim = context_dim
         self.use_text_conditioning = use_text_conditioning
         self.use_degradation_conditioning = use_degradation_conditioning
+        self.use_uncertainty_abstention = use_uncertainty_abstention
+        self.abstention_confidence_floor = float(abstention_confidence_floor)
+        self.uncertainty_scale = float(uncertainty_scale)
         self.use_back_projection = use_back_projection
         self.degradation_severity = degradation_severity
         self.base = SwinIRBase(
@@ -85,6 +103,7 @@ class GeoDiffGAN(nn.Module):
             context_dim=context_dim,
             style_dim=style_dim,
             use_evidence_gate=use_evidence_gate,
+            use_edit_gate=use_edit_gate,
         )
         self.decoder = ResidualSRDecoder(
             content_channels=mapper_channels,
@@ -115,6 +134,14 @@ class GeoDiffGAN(nn.Module):
             use_text_conditioning=model.get("use_text_conditioning", True),
             use_degradation_conditioning=model.get("use_degradation_conditioning", True),
             use_evidence_gate=model.get("use_evidence_gate", True),
+            use_edit_gate=model.get("use_edit_gate", True),
+            use_uncertainty_abstention=model.get(
+                "use_uncertainty_abstention", True
+            ),
+            abstention_confidence_floor=model.get(
+                "abstention_confidence_floor", 0.0
+            ),
+            uncertainty_scale=model.get("uncertainty_scale", 0.0025),
             use_back_projection=model.get("use_back_projection", True),
             degradation_severity=config.get("data", {}).get(
                 "degradation_severity", "mild"
@@ -129,6 +156,50 @@ class GeoDiffGAN(nn.Module):
         if not self.use_degradation_conditioning:
             degradation = torch.zeros_like(degradation)
         return context, degradation
+
+    def _resize_policy(
+        self, policy: torch.Tensor, output_size: tuple[int, int]
+    ) -> torch.Tensor:
+        return torch.nn.functional.interpolate(
+            policy,
+            size=output_size,
+            mode="bilinear",
+            align_corners=False,
+        ).clamp(0, 1)
+
+    def _effective_confidence(self, confidence: torch.Tensor) -> torch.Tensor:
+        floor = min(max(self.abstention_confidence_floor, 0.0), 1.0)
+        return floor + (1 - floor) * confidence
+
+    def apply_uncertainty_abstention(
+        self,
+        image: torch.Tensor,
+        base: torch.Tensor,
+        evidence_confidence: torch.Tensor,
+        uncertainty: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Blend stochastic SR toward the deterministic base when support is weak."""
+        evidence = self._resize_policy(evidence_confidence, image.shape[-2:])
+        if uncertainty.ndim == 3:
+            uncertainty = uncertainty[:, None]
+        uncertainty = torch.nn.functional.interpolate(
+            uncertainty,
+            size=image.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        ).clamp_min(0)
+        if self.use_uncertainty_abstention:
+            agreement = torch.exp(
+                -uncertainty / max(self.uncertainty_scale, 1e-8)
+            )
+            confidence = evidence * agreement
+            blend_strength = agreement
+        else:
+            confidence = evidence
+            blend_strength = torch.ones_like(evidence)
+        effective = self._effective_confidence(blend_strength)
+        abstained = base + effective * (image - base)
+        return abstained.clamp(0, 1), confidence, 1 - confidence
 
     @staticmethod
     def mode_tensor(mode: Mode, batch: int, device: torch.device) -> torch.Tensor:
@@ -193,37 +264,75 @@ class GeoDiffGAN(nn.Module):
             diagnostics.capture("latent.denoised", latent, visual="features")
         mode_values = self.mode_tensor(mode, lr.shape[0], lr.device)
         mapped = self.mapper(latent, lr_features[1], context, mode_values)
-        raw_residual = self.decoder(mapped, lr_features)
-        residual = raw_residual
+        decoded = self.decoder(mapped, lr_features)
+        raw_detail = decoded.detail_residual
+        raw_edit = decoded.edit_residual
+        evidence_hr = self._resize_policy(
+            mapped.evidence_confidence, base.shape[-2:]
+        )
+        edit_hr = self._resize_policy(mapped.edit_permission, base.shape[-2:])
+        effective_evidence = self._effective_confidence(evidence_hr)
+        detail_residual = high_pass(raw_detail)
+        evidence_residual = detail_residual * effective_evidence
+        edit_residual = raw_edit * edit_hr
+        ungated_sr = (base + detail_residual).clamp(0, 1)
+        sr_anchor = (base + evidence_residual).clamp(0, 1)
+        residual = (
+            evidence_residual
+            if mode == "sr"
+            else evidence_residual + edit_residual
+        )
         if diagnostics is not None:
             diagnostics.capture("mapper.content", mapped.content, visual="features")
             diagnostics.capture(
-                "mapper.evidence_gate", mapped.evidence_gate, visual="heatmap"
+                "mapper.evidence_confidence",
+                mapped.evidence_confidence,
+                visual="heatmap",
+            )
+            diagnostics.capture(
+                "mapper.edit_permission",
+                mapped.edit_permission,
+                visual="heatmap",
             )
             for index, style in enumerate(mapped.styles):
                 diagnostics.capture(f"mapper.style_{index}", style)
-            diagnostics.capture("decoder.raw_residual", raw_residual, visual="residual")
-            diagnostics.scalar("mapper.gate_mean", mapped.evidence_gate.mean())
-            diagnostics.scalar("mapper.gate_std", mapped.evidence_gate.std(unbiased=False))
+            diagnostics.capture(
+                "decoder.raw_detail_residual", raw_detail, visual="residual"
+            )
+            diagnostics.capture(
+                "decoder.raw_edit_residual", raw_edit, visual="residual"
+            )
             diagnostics.scalar(
-                "mapper.gate_saturated_fraction",
+                "mapper.evidence_mean", mapped.evidence_confidence.mean()
+            )
+            diagnostics.scalar(
+                "mapper.evidence_std",
+                mapped.evidence_confidence.std(unbiased=False),
+            )
+            diagnostics.scalar(
+                "mapper.evidence_saturated_fraction",
                 (
-                    (mapped.evidence_gate < 0.05)
-                    | (mapped.evidence_gate > 0.95)
+                    (mapped.evidence_confidence < 0.05)
+                    | (mapped.evidence_confidence > 0.95)
                 )
                 .float()
                 .mean(),
             )
+            diagnostics.scalar(
+                "mapper.edit_permission_mean", mapped.edit_permission.mean()
+            )
+            diagnostics.capture(
+                "output.abstention_map", 1 - evidence_hr, visual="heatmap"
+            )
         if mode == "sr":
-            residual = high_pass(residual)
             if diagnostics is not None:
                 diagnostics.capture("decoder.residual", residual, visual="residual")
-                raw_low = raw_residual - high_pass(raw_residual)
+                raw_low = raw_detail - detail_residual
                 diagnostics.scalar(
                     "residual.raw_low_frequency_fraction",
-                    raw_low.abs().mean() / raw_residual.abs().mean().clamp_min(1e-8),
+                    raw_low.abs().mean() / raw_detail.abs().mean().clamp_min(1e-8),
                 )
-            estimate = (base + residual).clamp(0, 1)
+            estimate = sr_anchor
             steps = 3 if back_projection_steps is None else back_projection_steps
             steps = steps if self.use_back_projection else 0
             image = back_project(
@@ -281,16 +390,40 @@ class GeoDiffGAN(nn.Module):
                 "spatial.projection_update_abs_mean",
                 (image - estimate).abs().mean(),
             )
-        metadata = [
-            {
-                "mode": mode,
-                "synthetic_edit": mode == "edit",
-                "scale": self.scale,
-                "back_projection_steps": steps,
-            }
-            for _ in range(lr.shape[0])
-        ]
-        return GeoDiffOutput(image, base, residual, latent, mapped.evidence_gate, metadata)
+        metadata = []
+        evidence_means = mapped.evidence_confidence.flatten(1).mean(dim=1)
+        permission_means = mapped.edit_permission.flatten(1).mean(dim=1)
+        for index in range(lr.shape[0]):
+            metadata.append(
+                {
+                    "mode": mode,
+                    "synthetic_edit": mode == "edit",
+                    "scale": self.scale,
+                    "back_projection_steps": steps,
+                    "dual_policy_gating": True,
+                    "uncertainty_abstention": self.use_uncertainty_abstention,
+                    "evidence_confidence_mean": float(
+                        evidence_means[index].detach()
+                    ),
+                    "edit_permission_mean": float(
+                        permission_means[index].detach()
+                    ),
+                }
+            )
+        return GeoDiffOutput(
+            image=image,
+            base=base,
+            residual=residual,
+            latent=latent,
+            evidence_confidence=mapped.evidence_confidence,
+            edit_permission=mapped.edit_permission,
+            abstention_map=1 - evidence_hr,
+            raw_detail_residual=raw_detail,
+            raw_edit_residual=raw_edit,
+            ungated_sr=ungated_sr,
+            sr_anchor=sr_anchor,
+            metadata=metadata,
+        )
 
     @torch.no_grad()
     def sample(

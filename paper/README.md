@@ -25,6 +25,7 @@ Regenerate the exact architecture poster after changing model dimensions:
 
 ```bash
 python build_architecture_infographic.py
+python build_dual_policy_infographic.py
 ```
 
 Compile from this directory with a standard LaTeX distribution:

@@ -3,9 +3,19 @@ from __future__ import annotations
 import hashlib
 import re
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 
 import torch
 from torch import nn
+
+
+COUNTERFACTUAL_PROMPTS = (
+    "dense urban blocks with intersecting roads and compact rooftops",
+    "open agricultural parcels with regular field boundaries",
+    "continuous forest canopy with irregular natural texture",
+    "dry exposed terrain with sparse vegetation and rocky texture",
+    "coastal water beside a developed shoreline",
+)
 
 
 class TextEncoder(nn.Module, ABC):
@@ -134,25 +144,42 @@ def build_text_encoder(config: dict) -> TextEncoder:
     )
 
 
+@dataclass(frozen=True)
+class PromptBatch:
+    prompts: list[str]
+    kinds: list[str]
+
+
 def augment_prompts(
     prompts: list[str],
     null_probability: float = 0.4,
     paraphrase_probability: float = 0.2,
     mismatch_probability: float = 0.1,
-) -> list[str]:
+    return_metadata: bool = False,
+) -> list[str] | PromptBatch:
     if not prompts:
-        return prompts
+        return PromptBatch(prompts, []) if return_metadata else prompts
     values = prompts.copy()
+    kinds = ["original"] * len(values)
     random_values = torch.rand(len(values))
     for index in range(len(values)):
         if random_values[index] < null_probability:
             values[index] = ""
+            kinds[index] = "null"
         elif random_values[index] < null_probability + paraphrase_probability:
             values[index] = f"Overhead satellite view containing: {values[index]}"
+            kinds[index] = "paraphrase"
         elif (
             random_values[index]
             < null_probability + paraphrase_probability + mismatch_probability
-            and len(values) > 1
         ):
-            values[index] = prompts[(index + 1) % len(values)]
-    return values
+            if len(values) > 1:
+                values[index] = prompts[(index + 1) % len(values)]
+            else:
+                counterfactual_index = int(
+                    torch.randint(0, len(COUNTERFACTUAL_PROMPTS), (1,))
+                )
+                values[index] = COUNTERFACTUAL_PROMPTS[counterfactual_index]
+            kinds[index] = "mismatch"
+    result = PromptBatch(values, kinds)
+    return result if return_metadata else result.prompts

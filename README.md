@@ -8,7 +8,7 @@ New to the subject? Follow the sequential [GeoDiff-GAN learning course](learning
 starts with the mathematical, PyTorch, remote-sensing, GAN, and diffusion prerequisites before
 deriving this repository's architecture, training stages, diagnostics, and research methodology.
 
-![GeoDiff-GAN architecture](docs/images/geodiff-gan-architecture.png)
+![GeoDiff-GAN dual-policy architecture](docs/images/geodiff-dual-policy-architecture.png)
 
 Input/output and tensor-shape explainers:
 
@@ -39,26 +39,34 @@ LR RGB
   |                                                  |
   +--> LR encoder --> latent residual diffusion      |
                          |                            |
-                    GeoMapper                        |
-              (spatial content, FiLM, gate)          |
+                 dual-policy GeoMapper               |
+       (content, FiLM, evidence, edit permission)    |
                          |                            |
-                 residual GAN decoder ---------------+
+               dual-head GAN decoder                 |
+              /                         \             |
+      evidence detail              edit residual     |
+              \                         /             |
+               policy-gated composition -------------+
                          |
-          high-pass + sensor back-projection (SR)
-             or soft consistency projection (edit)
+       sensor projection + uncertainty abstention
 ```
 
-`sr` mode restricts generation to high-frequency residuals and applies three consistency
-projections. `edit` mode permits full-band prompt-guided residuals, applies only a soft projection,
-and writes `"synthetic_edit": true` to the output JSON.
+`sr` mode uses only high-frequency detail, scales it with calibrated evidence confidence, applies
+three consistency projections, and can blend stochastic predictions back toward the deterministic
+base where ensemble disagreement is high. `edit` mode uses a separate full-band residual head
+controlled by a spatial edit-permission map, applies only a soft projection, and writes
+`"synthetic_edit": true` to the output JSON.
 
 The implementation includes:
 
 - SwinIR-style base branch with six shifted-window blocks and 4x pixel shuffle.
 - Residual VAE with a four-channel latent at one-eighth HR resolution.
 - Conditional `v`-prediction U-Net with LR, degradation, mode, and text conditioning.
-- Four-block GeoMapper with a spatial prompt-evidence gate and per-stage FiLM styles.
-- Four-stage residual decoder and spatial plus Haar-wavelet discriminators.
+- Four-block dual-policy GeoMapper with separate evidence-confidence and edit-permission maps.
+- Four-stage dual-head residual decoder: evidence detail for SR and full-band change for edits.
+- Confidence calibration, sparse counterfactual edit coverage, and edit-localization objectives.
+- Ensemble uncertainty abstention that returns unsupported SR regions toward the SwinIR base.
+- Spatial plus Haar-wavelet discriminators.
 - Differentiable MTF degradation and iterative LR consistency projection.
 - Tile-level train/validation/test isolation, SCL cloud filtering, and windowed SAFE processing.
 - Five-stage training, DDP, AMP, gradient accumulation, checkpoint transfer, and uncertainty runs.
@@ -176,7 +184,8 @@ geodiff-infer \
   --mode edit --steps 20 --guidance 3.0 --seed 7
 ```
 
-Evaluate eight stochastic samples and save per-pixel variance:
+Evaluate eight stochastic samples and save per-pixel variance, confidence, edit permission, and
+abstention maps:
 
 ```bash
 geodiff-evaluate \
@@ -186,8 +195,10 @@ geodiff-evaluate \
   --split test --samples 8 --steps 20 --mode sr
 ```
 
-PSNR, SSIM, edge F1, and LR re-degradation error are always reported. LPIPS and DISTS are added when
-the metrics extra is installed. Edit evaluation also reports frozen vision-language alignment.
+PSNR, SSIM, edge F1, and LR re-degradation error are always reported. Evaluation also reports
+confidence-error correlation, uncertainty-error correlation, and selective L1 at 80% coverage.
+LPIPS and DISTS are added when the metrics extra is installed. Edit evaluation also reports frozen
+vision-language alignment.
 
 Generate the built-in bicubic and trained base-branch baselines:
 
@@ -218,7 +229,8 @@ geodiff-debug \
 The folder contains:
 
 - `overview.png`: LR, base, residual, output, target, re-degraded output, and error maps.
-- `features.png`: all LR feature scales, denoised latent, mapper content, and evidence gate.
+- `features.png`: LR features, denoised latent, mapper content, evidence confidence, edit
+  permission, and abstention map.
 - `diffusion_trajectory.png`: selected noisy and predicted-clean latent states.
 - `report.json`: shapes, ranges, NaN/Inf counts, losses, gate saturation, residual strength, and
   LR consistency before and after back-projection.
@@ -235,6 +247,8 @@ The following `model` switches can be changed without code edits:
 - `use_text_conditioning`
 - `use_degradation_conditioning`
 - `use_evidence_gate`
+- `use_edit_gate`
+- `use_uncertainty_abstention`
 - `use_back_projection`
 
 Run each ablation from the same parent checkpoint and seed set. Also compare bicubic, the trained

@@ -74,6 +74,44 @@ def degradation_consistency(
     )
 
 
+def evidence_calibration_loss(
+    confidence: torch.Tensor,
+    ungated_prediction: torch.Tensor,
+    target: torch.Tensor,
+    temperature: float = 0.05,
+    smoothing_window: int = 9,
+) -> torch.Tensor:
+    """Calibrate confidence against local paired-target reconstruction accuracy."""
+    with torch.no_grad():
+        error = (ungated_prediction - target).abs().mean(dim=1, keepdim=True)
+        error = F.avg_pool2d(
+            error,
+            smoothing_window,
+            stride=1,
+            padding=smoothing_window // 2,
+        )
+        target_confidence = torch.exp(-error / max(temperature, 1e-8))
+        target_confidence = F.interpolate(
+            target_confidence,
+            size=confidence.shape[-2:],
+            mode="area",
+        )
+    return F.smooth_l1_loss(confidence, target_confidence)
+
+
+def edit_localization_loss(
+    raw_edit_residual: torch.Tensor,
+    edit_permission: torch.Tensor,
+) -> torch.Tensor:
+    permission = F.interpolate(
+        edit_permission,
+        size=raw_edit_residual.shape[-2:],
+        mode="bilinear",
+        align_corners=False,
+    )
+    return ((1 - permission) * raw_edit_residual.abs()).mean()
+
+
 def snr_weighted_velocity_loss(
     prediction: torch.Tensor,
     target: torch.Tensor,

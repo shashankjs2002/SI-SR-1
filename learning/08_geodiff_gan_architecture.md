@@ -11,7 +11,7 @@
 
 For batch size \(B\):
 
-![GeoDiff-GAN architecture](../docs/images/geodiff-gan-architecture.png)
+![GeoDiff-GAN dual-policy architecture](../docs/images/geodiff-dual-policy-architecture.png)
 
 ![GeoDiff-GAN tensor shapes](../docs/images/geodiff-tensor-shapes.png)
 
@@ -30,8 +30,11 @@ flowchart TD
     MAP["GeoMapper"]
     CONTENT["content<br/>B x 128 x 64 x 64"]
     STYLES["4 styles<br/>each B x 256"]
-    GATE["gate<br/>B x 1 x 64 x 64"]
-    DEC["Residual decoder<br/>B x 3 x 512 x 512"]
+    EVID["evidence confidence<br/>B x 1 x 64 x 64"]
+    EDIT["edit permission<br/>B x 1 x 64 x 64"]
+    DEC["Dual-head residual decoder"]
+    DETAIL["detail residual<br/>B x 3 x 512 x 512"]
+    CHANGE["edit residual<br/>B x 3 x 512 x 512"]
     OUT["SR/edit output<br/>B x 3 x 512 x 512"]
 
     LR --> BASE
@@ -45,12 +48,18 @@ flowchart TD
     F64 --> MAP
     MAP --> CONTENT
     MAP --> STYLES
-    MAP --> GATE
+    MAP --> EVID
+    MAP --> EDIT
     CONTENT --> DEC
     STYLES --> DEC
     F64 --> DEC
     F128 --> DEC
-    DEC --> OUT
+    DEC --> DETAIL
+    DEC --> CHANGE
+    EVID --> DETAIL
+    EDIT --> CHANGE
+    DETAIL --> OUT
+    CHANGE --> OUT
     BASE --> OUT
 ```
 
@@ -191,99 +200,85 @@ content realization.
 
 Role: model uncertainty and multimodality that the deterministic base cannot express.
 
-## 6. GeoMapper
+## 6. Dual-Policy GeoMapper
 
-Input:
+The mapper predicts two different spatial decisions at the latent grid:
+
+| Policy | Shape | Inputs | Meaning |
+|---|---:|---|---|
+| Evidence confidence \(c_e\) | \(B\times1\times64\times64\) | latent content and LR evidence | whether generated detail is supported by the observation |
+| Edit permission \(c_p\) | \(B\times1\times64\times64\) | latent content, prompt context, and evidence | where a counterfactual prompt may change the image |
+
+These maps are deliberately not aliases. Evidence confidence is text-independent at its prediction
+head, while edit permission is prompt-conditioned and forced to zero in SR mode.
 
 \[
-[\hat{z}_0;f_{64}]
-\in\mathbb{R}^{B\times132\times64\times64}.
+h_{\text{map}} =
+h_{\text{content}} +
+h_{\text{text}}\left(
+0.15c_e(1-m)+c_pm
+\right),
 \]
 
-Four spatial residual blocks map this into:
+where \(m=0\) for SR and \(m=1\) for edit mode. The same policy strength also limits text entering
+the layer-wise FiLM styles.
 
-1. content tensor \(B\times128\times64\times64\);
-2. four style vectors, each \(B\times256\);
-3. evidence gate \(B\times1\times64\times64\).
+## 7. Dual-Head Residual Decoder
 
-```mermaid
-flowchart TD
-    Z["Denoised latent<br/>4 x 64 x 64"] --> CAT["Concat"]
-    F["LR f64<br/>128 x 64 x 64"] --> CAT
-    CAT --> RB["4 spatial residual blocks"]
-    TXT["Pooled prompt context"] --> PG["Prompt projection"]
-    RB --> CONTENT["Spatial content"]
-    RB --> GATE["Evidence gate"]
-    RB --> STYLE["Content summary"]
-    PG --> GATE
-    PG --> STYLE
-    STYLE --> S1["Style 64 stage"]
-    STYLE --> S2["Style 128 stage"]
-    STYLE --> S3["Style 256 stage"]
-    STYLE --> S4["Style 512 stage"]
-```
+The shared decoder trunk upsamples \(64\to128\to256\to512\) and receives LR skips. It then splits:
 
-Why not send latent directly to the decoder? The mapper translates diffusion's denoising space into
-two decoder control forms:
-
-- spatial content for location-specific generation;
-- global/channel styles for stage-wise feature modulation.
-
-This interface is a central research hypothesis.
-
-## 7. Residual GAN Decoder
-
-| Stage | Output shape | Evidence |
+| Head | Output | Allowed use |
 |---|---:|---|
-| input/content | \(B\times128\times64\times64\) | mapper + \(f_{64}\) |
-| upsample 1 | \(B\times96\times128\times128\) | \(f_{128}\) skip |
-| upsample 2 | \(B\times64\times256\times256\) | interpolated LR evidence |
-| upsample 3 | \(B\times48\times512\times512\) | interpolated LR evidence |
-| RGB head | \(B\times3\times512\times512\) | predicted residual |
+| Detail head | \(B\times3\times512\times512\) | high-pass evidence detail in both modes |
+| Edit head | \(B\times3\times512\times512\) | full-band synthetic change in edit mode only |
 
-Each stage receives a style/FiLM vector. LR skip features are resized to the stage grid and fused.
-
-```mermaid
-flowchart LR
-    C["128 x 64 x 64"] --> U1["96 x 128 x 128"]
-    U1 --> U2["64 x 256 x 256"]
-    U2 --> U3["48 x 512 x 512"]
-    U3 --> R["3 x 512 x 512 residual"]
-    S["Four style vectors"] -. "FiLM per stage" .-> C
-    S -.-> U1
-    S -.-> U2
-    S -.-> U3
-    F["LR skips"] -. "spatial fusion" .-> U1
-    F -.-> U2
-    F -.-> U3
-```
-
-Role: convert a coarse latent representation into high-resolution detail, while adversarial
-training encourages realistic local statistics.
-
-## 8. Output Controller
-
-### SR mode
+The compositions are:
 
 \[
-r_{sr}=r-\operatorname{blur}(r),
+r_{\mathrm{SR}} =
+H(r_{\mathrm{detail}})\odot c_e,
 \]
 
 \[
-\hat{x}_0=\operatorname{clip}(x_{\text{base}}+r_{sr},0,1),
+r_{\mathrm{edit}} =
+H(r_{\mathrm{detail}})\odot c_e +
+r_{\mathrm{change}}\odot c_p.
 \]
 
-followed by three degradation back-projection steps with step size 0.5.
+This prevents the edit branch from silently becoming the SR reconstruction branch.
 
-### Edit mode
+## 8. Confidence Calibration and Abstention
+
+During paired synthetic training, confidence is supervised by local ungated reconstruction error:
 
 \[
-\hat{x}_0=\operatorname{clip}(x_{\text{base}}+r,0,1),
+c_e^*=\exp\left(
+-\frac{\operatorname{AvgPool}(
+|\hat{x}_{\mathrm{ungated}}-x|)}
+\tau}
+\right).
 \]
 
-followed by one soft projection with step size 0.15 and synthetic metadata.
+At multi-sample evaluation, pixelwise variance \(u\) discounts confidence:
 
-Implementation: [`degradation.py`](../src/geodiff_gan/models/degradation.py).
+\[
+c_{\mathrm{final}}=c_e\exp(-u/s_u).
+\]
+
+The final stochastic mean can abstain toward the deterministic base:
+
+\[
+\alpha=\exp(-u/s_u),
+\qquad
+\hat{x}_{\mathrm{abstain}} =
+x_{\mathrm{base}}+
+\alpha(\hat{x}_{\mathrm{stochastic}}-x_{\mathrm{base}}).
+\]
+
+The stochastic image is already evidence-gated, so ensemble abstention applies only the additional
+agreement factor instead of multiplying evidence twice. The model therefore exposes uncertainty as
+an operational reconstruction policy, not only as a heatmap. Back-projection remains the final
+sensor-consistency controller: three steps for SR and one soft step for edit mode.
 
 ## 9. Discriminators
 
@@ -305,10 +300,12 @@ It **encourages** conservation through:
 2. LR features aligned to the latent and decoder;
 3. residual rather than unrestricted output;
 4. high-pass filtering in SR mode;
-5. degradation-consistency loss;
-6. iterative back-projection;
-7. conditional discriminators;
-8. tile-preserving data preparation.
+5. calibrated evidence confidence;
+6. a separate edit permission policy and decoder head;
+7. degradation-consistency loss and iterative back-projection;
+8. stochastic uncertainty abstention;
+9. conditional discriminators;
+10. tile-preserving data preparation.
 
 It does **not mathematically guarantee** exact spatial truth because:
 
@@ -332,8 +329,8 @@ These are experiments, not automatic upgrades:
 |---|---|---|
 | use \(f_{32},f_{16}\) in U-Net/decoder | stronger multi-scale geometry | more memory; may duplicate U-Net features |
 | learned degradation adjoint | better back-projection | may exploit simulator and generalize poorly |
-| cross-attention gate regularization | improve prompt evidence behavior | can suppress useful conditioning |
-| uncertainty-aware residual scaling | reduce risky detail in uncertain regions | needs calibrated uncertainty |
+| confidence calibration alternatives | improve selective-risk calibration | can overfit the synthetic target error |
+| dense edit masks | improve edit localization | requires reliable counterfactual supervision |
 | spectral-angle/radiometric loss | protect RGB ratios | may trade off texture |
 | geospatial edge constraints | preserve roads/field boundaries | requires reliable labels or operators |
 | prompt-localization supervision | ensure text affects relevant regions | captions lack dense localization |
@@ -345,7 +342,7 @@ new modules.
 
 1. Reproduce every spatial shape from 128 LR to 512 output.
 2. Why is the latent \(64\times64\) while the LR is \(128\times128\)?
-3. Explain the difference between GeoMapper content, styles, and gate.
+3. Explain the difference between content, styles, evidence confidence, and edit permission.
 4. Identify all paths by which LR evidence reaches the output.
 5. Defend or criticize the claim that the model "conserves spatial data."
 
@@ -354,6 +351,7 @@ new modules.
 - [ ] I can draw the architecture from memory.
 - [ ] I can state every major tensor shape.
 - [ ] I can explain the unique role of every module.
+- [ ] I can distinguish reconstruction confidence from edit authority.
 - [ ] I know which conservation mechanisms are soft constraints.
 - [ ] I can propose an improvement with a falsifiable ablation.
 

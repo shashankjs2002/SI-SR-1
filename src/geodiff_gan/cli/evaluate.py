@@ -17,6 +17,17 @@ from ..text import build_text_encoder
 from ..training.checkpoint import load_checkpoint
 
 
+def _safe_correlation(first: torch.Tensor, second: torch.Tensor) -> float:
+    first = first.float().flatten()
+    second = second.float().flatten()
+    if first.numel() < 2 or first.std(unbiased=False) < 1e-8:
+        return 0.0
+    if second.std(unbiased=False) < 1e-8:
+        return 0.0
+    value = torch.corrcoef(torch.stack((first, second)))[0, 1]
+    return float(value) if torch.isfinite(value) else 0.0
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate GeoDiff-GAN with uncertainty sampling")
     parser.add_argument("--config", required=True)
@@ -57,10 +68,10 @@ def main() -> None:
         degradation = batch["degradation"].to(device)
         context = text_encoder(list(batch["caption"]))
         null_context = text_encoder([""])
-        predictions = []
+        outputs = []
         for seed in range(args.samples):
             generator = torch.Generator(device=device).manual_seed(seed)
-            predictions.append(
+            outputs.append(
                 model.sample(
                     lr,
                     context,
@@ -70,11 +81,33 @@ def main() -> None:
                     sample_steps=args.steps,
                     null_context=null_context,
                     generator=generator,
-                ).image
+                )
             )
+        predictions = [output.image for output in outputs]
         stack = torch.stack(predictions)
-        mean = stack.mean(dim=0)
+        raw_mean = stack.mean(dim=0)
         uncertainty = stack.var(dim=0, unbiased=False).mean(dim=1)
+        evidence = torch.stack(
+            [output.evidence_confidence for output in outputs]
+        ).mean(dim=0)
+        edit_permission = torch.stack(
+            [output.edit_permission for output in outputs]
+        ).mean(dim=0)
+        if args.mode == "sr":
+            mean, combined_confidence, abstention = (
+                model.apply_uncertainty_abstention(
+                    raw_mean,
+                    outputs[0].base,
+                    evidence,
+                    uncertainty,
+                )
+            )
+        else:
+            mean = raw_mean
+            combined_confidence = model._resize_policy(
+                evidence, mean.shape[-2:]
+            )
+            abstention = 1 - combined_confidence
         values = basic_metrics(
             mean,
             hr,
@@ -88,6 +121,22 @@ def main() -> None:
             (lr - clean_lr).abs().mean() / clean_lr.abs().mean().clamp_min(1e-8)
         )
         values.update(optional_metrics(mean, hr))
+        error_map = (mean - hr).abs().mean(dim=1, keepdim=True)
+        confidence_flat = combined_confidence.flatten()
+        uncertainty_flat = uncertainty[:, None].flatten()
+        error_flat = error_map.flatten()
+        if confidence_flat.numel() > 1:
+            values["confidence_error_correlation"] = _safe_correlation(
+                confidence_flat, error_flat
+            )
+            values["uncertainty_error_correlation"] = _safe_correlation(
+                uncertainty_flat, error_flat
+            )
+            keep = max(1, int(confidence_flat.numel() * 0.8))
+            selected = torch.topk(confidence_flat, keep).indices
+            values["selective_l1_at_80pct_coverage"] = float(
+                error_flat[selected].mean()
+            )
         if args.mode == "edit":
             values["prompt_alignment"] = float(
                 1 - text_encoder.alignment_loss(mean, list(batch["caption"]))
@@ -98,7 +147,11 @@ def main() -> None:
         np.savez_compressed(
             output_dir / f"{patch_name}_uncertainty.npz",
             mean=mean[0].detach().cpu().numpy(),
+            raw_mean=raw_mean[0].detach().cpu().numpy(),
             variance=uncertainty[0].detach().cpu().numpy(),
+            evidence_confidence=evidence[0].detach().cpu().numpy(),
+            edit_permission=edit_permission[0].detach().cpu().numpy(),
+            abstention_map=abstention[0].detach().cpu().numpy(),
         )
         count += 1
     summary = {name: value / max(count, 1) for name, value in totals.items()}
