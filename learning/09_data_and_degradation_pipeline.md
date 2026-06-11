@@ -176,7 +176,28 @@ Exclude:
 Audit a random caption sample. A vision-language model can introduce label noise, and prompt
 conditioning will learn that noise.
 
-## 8. Sampling Balance
+## 8. Incremental SAFE Preparation
+
+The preparation command treats each SAFE directory as a transaction:
+
+1. discover products below the input root;
+2. load completed product names from the preparation state;
+3. extract only unseen products;
+4. merge their records into the existing active manifest;
+5. validate tile isolation;
+6. checkpoint the manifest and state before continuing.
+
+This avoids recreating patches when a Kaggle dataset is expanded. Products yielding zero valid
+patches are still marked complete, so repeated runs do not rescan them. Preserve the preparation
+state with the manifest. If the state is absent, completion can be inferred from manifest
+`source_product` fields. The Kaggle notebook also supplies its pre-filter and rejected-patch
+manifests as completion history, so products whose patches were all quarantined are not rescanned.
+
+Changing patch size, stride, or minimum valid fraction is not an incremental update because it
+would mix incompatible examples. The CLI rejects such a state mismatch; use a new output directory
+or an explicit rebuild.
+
+## 9. Sampling Balance
 
 Target 40,000-100,000 valid patches across:
 
@@ -199,7 +220,7 @@ Track distributions by:
 - reflectance histograms;
 - degradation parameters.
 
-## 9. Dataset Failure Modes
+## 10. Dataset Failure Modes
 
 | Failure | Effect |
 |---|---|
@@ -212,7 +233,7 @@ Track distributions by:
 | caption geographic names | location leakage |
 | unbalanced terrain | misleading aggregate metrics |
 
-## 10. Data Validation Checklist
+## 11. Data Validation Checklist
 
 Before a long run:
 

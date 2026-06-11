@@ -45,8 +45,11 @@ Prefix matching is case-insensitive. `MAX_TILES` limits only unmatched/training 
 explicit validation and test products remain selected. If an old manifest lacks `source_product`,
 delete the old manifest and patch directory once and rerun preparation.
 
-`RUN_DATA_PREPARATION=False` reuses an existing manifest. If the manifest does not exist, the
-notebook prepares it automatically instead of continuing with an invalid empty workspace.
+`RUN_DATA_PREPARATION=True` scans for newly attached SAFE products on every run. Previously
+completed products are skipped using `/kaggle/working/geodiff-gan-output/preparation-state.json`.
+Set it to `False` to reuse the current manifest without scanning. If the manifest does not exist,
+the notebook prepares it automatically. Set `REBUILD_PATCHES=True` only when deliberately changing
+patch extraction settings and regenerating selected products.
 
 Do not change `MODEL_SIZE` between training stages in one run. Stage-to-stage checkpoint transfer
 requires identical architecture dimensions.

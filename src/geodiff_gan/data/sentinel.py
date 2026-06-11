@@ -126,7 +126,7 @@ def extract_product_patches(
         test_prefixes=test_prefixes,
         unmatched_split=unmatched_split,
     )
-    destination = output_dir / tile_id
+    destination = output_dir / tile_id / product.stem
     destination.mkdir(parents=True, exist_ok=True)
     band_paths = [
         _find_band(product, "*_B04_10m.jp2"),

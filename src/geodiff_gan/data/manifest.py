@@ -70,6 +70,8 @@ def load_manifest(path: str | Path, split: str | None = None) -> list[ManifestRe
 def write_manifest(path: str | Path, records: list[ManifestRecord]) -> None:
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    with destination.open("w", encoding="utf-8") as handle:
+    temporary = destination.with_suffix(destination.suffix + ".tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
         for record in records:
             handle.write(record.to_json() + "\n")
+    temporary.replace(destination)

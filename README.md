@@ -122,6 +122,12 @@ window location, source SAFE product, split, source, and licence identifier. Pre
 case-insensitive. Explicit validation/test SAFE products are retained even when `--max-products`
 limits the unmatched training products.
 
+Preparation is incremental. When the manifest already exists, completed SAFE products are skipped
+and only newly attached products are extracted. Progress is checkpointed after each product in
+`manifest.jsonl.preparation.json` by default. Use `--state PATH` to choose another location and
+`--rebuild` only when intentionally regenerating patches. Patch directories include the SAFE
+product name, preventing multiple acquisitions of the same MGRS tile from overwriting each other.
+
 All windows from one MGRS tile receive the same split. Preparation stops if prefix rules place the
 same MGRS tile in both validation and test. A study with only a few tiles is invalid: collect enough
 complete tiles to represent train, validation, and test geography.
