@@ -150,6 +150,10 @@ Training stages:
 5. `edit`: counterfactual/mismatched prompt tuning with SigLIP image-text alignment and softer
    consistency.
 
+Joint and edit training use `training.train_back_projection_steps` (default: 1), while SR
+inference uses three projection steps and edit inference uses one. Set the training value to `0`
+only for an explicit no-projection ablation.
+
 The hash text encoder in `configs/smoke.yaml` is only for tests. Research runs must use the frozen
 SigLIP encoder from the default configuration.
 

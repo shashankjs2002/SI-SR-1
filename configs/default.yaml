@@ -56,6 +56,7 @@ training:
   amp: true
   gradient_checkpointing: true
   gradient_clip: 1.0
+  train_back_projection_steps: 1
   discriminator_channels: 64
   output_dir: runs/base
   init_checkpoint: null

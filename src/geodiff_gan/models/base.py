@@ -4,7 +4,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from .blocks import LayerNorm2d
+from .blocks import LayerNorm2d, validate_attention_heads
 
 
 def _window_partition(x: torch.Tensor, window: int) -> tuple[torch.Tensor, tuple[int, int]]:
@@ -55,9 +55,7 @@ class WindowTransformerBlock(nn.Module):
         shift: bool = False,
     ) -> None:
         super().__init__()
-        heads = min(heads, channels)
-        while channels % heads:
-            heads -= 1
+        heads = validate_attention_heads(channels, heads)
         self.window_size = window_size
         self.shift = window_size // 2 if shift else 0
         self.norm1 = nn.LayerNorm(channels)
@@ -138,4 +136,3 @@ class SwinIRBase(nn.Module):
         residual = self.output(self.upsample(features))
         bicubic = F.interpolate(lr, scale_factor=self.scale, mode="bicubic", align_corners=False)
         return (bicubic + residual).clamp(0, 1)
-

@@ -176,10 +176,12 @@ class GeoDiffGAN(nn.Module):
         back_projection_steps: int | None = None,
         diagnostics: DiagnosticRecorder | None = None,
         projection_lr: torch.Tensor | None = None,
+        conditioning_prepared: bool = False,
     ) -> GeoDiffOutput:
         base = self.base(lr) if base is None else base
         consistency_lr = lr if projection_lr is None else projection_lr
-        context, degradation = self.apply_ablation_inputs(context, degradation)
+        if not conditioning_prepared:
+            context, degradation = self.apply_ablation_inputs(context, degradation)
         lr_features = self.lr_encoder(lr)
         if diagnostics is not None:
             diagnostics.capture("input.lr", lr, visual="rgb")
@@ -275,7 +277,10 @@ class GeoDiffGAN(nn.Module):
                 "spatial.lr_error_after_projection",
                 (post_degraded - consistency_lr).abs().mean(),
             )
-            diagnostics.scalar("spatial.projection_update_abs_mean", (image - estimate).abs().mean())
+            diagnostics.scalar(
+                "spatial.projection_update_abs_mean",
+                (image - estimate).abs().mean(),
+            )
         metadata = [
             {
                 "mode": mode,
@@ -312,8 +317,8 @@ class GeoDiffGAN(nn.Module):
             null_context = torch.zeros_like(null_context)
         base = self.base(lr)
         lr_features = self.lr_encoder(lr)
-        latent_height = base.shape[-2] // 8
-        latent_width = base.shape[-1] // 8
+        latent_height = base.shape[-2] // self.vae.downsample_factor
+        latent_width = base.shape[-1] // self.vae.downsample_factor
         mode_values = self.mode_tensor(mode, lr.shape[0], lr.device)
         latent = self.scheduler.ddim_sample(
             self.diffusion,
@@ -338,4 +343,5 @@ class GeoDiffGAN(nn.Module):
             base=base,
             projection_lr=projection_lr,
             diagnostics=diagnostics,
+            conditioning_prepared=True,
         )

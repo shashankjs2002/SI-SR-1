@@ -7,6 +7,16 @@ from torch import nn
 from torch.nn import functional as F
 
 
+def validate_attention_heads(channels: int, heads: int) -> int:
+    if heads < 1:
+        raise ValueError("Attention head count must be positive")
+    if heads > channels or channels % heads:
+        raise ValueError(
+            f"Attention channels ({channels}) must be divisible by heads ({heads})"
+        )
+    return heads
+
+
 class LayerNorm2d(nn.Module):
     def __init__(self, channels: int) -> None:
         super().__init__()
@@ -101,9 +111,7 @@ class ConditionedResBlock(nn.Module):
 class CrossAttention2d(nn.Module):
     def __init__(self, channels: int, context_dim: int, heads: int = 8) -> None:
         super().__init__()
-        heads = min(heads, channels)
-        while channels % heads:
-            heads -= 1
+        heads = validate_attention_heads(channels, heads)
         self.norm = LayerNorm2d(channels)
         self.context_proj = nn.Linear(context_dim, channels)
         self.attention = nn.MultiheadAttention(channels, heads, batch_first=True)

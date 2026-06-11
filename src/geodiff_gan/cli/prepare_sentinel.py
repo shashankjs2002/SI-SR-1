@@ -36,10 +36,22 @@ def main() -> None:
             )
         )
     write_manifest(Path(args.manifest), records)
-    counts = {split: sum(record.split == split for record in records) for split in ("train", "val", "test")}
+    counts = {
+        split: sum(record.split == split for record in records)
+        for split in ("train", "val", "test")
+    }
     print(f"wrote {len(records)} patches to {args.manifest}: {counts}")
+    tile_ids = sorted({record.tile_id for record in records})
+    missing = [split for split, count in counts.items() if count == 0]
+    if len(tile_ids) < 3 or missing:
+        print(
+            "WARNING: tile-level geographic evaluation is incomplete. "
+            f"Found {len(tile_ids)} unique tile(s); missing splits: {missing or 'none'}. "
+            "Use this manifest only for development until geographically separated "
+            "train, validation, and test tiles are present.",
+            flush=True,
+        )
 
 
 if __name__ == "__main__":
     main()
-

@@ -16,6 +16,7 @@ class ResidualVAE(nn.Module):
     ) -> None:
         super().__init__()
         channels = [base_channels, base_channels * 2, base_channels * 4]
+        self.downsample_factor = 2 ** len(channels)
         encoder: list[nn.Module] = [nn.Conv2d(in_channels, channels[0], 3, padding=1)]
         for index, channel in enumerate(channels):
             if index:
@@ -51,7 +52,11 @@ class ResidualVAE(nn.Module):
             latent = mean
         return latent, mean, log_variance
 
-    def decode(self, latent: torch.Tensor, output_size: tuple[int, int] | None = None) -> torch.Tensor:
+    def decode(
+        self,
+        latent: torch.Tensor,
+        output_size: tuple[int, int] | None = None,
+    ) -> torch.Tensor:
         decoded = self.output(self.decoder(self.from_latent(latent)))
         if output_size is not None and decoded.shape[-2:] != output_size:
             decoded = F.interpolate(decoded, size=output_size, mode="bilinear", align_corners=False)
@@ -62,4 +67,3 @@ class ResidualVAE(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         latent, mean, log_variance = self.encode(residual)
         return self.decode(latent, residual.shape[-2:]), latent, mean, log_variance
-

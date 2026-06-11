@@ -226,7 +226,13 @@ sequenceDiagram
 ```
 
 Never backpropagate discriminator updates into the generator; use a detached fake for the
-discriminator step.
+discriminator step. During gradient accumulation, accumulate discriminator loss from every
+microbatch and step both optimizers at the accumulation boundary. Freeze discriminator parameters
+during the generator adversarial pass so only the generated image receives that gradient.
+
+Joint and edit training use a configurable differentiable back-projection count. The default is one
+step, which exposes the trainable generator to the same output controller used at inference without
+letting three correction iterations dominate the reconstruction objective.
 
 ## 6. Stage 5 - Edit Fine-Tuning
 

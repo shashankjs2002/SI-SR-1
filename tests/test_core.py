@@ -3,16 +3,25 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 import torch
 
 from geodiff_gan.config import load_config
+from geodiff_gan.cli.caption_qwen import _resolve_model_class
 from geodiff_gan.data import SentinelPatchDataset
-from geodiff_gan.data.manifest import ManifestRecord, deterministic_split, load_manifest, write_manifest
+from geodiff_gan.data.manifest import (
+    ManifestRecord,
+    deterministic_split,
+    load_manifest,
+    write_manifest,
+)
 from geodiff_gan.diagnostics import DiagnosticRecorder, tensor_statistics
 from geodiff_gan.metrics import edge_f1
-from geodiff_gan.models.blocks import high_pass
+from geodiff_gan.models.base import WindowTransformerBlock
+from geodiff_gan.models.blocks import CrossAttention2d, high_pass
 from geodiff_gan.models.degradation import back_project, random_degradation, sensor_degrade
 from geodiff_gan.models.system import GeoDiffGAN
 from geodiff_gan.text import HashTextEncoder
@@ -37,6 +46,7 @@ class CoreTests(unittest.TestCase):
         residual = torch.rand_like(base) - 0.5
         latent, mean, log_variance = model.vae.encode(residual, sample=False)
         self.assertEqual(latent.shape, (1, 4, 8, 8))
+        self.assertEqual(model.vae.downsample_factor, 8)
         self.assertEqual(mean.shape, log_variance.shape)
         batch = model.prepare_diffusion_batch(latent)
         features = model.lr_encoder(lr)
@@ -65,15 +75,21 @@ class CoreTests(unittest.TestCase):
         encoder = HashTextEncoder(32, 8)
         with tempfile.TemporaryDirectory() as directory:
             diagnostics = DiagnosticRecorder(directory, verbose=False)
-            output = model.sample(
-                lr,
-                encoder(["agricultural fields"]),
-                sample_steps=2,
-                null_context=encoder([""]),
-                generator=torch.Generator().manual_seed(4),
-                diagnostics=diagnostics,
-                diffusion_debug_interval=1,
-            )
+            with mock.patch.object(
+                model,
+                "apply_ablation_inputs",
+                wraps=model.apply_ablation_inputs,
+            ) as apply_ablation:
+                output = model.sample(
+                    lr,
+                    encoder(["agricultural fields"]),
+                    sample_steps=2,
+                    null_context=encoder([""]),
+                    generator=torch.Generator().manual_seed(4),
+                    diagnostics=diagnostics,
+                    diffusion_debug_interval=1,
+                )
+            self.assertEqual(apply_ablation.call_count, 1)
             diagnostics.add_spatial_metrics(
                 lr,
                 output.base,
@@ -191,6 +207,29 @@ class CoreTests(unittest.TestCase):
             write_manifest(manifest, [record])
             loaded = load_manifest(manifest)
             self.assertEqual(loaded[0], record)
+
+    def test_caption_model_class_resolution(self) -> None:
+        explicit = type("ExplicitQwen3VL", (), {})
+        automatic = type("AutomaticMultimodal", (), {})
+        module = SimpleNamespace(
+            Qwen3VLForConditionalGeneration=explicit,
+            AutoModelForMultimodalLM=automatic,
+        )
+        self.assertIs(_resolve_model_class(module), explicit)
+        self.assertIs(
+            _resolve_model_class(
+                SimpleNamespace(AutoModelForMultimodalLM=automatic)
+            ),
+            automatic,
+        )
+        with self.assertRaises(RuntimeError):
+            _resolve_model_class(SimpleNamespace())
+
+    def test_attention_heads_must_divide_channels(self) -> None:
+        with self.assertRaisesRegex(ValueError, "divisible"):
+            WindowTransformerBlock(channels=10, heads=6)
+        with self.assertRaisesRegex(ValueError, "divisible"):
+            CrossAttention2d(channels=10, context_dim=8, heads=6)
 
     def test_rgb_window_maps_to_scl_resolution(self) -> None:
         try:

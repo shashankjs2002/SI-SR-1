@@ -99,7 +99,7 @@ def main() -> None:
             "guidance": args.guidance,
             "architecture_notes": {
                 "f32_and_f16_lr_features_are_recorded_but_not_consumed": True,
-                "training_joint_path_uses_loss_consistency_without_back_projection": True,
+                "training_back_projection_steps_are_configurable": True,
                 "inference_sr_mode_uses_three_back_projection_steps": True,
             },
         }

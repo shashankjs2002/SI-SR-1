@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 from PIL import Image
@@ -13,6 +14,23 @@ CAPTION_INSTRUCTION = """Describe this satellite image patch as compact JSON wit
 land_cover, visible_objects, object_density, terrain, texture, confidence.
 Only describe visible evidence. Do not infer coordinates, city names, country names,
 ownership, people, or events. Keep each value short."""
+
+
+def _resolve_model_class(transformers_module: Any) -> type:
+    """Resolve Qwen3-VL across supported Transformers API generations."""
+    for name in (
+        "Qwen3VLForConditionalGeneration",
+        "AutoModelForMultimodalLM",
+        "AutoModelForVision2Seq",
+    ):
+        model_class = getattr(transformers_module, name, None)
+        if model_class is not None:
+            return model_class
+    raise RuntimeError(
+        "The installed Transformers build does not expose a Qwen3-VL-compatible "
+        "conditional-generation class. Install the caption dependencies from "
+        "pyproject.toml or requirements-kaggle.txt."
+    )
 
 
 def _load_image(path: str) -> Image.Image:
@@ -39,13 +57,15 @@ def main() -> None:
     args = build_parser().parse_args()
     try:
         import torch
-        from transformers import AutoModelForMultimodalLM, AutoProcessor, BitsAndBytesConfig
+        import transformers
+        from transformers import AutoProcessor, BitsAndBytesConfig
     except ImportError as error:
         raise SystemExit(
             "Install geodiff-gan[caption] before running Qwen3-VL captioning"
         ) from error
+    model_class = _resolve_model_class(transformers)
     quantization = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.float16)
-    model = AutoModelForMultimodalLM.from_pretrained(
+    model = model_class.from_pretrained(
         args.model,
         device_map="auto",
         quantization_config=quantization,

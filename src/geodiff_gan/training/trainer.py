@@ -4,6 +4,7 @@ import json
 import os
 import random
 from collections import defaultdict
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -43,6 +44,11 @@ class Trainer:
         self.stage = config["training"]["stage"]
         if self.stage not in STAGES:
             raise ValueError(f"Unknown stage {self.stage!r}; expected one of {STAGES}")
+        self.train_back_projection_steps = int(
+            config["training"].get("train_back_projection_steps", 1)
+        )
+        if self.train_back_projection_steps < 0:
+            raise ValueError("training.train_back_projection_steps must be non-negative")
         self.distributed = int(os.environ.get("WORLD_SIZE", "1")) > 1
         self.world_size = int(os.environ.get("WORLD_SIZE", "1"))
         self.local_rank = int(os.environ.get("LOCAL_RANK", "0"))
@@ -160,6 +166,7 @@ class Trainer:
             self.model.decoder.requires_grad_(True)
             if self.stage == "joint":
                 self.model.lr_encoder.requires_grad_(True)
+            # Edit tuning keeps the spatial evidence encoder fixed by design.
 
     def _loader(self, split: str) -> DataLoader:
         data = self.config["data"]
@@ -172,7 +179,11 @@ class Trainer:
             degradation_seed=int(data.get("degradation_seed", 0)),
             degradation_severity=data.get("degradation_severity", "mild"),
         )
-        sampler = DistributedSampler(dataset, shuffle=split == "train") if self.distributed else None
+        sampler = (
+            DistributedSampler(dataset, shuffle=split == "train")
+            if self.distributed
+            else None
+        )
         return DataLoader(
             dataset,
             batch_size=int(self.config["training"]["batch_size"]),
@@ -328,7 +339,7 @@ class Trainer:
             mode=mode,
             base=base,
             projection_lr=consistency_lr,
-            back_projection_steps=0,
+            back_projection_steps=self.train_back_projection_steps,
             diagnostics=diagnostics,
         )
         prediction = output.image
@@ -373,24 +384,54 @@ class Trainer:
             for name in losses
         )
 
-    def _discriminator_step(
+    @contextmanager
+    def _frozen_discriminators(self):
+        modules = (
+            unwrap(self.patch_discriminator),
+            unwrap(self.wavelet_discriminator),
+        )
+        training_states = [module.training for module in modules]
+        parameters = [
+            parameter for module in modules for parameter in module.parameters()
+        ]
+        states = [parameter.requires_grad for parameter in parameters]
+        try:
+            for module in modules:
+                module.eval()
+            for parameter in parameters:
+                parameter.requires_grad_(False)
+            yield modules
+        finally:
+            for parameter, state in zip(parameters, states):
+                parameter.requires_grad_(state)
+            for module, state in zip(modules, training_states):
+                module.train(state)
+
+    def _generator_adversarial_loss(
+        self, prediction: torch.Tensor, lr: torch.Tensor
+    ) -> torch.Tensor:
+        # Bypass DDP wrappers here: only the gradient with respect to prediction is needed.
+        with self._frozen_discriminators() as (patch, wavelet):
+            return generator_hinge(patch(prediction, lr)) + generator_hinge(
+                wavelet(prediction, lr)
+            )
+
+    def _discriminator_loss(
         self, prediction: torch.Tensor, hr: torch.Tensor, lr: torch.Tensor
     ) -> torch.Tensor:
-        self.discriminator_optimizer.zero_grad(set_to_none=True)
         real_outputs = self.patch_discriminator(hr, lr)
         fake_outputs = self.patch_discriminator(prediction.detach(), lr)
         real_wavelet = self.wavelet_discriminator(hr, lr)
         fake_wavelet = self.wavelet_discriminator(prediction.detach(), lr)
         loss = discriminator_hinge(real_outputs, fake_outputs)
-        loss = loss + discriminator_hinge(real_wavelet, fake_wavelet)
-        loss.backward()
-        self.discriminator_optimizer.step()
-        return loss.detach()
+        return loss + discriminator_hinge(real_wavelet, fake_wavelet)
 
     def train(self) -> None:
         loader = self._loader("train")
         training = self.config["training"]
         accumulation = int(training.get("gradient_accumulation", 1))
+        if accumulation < 1:
+            raise ValueError("training.gradient_accumulation must be at least 1")
         epochs = int(training["epochs"])
         output_dir = Path(training.get("output_dir", "runs/default"))
         if self.is_main:
@@ -405,7 +446,14 @@ class Trainer:
             if self.text_encoder is not None:
                 self.text_encoder.eval()
             self.optimizer.zero_grad(set_to_none=True)
+            if self.stage in ("joint", "edit"):
+                self.patch_discriminator.train()
+                self.wavelet_discriminator.train()
+                self.discriminator_optimizer.zero_grad(set_to_none=True)
             for step, batch in enumerate(loader):
+                group_start = (step // accumulation) * accumulation
+                group_size = min(accumulation, len(loader) - group_start)
+                should_step = (step + 1) % accumulation == 0 or step + 1 == len(loader)
                 debug_config = self.config.get("debug", {})
                 debug_enabled = bool(debug_config.get("enabled", False)) and self.is_main
                 debug_every = max(1, int(debug_config.get("every_n_steps", 100)))
@@ -432,21 +480,26 @@ class Trainer:
                 ):
                     prediction, losses = self._forward_stage(batch, diagnostics)
                     generator_loss = self._weighted_loss(losses)
+                    discriminator_loss = None
                     if self.stage in ("joint", "edit"):
-                        adversarial = generator_hinge(
-                            self.patch_discriminator(prediction, lr)
-                        ) + generator_hinge(self.wavelet_discriminator(prediction, lr))
+                        adversarial = self._generator_adversarial_loss(prediction, lr)
                         losses["adversarial"] = adversarial
                         generator_loss = generator_loss + adversarial * float(
                             training.get("loss_weights", {}).get("adversarial", 0.01)
                         )
-                    scaled_loss = generator_loss / accumulation
+                        discriminator_loss = self._discriminator_loss(prediction, hr, lr)
+                    scaled_loss = generator_loss / group_size
                     if diagnostics is not None:
                         for name, value in losses.items():
                             diagnostics.scalar(f"loss.{name}", value)
                         diagnostics.scalar("loss.total", generator_loss)
+                        if discriminator_loss is not None:
+                            diagnostics.scalar("loss.discriminator", discriminator_loss)
                 self.scaler.scale(scaled_loss).backward()
-                if (step + 1) % accumulation == 0:
+                if discriminator_loss is not None:
+                    self.scaler.scale(discriminator_loss / group_size).backward()
+                    metrics["discriminator"] += float(discriminator_loss.detach())
+                if should_step:
                     self.scaler.unscale_(self.optimizer)
                     self._synchronize_model_gradients()
                     gradient_norm = torch.nn.utils.clip_grad_norm_(
@@ -456,13 +509,13 @@ class Trainer:
                     if diagnostics is not None:
                         diagnostics.scalar("gradient.global_l2_before_clip", gradient_norm)
                     self.scaler.step(self.optimizer)
+                    if discriminator_loss is not None:
+                        self.scaler.unscale_(self.discriminator_optimizer)
+                        self.scaler.step(self.discriminator_optimizer)
                     self.scaler.update()
                     self.optimizer.zero_grad(set_to_none=True)
                     if self.stage in ("joint", "edit"):
-                        discriminator_loss = self._discriminator_step(prediction, hr, lr)
-                        metrics["discriminator"] += float(discriminator_loss)
-                        if diagnostics is not None:
-                            diagnostics.scalar("loss.discriminator", discriminator_loss)
+                        self.discriminator_optimizer.zero_grad(set_to_none=True)
                 if diagnostics is not None:
                     if self.stage != "diffusion":
                         if self.stage == "base":
