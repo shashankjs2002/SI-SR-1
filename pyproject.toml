@@ -34,6 +34,7 @@ geodiff-infer = "geodiff_gan.cli.infer:main"
 geodiff-evaluate = "geodiff_gan.cli.evaluate:main"
 geodiff-baselines = "geodiff_gan.cli.baselines:main"
 geodiff-debug = "geodiff_gan.cli.debug:main"
+geodiff-parameters = "geodiff_gan.cli.parameters:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

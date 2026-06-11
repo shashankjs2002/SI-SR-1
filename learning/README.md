@@ -41,6 +41,7 @@ and a visually sharp satellite image is not automatically a spatially faithful r
 | 13 | [Novelty, ablations, and research design](13_novelty_ablations_and_research.md) | Turn the architecture into defensible research |
 | 14 | [Kaggle execution and research workflow](14_kaggle_and_research_workflow.md) | Run experiments reproducibly and organize evidence |
 | 15 | [Paper, thesis, and viva guide](15_paper_thesis_and_viva.md) | Explain and defend the work precisely |
+| 16 | [Parameter counts and training configuration](16_parameter_counts_and_training_configuration.md) | Audit capacity, stage freezing, optimizers, and update counts |
 
 ## Recommended Pace
 

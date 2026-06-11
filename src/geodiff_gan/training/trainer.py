@@ -37,8 +37,7 @@ from ..models.discriminators import MultiScaleDiscriminator, WaveletDiscriminato
 from ..models.system import GeoDiffGAN
 from ..text import PromptBatch, TextEncoder, augment_prompts, build_text_encoder
 from .checkpoint import load_checkpoint, save_checkpoint, unwrap
-
-STAGES = ("base", "vae", "diffusion", "joint", "edit")
+from .stages import STAGES, configure_stage_trainability
 
 
 class Trainer:
@@ -153,23 +152,7 @@ class Trainer:
         return reduced
 
     def _configure_stage(self) -> None:
-        self.model.requires_grad_(False)
-        if self.stage == "base":
-            self.model.base.requires_grad_(True)
-        elif self.stage == "vae":
-            self.model.vae.requires_grad_(True)
-            self.model.lr_encoder.requires_grad_(True)
-            self.model.mapper.requires_grad_(True)
-            self.model.decoder.requires_grad_(True)
-        elif self.stage == "diffusion":
-            self.model.diffusion.requires_grad_(True)
-        elif self.stage in ("joint", "edit"):
-            self.model.diffusion.requires_grad_(True)
-            self.model.mapper.requires_grad_(True)
-            self.model.decoder.requires_grad_(True)
-            if self.stage == "joint":
-                self.model.lr_encoder.requires_grad_(True)
-            # Edit tuning keeps the spatial evidence encoder fixed by design.
+        configure_stage_trainability(self.model, self.stage)
 
     def _loader(self, split: str) -> DataLoader:
         data = self.config["data"]
