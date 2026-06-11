@@ -107,8 +107,10 @@ spatial gate, high-pass filtering, and re-degradation consistency.
         uncertainty, and prompt behavior.
 \end{itemize}
 
-\figblock{geodiff-gan-architecture.png}{1.0}{0.285}{Overall GeoDiff-GAN architecture. The GAN
-discriminators affect training gradients but are absent at inference.}
+\figblock{infographic_architecture.png}{1.0}{0.285}{Image-led overview of GeoDiff-GAN. The upper
+optical path reconstructs stable structure, the lower latent path synthesizes uncertain residual
+detail, and the two transparent layers are merged before evidence correction. The red inspection
+instruments at the bottom represent training-only adversarial critics.}
 
 \clearpage
 
@@ -148,11 +150,9 @@ both HR error and the evidence discrepancy
 Because $\Dtheta$ removes high frequencies, low $E_{\mathrm{LR}}$ is necessary but not sufficient:
 different HR details may share the same LR projection.
 
-\figblock{geodiff-input-output-explainer-v2.png}{0.94}{0.235}{Input/output interpretation. The
-primary task uses synthetic \SI{40}{m} inputs generated from native \SI{10}{m} Sentinel-2 targets.}
-
-\figblock{degradation_operator.png}{0.94}{0.225}{Parameterized degradation used for training and
-evaluation. The recorded vector is supplied to the diffusion network.}
+\figblock{infographic_task.png}{0.97}{0.285}{Paired task construction shown through the same
+satellite scene: native \SI{10}{m} target, optical blur and sampling, synthetic \SI{40}{m} input,
+reconstructed estimate, and the remaining spatial error.}
 
 \textbf{Two output policies.} SR mode is evaluated as reconstruction and must remain strongly
 consistent with the input. Edit mode is a prompt-conditioned visualization policy, not an
@@ -195,8 +195,10 @@ captions are generated offline from HR patches using Qwen3-VL and stripped of co
 place names. During SR training, a frozen SigLIP text encoder \citep{zhai2023siglip} provides token
 context; Qwen is never loaded into the SR optimization graph.
 
-\figblock{geodiff-gan-training-pipeline.png}{1.0}{0.39}{Dataset preparation and the five-stage
-training curriculum. Each stage initializes from the preceding checkpoint.}
+\figblock{infographic_data.png}{1.0}{0.39}{Image-led view of data preparation. Spectral layers and
+the SCL mask are read from complete SAFE products; valid windows are selected from the tile,
+cloudy or black-edge patches are quarantined, and geographically distinct tiles are assigned to
+separate data splits before HR--LR pairs and optional captions are produced.}
 
 \begin{table}[h]
 \centering
@@ -252,9 +254,6 @@ token, and text context. Channel widths are $[128,256,384,512]$ with cross-atten
 intermediate scales. Classifier-free guidance can combine conditional and null predictions
 \citep{ho2022classifierfree}.
 
-\figblock{geodiff-tensor-shapes.png}{0.98}{0.25}{Major tensor dimensions through residual
-encoding, latent diffusion, GeoMapper, and residual decoding.}
-
 \subsection{GeoMapper and decoder}
 GeoMapper receives $[\hat{\vect{z}}_0;f_{64}]$ and returns
 \begin{equation}
@@ -267,8 +266,11 @@ $\vect{g}\in[0,1]^{1\times64\times64}$ is the evidence gate. The residual decode
 64, 128, 256, and 512 grids with channels $[128,96,64,48]$, fusing LR skips and stage-specific
 styles before a three-channel $\tanh$ head.
 
-\figblock{geomapper_detail.png}{0.94}{0.205}{GeoMapper converts denoising-space features into
-location-specific content, prompt-sensitive gating, and stage-wise channel modulation.}
+\figblock{architecture_detailed.png}{1.0}{0.49}{Code-derived layer-level architecture of
+GeoDiff-GAN. Every chip reports its output tensor size. Solid connectors carry inference tensors;
+purple dashed connectors carry text, timestep, degradation, mode, or training targets; red paths
+terminate at critics removed during inference. Orthogonal buses preserve the distinct base,
+$f_{64}$, $f_{128}$, latent, and degradation routes.}
 
 \clearpage
 
@@ -310,12 +312,14 @@ scores $D(x)$ and fake scores $D(\hat{x})$,
 The adversarial generator weight begins at 0.01 so that realism cannot dominate reconstruction and
 sensor consistency.
 
-\figblock{dual_discriminator.png}{0.96}{0.205}{Spatial and Haar-frequency adversarial pathways.
-Both are conditional on the observed LR image and used only during optimization.}
+\figblock{infographic_discriminators.png}{0.96}{0.23}{The training-only critics inspect different
+properties. Multi-scale lenses compare layout and geometry, while a wavelet prism exposes
+directional high-frequency layers for edge and texture inspection.}
 
-\figblock{geodiff-gan-sr-vs-edit.png}{0.93}{0.235}{Different policies are enforced for
-reconstruction and prompt-guided synthesis. Edit-mode imagery must not be presented as measured
-ground truth.}
+\figblock{infographic_modes.png}{0.95}{0.25}{The same LR observation supports two policies. The
+upper reconstruction path permits only fine residual detail and applies strong evidence
+correction; the lower edit path permits broader prompt-driven change and carries an explicit
+synthetic warning.}
 
 \textbf{Spatial-conservation mechanisms.} The model preserves evidence through the deterministic
 base, aligned LR features, residual prediction, high-pass control, degradation conditioning,
@@ -374,8 +378,15 @@ The mode token scales prompt injection in GeoMapper and selects the output polic
 is a research hypothesis: matched/null/mismatched gate responses must be measured before claiming
 that the gate prevents hallucination.
 
-\figblock{conditioning_policy.png}{0.98}{0.225}{Prompt conditioning is optional in SR mode and
-explicitly stronger in edit mode. The two outputs are subject to different scientific claims.}
+\figblock{infographic_conditioning.png}{0.98}{0.24}{Prompt evidence is visualized as a spatial
+field over the observed satellite image. Null, matched, paraphrased, and mismatched prompts create
+different text contexts; the gate is intended to suppress incompatible influence where image
+evidence is strong.}
+
+\figblock{infographic_diagnostics.png}{0.98}{0.22}{Evidence diagnostics. The generated HR image is
+re-degraded and compared with clean LR evidence, iterative corrections reduce the discrepancy,
+high-pass control removes broad residual drift, and repeated stochastic samples produce a
+pixelwise uncertainty map.}
 
 \begin{table}[h]
 \centering
@@ -425,9 +436,10 @@ held-out tile. Paired method differences, dispersion, confidence intervals, and 
 tiles will be reported. Separate analyses cover unseen cities, unseen MGRS tiles, land-cover
 groups, degradation severity, uncertainty calibration, and failure cases.
 
-\figblock{evaluation_protocol.png}{0.98}{0.215}{Pre-registered evaluation flow. An architectural
-component is retained only if its intended metric improves without an unacceptable evidence
-trade-off.}
+\figblock{infographic_evaluation.png}{0.98}{0.24}{Evaluation as a visual research dashboard:
+geographically held-out tiles, side-by-side method outputs, fidelity/perceptual/evidence
+instruments, stochastic uncertainty, one-component-at-a-time ablation, and tile-level paired
+statistics.}
 
 \begin{center}
 \fcolorbox{geoorange}{orange!6}{%
