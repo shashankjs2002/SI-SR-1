@@ -10,6 +10,34 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class ParameterAuditTest(unittest.TestCase):
+    def test_medium_parameter_counts(self) -> None:
+        config = load_config(
+            ROOT / "configs/medium.yaml",
+            ROOT / "configs/default.yaml",
+        )
+        report = build_parameter_report(config)
+        verify_parameter_report(report)
+        large_report = build_parameter_report(
+            load_config(ROOT / "configs/default.yaml")
+        )
+
+        self.assertEqual(report["core_model"]["scalar_parameters"], 21_127_282)
+        self.assertEqual(
+            report["discriminators"]["scalar_parameters"],
+            1_731_972,
+        )
+        self.assertEqual(
+            report["training_stages"]["joint"]["total_optimized_parameters"],
+            20_227_048,
+        )
+        self.assertEqual(config["model"]["diffusion_widths"], [64, 128, 192, 256])
+        self.assertEqual(config["model"]["context_dim"], 768)
+        self.assertTrue(config["model"]["use_back_projection"])
+        self.assertEqual(
+            set(report["core_modules"]),
+            set(large_report["core_modules"]),
+        )
+
     def test_smoke_parameter_counts_and_stage_policy(self) -> None:
         config = load_config(
             ROOT / "configs/smoke.yaml",

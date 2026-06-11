@@ -11,6 +11,17 @@
 
 Use [`GeoDiff_GAN_Kaggle.ipynb`](../kaggle/GeoDiff_GAN_Kaggle.ipynb).
 
+The notebook has two independent controls:
+
+| Control | Responsibility |
+|---|---|
+| `FAST_DEV_RUN` | Tile limit, epoch count, sampling steps, and diagnostic frequency |
+| `MODEL_SIZE` | `xs`, `medium`, or `large` architecture capacity |
+
+Use XS only to verify execution. Medium preserves the research architecture at 21.13M core
+parameters and is the practical starting point for 16 GB GPUs. Large uses 81.86M core parameters
+and requires a substantially larger compute budget.
+
 ```mermaid
 flowchart TD
     GH["Clone GitHub repository"] --> INST["Install editable package"]

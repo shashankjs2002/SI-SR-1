@@ -27,9 +27,19 @@ checkpoints.
 After creating your GitHub repository, replace `OWNER` in the notebook's `REPOSITORY_URL` cell with
 your GitHub username or organization.
 
-The notebook defaults to `FAST_DEV_RUN = True`. This verifies the complete pipeline with a compact
-model and one epoch per stage; it is not a research result. Set it to `False` for the full
-architecture and paper-scale epoch schedule.
+The notebook defaults to `FAST_DEV_RUN = True` and `MODEL_SIZE = "xs"`. Run length and model
+capacity are independent: choose `MODEL_SIZE = "xs"`, `"medium"`, or `"large"`, then use
+`FAST_DEV_RUN` to select a one-epoch pipeline check or the research epoch schedule. Non-dev runs
+default to the 21.13M-parameter medium model; select `"large"` explicitly for the 81.86M model.
+
+| Model size | Core parameters | Intended use |
+|---|---:|---|
+| XS | 0.765M | Shape, loss, checkpoint, and pipeline testing |
+| Medium | 21.13M | Practical research training on 16 GB GPUs |
+| Large | 81.86M | Maximum-capacity research experiments |
+
+Keep `MODEL_SIZE` fixed across base, VAE, diffusion, joint, and edit stages. Checkpoints cannot be
+transferred between XS, medium, and large because their parameter tensor shapes differ.
 
 ## Model
 

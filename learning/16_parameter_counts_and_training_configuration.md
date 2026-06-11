@@ -38,7 +38,39 @@ Parameters measure model capacity, but they do not determine peak GPU memory alo
 attention maps, gradients, Adam states, input resolution, batch size, and precision are also major
 memory costs.
 
-## 2. Full Architecture Count
+## 2. XS, Medium, and Large Presets
+
+All three presets use the same end-to-end architecture, tensor interfaces, two operating modes,
+training curriculum, losses, evidence controls, and spatial-consistency mechanisms. They differ
+only in width, depth, text-encoder implementation for XS, and discriminator capacity.
+
+| Preset | Configuration | Core parameters | Training discriminators | Purpose |
+|---|---|---:|---:|---|
+| XS | `configs/smoke.yaml` | 765,046 | 113,508 | Unit tests and pipeline debugging |
+| Medium | `configs/medium.yaml` | 21,127,282 | 1,731,972 | Practical research on 16 GB GPUs |
+| Large | `configs/default.yaml` | 81,856,274 | 6,871,812 | Highest-capacity research model |
+
+The medium model is about 27.6 times larger than XS and contains 25.8% of the large model's core
+parameters. Unlike XS, medium retains the full 768-dimensional SigLIP-compatible context,
+four-level diffusion U-Net, 1,000-step training schedule, and all research mechanisms.
+
+Capacity presets are not checkpoint-compatible. Keep one preset for the complete five-stage
+curriculum; changing widths between stages changes parameter tensor shapes.
+
+| Architecture setting | XS | Medium | Large |
+|---|---:|---:|---:|
+| Swin embedding/depth/heads | 16 / 2 / 4 | 40 / 4 / 5 | 60 / 6 / 6 |
+| VAE base channels | 8 | 32 | 64 |
+| LR encoder base channels | 8 | 32 | 64 |
+| Diffusion widths | 16, 32, 48 | 64, 128, 192, 256 | 128, 256, 384, 512 |
+| Context dimension | 32 | 768 | 768 |
+| Mapper channels | 16 | 64 | 128 |
+| Style dimension | 16 | 128 | 256 |
+| Decoder channels | 16, 12, 8, 8 | 64, 48, 32, 24 | 128, 96, 64, 48 |
+| Diffusion schedule | 20 | 1,000 | 1,000 |
+| Discriminator base channels | 8 | 32 | 64 |
+
+## 3. Large Architecture Count
 
 The core inference model contains:
 
@@ -90,7 +122,7 @@ flowchart LR
     CORE --> DEC
 ```
 
-## 3. Training-Only Discriminators
+## 4. Large Training-Only Discriminators
 
 The discriminators are loaded only for training and are not required for inference.
 
@@ -110,7 +142,7 @@ The complete training graph therefore contains:
 This does not mean all 88.73 million parameters are optimized simultaneously. Stage freezing
 selects a different subset.
 
-## 4. Stage-Wise Optimized Parameters
+## 5. Large Stage-Wise Optimized Parameters
 
 | Stage | Trainable core modules | Core trainable | Discriminators | Total optimized |
 |---|---|---:|---:|---:|
@@ -144,7 +176,7 @@ The stage policy is defined once in
 [`training/stages.py`](../src/geodiff_gan/training/stages.py) and is shared by the trainer and
 parameter checker. This prevents the report from silently disagreeing with actual training.
 
-## 5. Architecture Hyperparameters
+## 6. Large Architecture Hyperparameters
 
 The full architecture in `configs/default.yaml` uses:
 
@@ -169,7 +201,7 @@ The full architecture in `configs/default.yaml` uses:
 Changing any width, depth, head count, or number of stages changes the parameter count. Spatial
 input size usually changes activation memory and compute, but not convolution parameter counts.
 
-## 6. Optimizer and Runtime Parameters
+## 7. Optimizer and Runtime Parameters
 
 Default optimizer configuration:
 
@@ -213,7 +245,7 @@ The Kaggle `FAST_DEV_RUN` deliberately overrides accumulation to 1 and runs one 
 stage. With 702 accepted patches, this is about 702 optimizer updates per stage. The exact number
 can be lower after black-border quarantine or if the manifest contains fewer accepted patches.
 
-## 7. Loss Weights
+## 8. Loss Weights
 
 The default configured weights are:
 
@@ -237,7 +269,7 @@ The default configured weights are:
 Not every loss is active in every stage. A configured weight is a potential coefficient, while
 `Trainer._forward_stage` determines whether that loss participates in a specific stage.
 
-## 8. External Models Excluded from the Core Count
+## 9. External Models Excluded from the Core Count
 
 The frozen SigLIP text encoder is model-dependent and is excluded from the 81.86 million core
 count. It supplies conditioning but is not optimized. Count it explicitly with
@@ -251,7 +283,7 @@ Therefore, report parameter totals using precise language:
 > GeoDiff-GAN has 81.86 M core inference parameters and 6.87 M training-only discriminator
 > parameters, excluding the frozen external text encoder and offline captioning model.
 
-## 9. Reproducing the Audit
+## 10. Reproducing the Audit
 
 Run the standalone test script:
 
@@ -285,6 +317,18 @@ python scripts/check_parameters.py \
 The smoke model contains 765,046 core parameters and 113,508 discriminator parameters. It is for
 pipeline testing, not research-quality training.
 
+Check the medium architecture:
+
+```bash
+python scripts/check_parameters.py \
+  --config configs/medium.yaml \
+  --defaults configs/default.yaml \
+  --patches 702 \
+  --verify
+```
+
+The medium model contains 21,127,282 core parameters and 1,731,972 discriminator parameters.
+
 To count the configured frozen text encoder:
 
 ```bash
@@ -293,7 +337,7 @@ geodiff-parameters \
   --include-text-encoder
 ```
 
-## 10. What `--verify` Tests
+## 11. What `--verify` Tests
 
 The verification mode checks:
 
@@ -302,8 +346,8 @@ The verification mode checks:
 3. each stage's total equals its trainable core plus active discriminators;
 4. invalid patch counts and world sizes are rejected.
 
-The unit test also locks the smoke architecture count. An intentional architecture change must
-update the expected test values and this chapter.
+The unit tests lock both XS and medium architecture counts. An intentional architecture change
+must update the expected test values and this chapter.
 
 ## Mastery Checklist
 

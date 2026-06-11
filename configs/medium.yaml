@@ -1,0 +1,19 @@
+model:
+  scale: 4
+  base_embed_dim: 40
+  base_depth: 4
+  base_heads: 5
+  window_size: 8
+  latent_channels: 4
+  vae_channels: 32
+  lr_channels: 32
+  diffusion_widths: [64, 128, 192, 256]
+  context_dim: 768
+  degradation_dim: 4
+  mapper_channels: 64
+  style_dim: 128
+  decoder_channels: [64, 48, 32, 24]
+  diffusion_steps: 1000
+
+training:
+  discriminator_channels: 32

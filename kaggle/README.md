@@ -21,8 +21,16 @@ The notebook:
 10. Displays per-stage training curves and detailed intermediate visualizations.
 11. Evaluates stochastic predictions and exports checkpoints and metrics.
 
-The notebook defaults to a quick one-epoch development run. Set
-`FAST_DEV_RUN = False` before producing research results.
+The notebook separates run length from model capacity:
+
+- `FAST_DEV_RUN` controls data limits, epochs, sampling steps, and diagnostic frequency.
+- `MODEL_SIZE` selects `"xs"` (0.765M), `"medium"` (21.13M), or `"large"` (81.86M).
+
+It defaults to XS for development and medium for non-dev training. Select large explicitly when
+the available GPU memory and training budget support it.
+
+Do not change `MODEL_SIZE` between training stages in one run. Stage-to-stage checkpoint transfer
+requires identical architecture dimensions.
 
 The preparation, filtering, and visualization cells reconstruct their required
 paths after a Kaggle kernel restart. Run the clone/install cell again only when
