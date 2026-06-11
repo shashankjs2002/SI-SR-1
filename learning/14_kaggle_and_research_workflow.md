@@ -18,6 +18,16 @@ The notebook has two independent controls:
 | `FAST_DEV_RUN` | Tile limit, epoch count, sampling steps, and diagnostic frequency |
 | `MODEL_SIZE` | `xs`, `medium`, or `large` architecture capacity |
 
+Dataset and evaluation controls are also independent:
+
+| Control | Responsibility |
+|---|---|
+| `TEST_SAFE_PREFIXES` | SAFE filename prefixes reserved for test |
+| `VAL_SAFE_PREFIXES` | SAFE filename prefixes reserved for validation |
+| `UNMATCHED_SAFE_SPLIT` | Split for all other SAFE products, normally `train` |
+| `VALIDATION_LIMIT` | Maximum validation batches per validated epoch |
+| `EVALUATION_LIMIT` | Maximum patches in each final validation/test report |
+
 Use XS only to verify execution. Medium preserves the research architecture at 21.13M core
 parameters and is the practical starting point for 16 GB GPUs. Large uses 81.86M core parameters
 and requires a substantially larger compute budget.
@@ -59,7 +69,6 @@ session.
 
 `FAST_DEV_RUN = True`:
 
-- compact model;
 - tiny sample count;
 - one epoch or few steps per stage;
 - verifies code paths and checkpoint transfer;
@@ -67,11 +76,12 @@ session.
 
 `FAST_DEV_RUN = False`:
 
-- full architecture;
 - paper-scale data;
 - intended epoch schedules;
 - frozen SigLIP encoder;
 - research metrics and ablations.
+
+Architecture capacity is selected separately by `MODEL_SIZE`.
 
 ```mermaid
 flowchart LR
@@ -195,13 +205,14 @@ If an input dataset path changes, update configuration explicitly and verify man
 1. Run unit tests locally or in Kaggle.
 2. Run the complete smoke notebook.
 3. Prepare and audit tile-split data.
-4. Train deterministic baseline.
-5. Train full stage chain.
-6. Run diagnostics on fixed validation cases.
-7. Evaluate baselines and full model.
-8. Run priority ablations.
-9. Repeat important runs with additional seeds.
-10. Generate paper tables, figures, uncertainty maps, and failures.
+4. Verify CHHATARPUR/test, CHHATARPUR/validation, and unmatched/train counts.
+5. Train deterministic baseline.
+6. Train full stage chain while monitoring tqdm ETA and per-epoch validation.
+7. Run diagnostics on fixed validation cases.
+8. Evaluate validation and test independently against baselines.
+9. Run priority ablations.
+10. Repeat important runs with additional seeds.
+11. Generate paper tables, figures, uncertainty maps, and failures.
 
 ## Exercises
 

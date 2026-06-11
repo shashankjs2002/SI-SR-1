@@ -225,6 +225,35 @@ def _line_chart(
         return np.asarray(canvas)
     epochs = [point[0] for point in points]
     values = [point[1] for point in points]
+    if len(points) == 1:
+        x = margin_left + plot_width / 2
+        y = margin_top + plot_height / 2
+        draw.ellipse((x - 8, y - 8, x + 8, y + 8), fill=(20, 75, 130))
+        draw.text(
+            (margin_left + 20, margin_top + 20),
+            "Single epoch summary",
+            fill=(70, 85, 105),
+            font=font,
+        )
+        draw.text(
+            (margin_left + 20, margin_top + 52),
+            f"value={values[0]:.6f}",
+            fill=(30, 50, 75),
+            font=font,
+        )
+        draw.text(
+            (margin_left + 20, margin_top + 84),
+            "A trend requires at least two epochs.",
+            fill=(140, 70, 35),
+            font=font,
+        )
+        draw.text(
+            (margin_left, height - 34),
+            f"epoch {epochs[0]}",
+            fill=(70, 85, 105),
+            font=font,
+        )
+        return np.asarray(canvas)
     x_min, x_max = min(epochs), max(epochs)
     y_min, y_max = min(values), max(values)
     if x_max == x_min:

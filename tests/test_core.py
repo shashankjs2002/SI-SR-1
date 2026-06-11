@@ -16,7 +16,12 @@ from geodiff_gan.data.manifest import (
     ManifestRecord,
     deterministic_split,
     load_manifest,
+    validate_tile_split_isolation,
     write_manifest,
+)
+from geodiff_gan.data.sentinel import (
+    reassign_product_splits,
+    split_for_product,
 )
 from geodiff_gan.diagnostics import DiagnosticRecorder, tensor_statistics
 from geodiff_gan.metrics import edge_f1
@@ -268,6 +273,77 @@ class CoreTests(unittest.TestCase):
             write_manifest(manifest, [record])
             loaded = load_manifest(manifest)
             self.assertEqual(loaded[0], record)
+
+    def test_safe_product_prefixes_override_dataset_splits(self) -> None:
+        self.assertEqual(
+            split_for_product(
+                "CHHATARPUR1_scene.SAFE",
+                "44QLL",
+                validation_prefixes=["CHHATARPUR2"],
+                test_prefixes=["chhatarpur1"],
+                unmatched_split="train",
+            ),
+            "test",
+        )
+        self.assertEqual(
+            split_for_product(
+                "CHHATARPUR2_scene.SAFE",
+                "44QMK",
+                validation_prefixes=["chhatarpur2"],
+                test_prefixes=["CHHATARPUR1"],
+                unmatched_split="train",
+            ),
+            "val",
+        )
+        self.assertEqual(
+            split_for_product(
+                "OTHER_scene.SAFE",
+                "44QML",
+                validation_prefixes=["CHHATARPUR2"],
+                test_prefixes=["CHHATARPUR1"],
+                unmatched_split="train",
+            ),
+            "train",
+        )
+
+    def test_safe_product_split_reassignment_prevents_tile_leakage(self) -> None:
+        records = [
+            ManifestRecord(
+                patch="test.npz",
+                tile_id="TEST_TILE",
+                split="train",
+                row=0,
+                col=0,
+                valid_fraction=1.0,
+                source_product="CHHATARPUR1_scene.SAFE",
+            ),
+            ManifestRecord(
+                patch="val.npz",
+                tile_id="VAL_TILE",
+                split="train",
+                row=0,
+                col=0,
+                valid_fraction=1.0,
+                source_product="CHHATARPUR2_scene.SAFE",
+            ),
+        ]
+        reassigned = reassign_product_splits(
+            records,
+            validation_prefixes=["CHHATARPUR2"],
+            test_prefixes=["CHHATARPUR1"],
+            unmatched_split="train",
+        )
+        self.assertEqual([record.split for record in reassigned], ["test", "val"])
+        validate_tile_split_isolation(reassigned)
+
+        records[1].tile_id = "TEST_TILE"
+        with self.assertRaisesRegex(ValueError, "tile leakage"):
+            reassign_product_splits(
+                records,
+                validation_prefixes=["CHHATARPUR2"],
+                test_prefixes=["CHHATARPUR1"],
+                unmatched_split="train",
+            )
 
     def test_caption_model_class_resolution(self) -> None:
         explicit = type("ExplicitQwen3VL", (), {})

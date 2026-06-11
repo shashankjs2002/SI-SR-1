@@ -5,7 +5,11 @@ from pathlib import Path
 
 import numpy as np
 
-from .manifest import ManifestRecord, deterministic_split
+from .manifest import (
+    ManifestRecord,
+    deterministic_split,
+    validate_tile_split_isolation,
+)
 
 INVALID_SCL_CLASSES = {0, 1, 3, 8, 9, 10, 11}
 
@@ -37,6 +41,61 @@ def tile_id_from_product(product: Path) -> str:
     return product.stem
 
 
+def product_matches_prefix(product: str | Path, prefixes: list[str]) -> bool:
+    name = Path(product).name.casefold()
+    return any(name.startswith(prefix.casefold()) for prefix in prefixes)
+
+
+def split_for_product(
+    product: str | Path,
+    tile_id: str,
+    validation_prefixes: list[str] | None = None,
+    test_prefixes: list[str] | None = None,
+    unmatched_split: str = "hash",
+) -> str:
+    validation_prefixes = validation_prefixes or []
+    test_prefixes = test_prefixes or []
+    is_validation = product_matches_prefix(product, validation_prefixes)
+    is_test = product_matches_prefix(product, test_prefixes)
+    if is_validation and is_test:
+        raise ValueError(
+            f"{Path(product).name} matches both validation and test prefixes"
+        )
+    if is_validation:
+        return "val"
+    if is_test:
+        return "test"
+    if unmatched_split == "hash":
+        return deterministic_split(tile_id)
+    if unmatched_split not in ("train", "val", "test"):
+        raise ValueError(f"Unsupported unmatched split {unmatched_split!r}")
+    return unmatched_split
+
+
+def reassign_product_splits(
+    records: list[ManifestRecord],
+    validation_prefixes: list[str] | None = None,
+    test_prefixes: list[str] | None = None,
+    unmatched_split: str = "hash",
+) -> list[ManifestRecord]:
+    missing = [record.patch for record in records if not record.source_product]
+    if missing:
+        raise ValueError(
+            "Manifest records do not contain source_product metadata. "
+            "Re-run Sentinel preparation before applying SAFE prefix splits."
+        )
+    for record in records:
+        record.split = split_for_product(
+            record.source_product,
+            record.tile_id,
+            validation_prefixes=validation_prefixes,
+            test_prefixes=test_prefixes,
+            unmatched_split=unmatched_split,
+        )
+    validate_tile_split_isolation(records)
+    return records
+
+
 def extract_product_patches(
     product: str | Path,
     output_dir: str | Path,
@@ -45,6 +104,10 @@ def extract_product_patches(
     minimum_valid_fraction: float = 0.95,
     reflectance_scale: float = 10000.0,
     saturation_value: float = 1.0,
+    validation_prefixes: list[str] | None = None,
+    test_prefixes: list[str] | None = None,
+    unmatched_split: str = "hash",
+    show_progress: bool = False,
 ) -> list[ManifestRecord]:
     try:
         import rasterio
@@ -56,6 +119,13 @@ def extract_product_patches(
     product = Path(product)
     output_dir = Path(output_dir)
     tile_id = tile_id_from_product(product)
+    split = split_for_product(
+        product,
+        tile_id,
+        validation_prefixes=validation_prefixes,
+        test_prefixes=test_prefixes,
+        unmatched_split=unmatched_split,
+    )
     destination = output_dir / tile_id
     destination.mkdir(parents=True, exist_ok=True)
     band_paths = [
@@ -73,7 +143,16 @@ def extract_product_patches(
         rasterio.open(scl_path) as scl,
     ):
         height, width = red.height, red.width
-        for row in range(0, max(height - patch_size + 1, 1), stride):
+        rows = range(0, max(height - patch_size + 1, 1), stride)
+        if show_progress:
+            from tqdm.auto import tqdm
+
+            rows = tqdm(
+                rows,
+                desc=f"windows {product.name[:36]}",
+                leave=False,
+            )
+        for row in rows:
             for col in range(0, max(width - patch_size + 1, 1), stride):
                 if row + patch_size > height or col + patch_size > width:
                     continue
@@ -113,10 +192,11 @@ def extract_product_patches(
                     ManifestRecord(
                         patch=str(patch_path.resolve()),
                         tile_id=tile_id,
-                        split=deterministic_split(tile_id),
+                        split=split,
                         row=row,
                         col=col,
                         valid_fraction=valid_fraction,
+                        source_product=product.name,
                     )
                 )
     return records

@@ -33,7 +33,10 @@ geodiff-prepare \
   --manifest data/manifest.jsonl \
   --patch-size 512 \
   --stride 384 \
-  --minimum-valid-fraction 0.95
+  --minimum-valid-fraction 0.95 \
+  --test-prefix CHHATARPUR1 \
+  --val-prefix CHHATARPUR2 \
+  --unmatched-split train
 ```
 
 Implementation:
@@ -86,6 +89,19 @@ A deterministic hash of tile identifiers assigns approximately:
 
 Approximate ratios are expected because the unit is a tile, not a patch. For small tile counts, the
 actual percentages may deviate substantially. Report both tile and patch counts.
+
+For a controlled experiment, the CLI and Kaggle notebook can override the hash using SAFE filename
+prefixes. In the supplied notebook:
+
+- SAFE names starting with `CHHATARPUR1` are test data;
+- SAFE names starting with `CHHATARPUR2` are validation data;
+- unmatched SAFE products are training data.
+
+Matching is case-insensitive and the values are editable in the first notebook cell. Every manifest
+record stores `source_product`, allowing the split rules to be reapplied without guessing from patch
+paths. A hard validation check rejects any assignment where one MGRS tile appears in multiple
+splits. If CHHATARPUR1 and CHHATARPUR2 are acquisitions of the same geographic MGRS tile, they
+cannot serve as independent validation and test geography.
 
 Recommended checks:
 

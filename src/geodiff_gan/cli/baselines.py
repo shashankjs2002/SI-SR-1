@@ -3,11 +3,13 @@ from __future__ import annotations
 import argparse
 import json
 from collections import defaultdict
+from itertools import islice
 from pathlib import Path
 
 import torch
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 
 from ..config import load_config
 from ..data import SentinelPatchDataset
@@ -36,6 +38,11 @@ def main() -> None:
         degradation_seed=int(config["data"].get("degradation_seed", 0)),
         degradation_severity=config["data"].get("degradation_severity", "mild"),
     )
+    if len(dataset) == 0:
+        raise SystemExit(
+            f"No patches found for split {args.split!r}. "
+            "Check the manifest SAFE-prefix assignments."
+        )
     loader = DataLoader(dataset, batch_size=1, shuffle=False)
     model = None
     if args.base_checkpoint:
@@ -47,11 +54,16 @@ def main() -> None:
         "base": defaultdict(float),
     }
     count = 0
+    total = min(len(loader), args.limit) if args.limit is not None else len(loader)
+    progress = tqdm(
+        islice(loader, total),
+        total=total,
+        desc=f"baselines {args.split}",
+        unit="patch",
+    )
 
     with torch.no_grad():
-        for index, batch in enumerate(loader):
-            if args.limit is not None and index >= args.limit:
-                break
+        for batch in progress:
             lr = batch["lr"].to(device)
             clean_lr = batch["clean_lr"].to(device)
             hr = batch["hr"].to(device)
@@ -81,6 +93,14 @@ def main() -> None:
                 for metric, value in values.items():
                     totals[name][metric] += value
             count += 1
+            progress.set_postfix(
+                bicubic_psnr=f"{totals['bicubic']['psnr'] / count:.2f}",
+                base_psnr=(
+                    f"{totals['base']['psnr'] / count:.2f}"
+                    if totals["base"]
+                    else "n/a"
+                ),
+            )
 
     summary = {
         name: {metric: value / max(count, 1) for metric, value in metrics.items()}

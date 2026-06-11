@@ -9,7 +9,8 @@
 
 ## 1. Evaluation Is Multi-Axis
 
-No single number answers whether satellite SR is good.
+No single number answers whether satellite SR is good. This is a regression/generation problem,
+not classification, so a generic "accuracy" percentage is not defined.
 
 ```mermaid
 flowchart TD
@@ -65,7 +66,8 @@ their relevance to remote-sensing content rather than treating them as universal
 ## 5. Edge F1
 
 The current implementation converts RGB to grayscale, computes one-pixel horizontal and vertical
-differences, thresholds gradient magnitude, and compares edge pixels at the same locations:
+differences, thresholds gradient magnitude, and matches edges within a configurable pixel
+tolerance:
 
 \[
 \operatorname{Precision}=
@@ -79,9 +81,8 @@ differences, thresholds gradient magnitude, and compares edge pixels at the same
 F_1=2\frac{PR}{P+R}.
 \]
 
-This measures exact thresholded edge overlap for roads, fields, coastlines, and buildings. It is
-sensitive to a one-pixel displacement. If a tolerance-aware edge metric is added later, report the
-detector, threshold, and matching tolerance separately from the current implementation.
+This measures thresholded edge overlap for roads, fields, coastlines, and buildings. Always report
+the detector, adaptive threshold policy, and matching tolerance.
 
 ## 6. LR Re-Degradation Error
 

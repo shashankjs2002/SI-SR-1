@@ -89,6 +89,7 @@ def basic_metrics(
     severity: str = "mild",
 ) -> dict[str, float]:
     return {
+        "l1": float(F.l1_loss(prediction, target)),
         "psnr": float(psnr(prediction, target)),
         "ssim": float(ssim(prediction, target)),
         "edge_f1": float(edge_f1(prediction, target)),

@@ -5,6 +5,7 @@ import os
 import random
 from collections import defaultdict
 from contextlib import contextmanager
+from itertools import islice
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +15,7 @@ from torch import nn
 from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
+from tqdm.auto import tqdm
 
 from ..data import SentinelPatchDataset
 from ..diagnostics import DiagnosticRecorder, append_training_history
@@ -35,6 +37,7 @@ from ..models.blocks import high_pass
 from ..models.degradation import sensor_degrade
 from ..models.discriminators import MultiScaleDiscriminator, WaveletDiscriminator
 from ..models.system import GeoDiffGAN
+from ..metrics import basic_metrics
 from ..text import PromptBatch, TextEncoder, augment_prompts, build_text_encoder
 from .checkpoint import load_checkpoint, save_checkpoint, unwrap
 from .stages import STAGES, configure_stage_trainability
@@ -167,7 +170,7 @@ class Trainer:
         )
         sampler = (
             DistributedSampler(dataset, shuffle=split == "train")
-            if self.distributed
+            if self.distributed and len(dataset) > 0
             else None
         )
         return DataLoader(
@@ -214,6 +217,7 @@ class Trainer:
         self,
         batch: dict[str, Any],
         diagnostics: DiagnosticRecorder | None = None,
+        training: bool = True,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         model: GeoDiffGAN = unwrap(self.model)  # type: ignore[assignment]
         hr = batch["hr"].to(self.device, non_blocking=True)
@@ -256,7 +260,8 @@ class Trainer:
             return prediction, losses
 
         context, _, used_prompts, prompt_kinds = self._contexts(
-            list(batch["caption"])
+            list(batch["caption"]),
+            training=training,
         )
         with torch.no_grad():
             base = model.base(lr)
@@ -469,6 +474,91 @@ class Trainer:
             )
         return prediction, losses
 
+    @torch.no_grad()
+    def _validate(
+        self,
+        loader: DataLoader,
+        epoch: int,
+    ) -> dict[str, float]:
+        if len(loader.dataset) == 0:
+            return {}
+        training = self.config["training"]
+        configured_limit = training.get("validation_limit")
+        limit = (
+            min(len(loader), int(configured_limit))
+            if configured_limit is not None
+            else len(loader)
+        )
+        if limit < 1:
+            return {}
+        self.model.eval()
+        if self.text_encoder is not None:
+            self.text_encoder.eval()
+        totals: defaultdict[str, float] = defaultdict(float)
+        seed = int(self.config.get("seed", 42)) + 10_000 + epoch
+        cuda_devices = (
+            [self.device.index or 0] if self.device.type == "cuda" else []
+        )
+        progress = tqdm(
+            enumerate(islice(loader, limit)),
+            total=limit,
+            desc=f"{self.stage} validation {epoch + 1}",
+            unit="batch",
+            leave=False,
+            disable=not self.is_main,
+        )
+        with torch.random.fork_rng(devices=cuda_devices):
+            torch.manual_seed(seed)
+            if self.device.type == "cuda":
+                torch.cuda.manual_seed_all(seed)
+            for step, batch in progress:
+                with torch.autocast(
+                    device_type=self.device.type,
+                    dtype=torch.float16,
+                    enabled=self.amp_enabled,
+                ):
+                    prediction, losses = self._forward_stage(
+                        batch,
+                        training=False,
+                    )
+                    total_loss = self._weighted_loss(losses)
+                for name, value in losses.items():
+                    totals[f"loss_{name}"] += float(value.detach())
+                totals["loss_total"] += float(total_loss.detach())
+                if self.stage != "diffusion":
+                    model: GeoDiffGAN = unwrap(self.model)  # type: ignore[assignment]
+                    values = basic_metrics(
+                        prediction,
+                        batch["hr"].to(self.device, non_blocking=True),
+                        batch.get("clean_lr", batch["lr"]).to(
+                            self.device,
+                            non_blocking=True,
+                        ),
+                        batch["degradation"].to(
+                            self.device,
+                            non_blocking=True,
+                        ),
+                        scale=model.scale,
+                        severity=model.degradation_severity,
+                    )
+                    for name, value in values.items():
+                        totals[name] += value
+                completed = step + 1
+                progress.set_postfix(
+                    loss=f"{totals['loss_total'] / completed:.4f}",
+                    psnr=(
+                        f"{totals['psnr'] / completed:.2f}"
+                        if "psnr" in totals
+                        else "n/a"
+                    ),
+                )
+        reduced = self._reduce_metrics(totals)
+        denominator = max(limit, 1)
+        return {
+            f"val_{name}": value / denominator
+            for name, value in reduced.items()
+        }
+
     def _weighted_loss(self, losses: dict[str, torch.Tensor]) -> torch.Tensor:
         weights = self.config["training"].get("loss_weights", {})
         default_weights = {
@@ -536,6 +626,12 @@ class Trainer:
 
     def train(self) -> None:
         loader = self._loader("train")
+        if len(loader.dataset) == 0:
+            raise ValueError(
+                "The training split contains no patches. Check SAFE prefix rules "
+                "and UNMATCHED_SAFE_SPLIT before starting training."
+            )
+        validation_loader = self._loader("val")
         training = self.config["training"]
         accumulation = int(training.get("gradient_accumulation", 1))
         if accumulation < 1:
@@ -546,7 +642,14 @@ class Trainer:
             output_dir.mkdir(parents=True, exist_ok=True)
             with (output_dir / "resolved_config.json").open("w", encoding="utf-8") as handle:
                 json.dump(self.config, handle, indent=2)
-        for epoch in range(self.start_epoch, epochs):
+        validate_every = max(1, int(training.get("validate_every", 1)))
+        epoch_progress = tqdm(
+            range(self.start_epoch, epochs),
+            desc=f"{self.stage} epochs",
+            unit="epoch",
+            disable=not self.is_main,
+        )
+        for epoch in epoch_progress:
             if isinstance(loader.sampler, DistributedSampler):
                 loader.sampler.set_epoch(epoch)
             metrics: defaultdict[str, float] = defaultdict(float)
@@ -559,7 +662,14 @@ class Trainer:
                 self.patch_discriminator.train()
                 self.wavelet_discriminator.train()
                 self.discriminator_optimizer.zero_grad(set_to_none=True)
-            for step, batch in enumerate(loader):
+            batch_progress = tqdm(
+                loader,
+                desc=f"{self.stage} train {epoch + 1}/{epochs}",
+                unit="batch",
+                leave=False,
+                disable=not self.is_main,
+            )
+            for step, batch in enumerate(batch_progress):
                 group_start = (step // accumulation) * accumulation
                 group_size = min(accumulation, len(loader) - group_start)
                 should_step = (step + 1) % accumulation == 0 or step + 1 == len(loader)
@@ -688,12 +798,33 @@ class Trainer:
                 for name, value in losses.items():
                     metrics[name] += float(value.detach())
                 metrics["total"] += float(generator_loss.detach())
+                completed = step + 1
+                batch_progress.set_postfix(
+                    loss=f"{float(generator_loss.detach()):.4f}",
+                    avg=f"{metrics['total'] / completed:.4f}",
+                    lr=f"{self.optimizer.param_groups[0]['lr']:.2e}",
+                )
             reduced_metrics = self._reduce_metrics(metrics)
+            validation_metrics = {}
+            if (
+                len(validation_loader.dataset) > 0
+                and (epoch + 1) % validate_every == 0
+            ):
+                validation_metrics = self._validate(validation_loader, epoch)
             if self.is_main:
                 denominator = max(len(loader), 1)
                 epoch_metrics = {
                     key: value / denominator for key, value in reduced_metrics.items()
                 }
+                epoch_metrics.update(validation_metrics)
+                epoch_progress.set_postfix(
+                    train_loss=f"{epoch_metrics.get('total', float('nan')):.4f}",
+                    val_psnr=(
+                        f"{epoch_metrics['val_psnr']:.2f}"
+                        if "val_psnr" in epoch_metrics
+                        else "n/a"
+                    ),
+                )
                 print(f"epoch={epoch} stage={self.stage} metrics={epoch_metrics}", flush=True)
                 save_checkpoint(
                     output_dir / f"{self.stage}_epoch_{epoch:04d}.pt",

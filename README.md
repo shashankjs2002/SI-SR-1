@@ -109,16 +109,22 @@ geodiff-prepare \
   --manifest /kaggle/working/geodiff-data/manifest.jsonl \
   --patch-size 512 \
   --stride 384 \
-  --minimum-valid-fraction 0.95
+  --minimum-valid-fraction 0.95 \
+  --test-prefix CHHATARPUR1 \
+  --val-prefix CHHATARPUR2 \
+  --unmatched-split train
 ```
 
 The command reads each large product by raster window. It does not load a whole state or complete
 110 km tile into RAM. B4/B3/B2 are scaled by 10,000; invalid, cloud, cloud-shadow, cirrus, snow,
 no-data, and saturated patches are rejected using SCL. Every extracted patch records its MGRS tile,
-window location, split, source, and licence identifier.
+window location, source SAFE product, split, source, and licence identifier. Prefix matching is
+case-insensitive. Explicit validation/test SAFE products are retained even when `--max-products`
+limits the unmatched training products.
 
-All windows from one MGRS tile receive the same split. A study with only a few tiles is invalid:
-collect enough complete tiles to represent train, validation, and test geography.
+All windows from one MGRS tile receive the same split. Preparation stops if prefix rules place the
+same MGRS tile in both validation and test. A study with only a few tiles is invalid: collect enough
+complete tiles to represent train, validation, and test geography.
 
 ## Generate Qwen3-VL Captions
 
@@ -158,6 +164,11 @@ torchrun --standalone --nproc_per_node=2 -m geodiff_gan.cli.train \
 
 Change each overlay's `init_checkpoint` if an epoch count changes. Use `resume` only to continue the
 same stage because it restores optimizer and discriminator state.
+
+Training displays nested tqdm bars for stage epochs and batches, including running loss, learning
+rate, elapsed time, and ETA. With a non-empty validation split, `validate_every` and
+`validation_limit` control held-out evaluation. Validation L1, PSNR, SSIM, edge F1, and LR
+re-degradation error are written to `latest_metrics.json` and `training_history.jsonl`.
 
 Training stages:
 
@@ -205,10 +216,11 @@ geodiff-evaluate \
   --split test --samples 8 --steps 20 --mode sr
 ```
 
-PSNR, SSIM, edge F1, and LR re-degradation error are always reported. Evaluation also reports
+L1, PSNR, SSIM, edge F1, and LR re-degradation error are always reported. Evaluation also reports
 confidence-error correlation, uncertainty-error correlation, and selective L1 at 80% coverage.
 LPIPS and DISTS are added when the metrics extra is installed. Edit evaluation also reports frozen
-vision-language alignment.
+vision-language alignment. Super-resolution is a regression/generation task, so there is no
+classification accuracy value.
 
 Generate the built-in bicubic and trained base-branch baselines:
 

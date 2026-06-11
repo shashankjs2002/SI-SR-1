@@ -3,11 +3,13 @@ from __future__ import annotations
 import argparse
 import json
 from collections import defaultdict
+from itertools import islice
 from pathlib import Path
 
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 
 from ..config import load_config
 from ..data import SentinelPatchDataset
@@ -54,14 +56,24 @@ def main() -> None:
         degradation_seed=int(config["data"].get("degradation_seed", 0)),
         degradation_severity=config["data"].get("degradation_severity", "mild"),
     )
+    if len(dataset) == 0:
+        raise SystemExit(
+            f"No patches found for split {args.split!r}. "
+            "Check the manifest SAFE-prefix assignments."
+        )
     loader = DataLoader(dataset, batch_size=1, shuffle=False)
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
     totals: defaultdict[str, float] = defaultdict(float)
     count = 0
-    for index, batch in enumerate(loader):
-        if args.limit is not None and index >= args.limit:
-            break
+    total = min(len(loader), args.limit) if args.limit is not None else len(loader)
+    progress = tqdm(
+        islice(loader, total),
+        total=total,
+        desc=f"evaluate {args.split}",
+        unit="patch",
+    )
+    for index, batch in enumerate(progress):
         lr = batch["lr"].to(device)
         clean_lr = batch["clean_lr"].to(device)
         hr = batch["hr"].to(device)
@@ -143,6 +155,10 @@ def main() -> None:
             )
         for name, value in values.items():
             totals[name] += value
+        progress.set_postfix(
+            psnr=f"{totals['psnr'] / (count + 1):.2f}",
+            ssim=f"{totals['ssim'] / (count + 1):.4f}",
+        )
         patch_name = Path(batch["patch"][0]).stem
         np.savez_compressed(
             output_dir / f"{patch_name}_uncertainty.npz",

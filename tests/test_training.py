@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -17,28 +18,43 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class TrainingSmokeTest(unittest.TestCase):
-    def _fixture(self, root: Path, record_count: int = 1) -> tuple[Path, dict]:
+    def _fixture(
+        self,
+        root: Path,
+        record_count: int = 1,
+        include_validation: bool = False,
+    ) -> tuple[Path, dict]:
         patch = root / "patch.npz"
         np.savez_compressed(
             patch,
             hr=np.random.default_rng(2).random((3, 64, 64)).astype(np.float32),
         )
         manifest = root / "manifest.jsonl"
-        write_manifest(
-            manifest,
-            [
+        records = [
+            ManifestRecord(
+                patch=str(patch),
+                tile_id="TEST_TILE",
+                split="train",
+                row=index,
+                col=0,
+                valid_fraction=1.0,
+                caption="mixed agricultural fields",
+            )
+            for index in range(record_count)
+        ]
+        if include_validation:
+            records.append(
                 ManifestRecord(
                     patch=str(patch),
-                    tile_id="TEST_TILE",
-                    split="train",
-                    row=index,
+                    tile_id="VALIDATION_TILE",
+                    split="val",
+                    row=0,
                     col=0,
                     valid_fraction=1.0,
                     caption="mixed agricultural fields",
                 )
-                for index in range(record_count)
-            ],
-        )
+            )
+        write_manifest(manifest, records)
         config = load_config(ROOT / "configs/smoke.yaml", ROOT / "configs/default.yaml")
         config["data"]["manifest"] = str(manifest)
         config["data"]["captions"] = None
@@ -50,6 +66,7 @@ class TrainingSmokeTest(unittest.TestCase):
                 "num_workers": 0,
                 "init_checkpoint": None,
                 "resume": None,
+                "validation_limit": 1,
             }
         )
         return manifest, config
@@ -57,7 +74,7 @@ class TrainingSmokeTest(unittest.TestCase):
     def test_base_stage_writes_checkpoint(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            _, config = self._fixture(root)
+            _, config = self._fixture(root, include_validation=True)
             config["training"].update(
                 {
                     "stage": "base",
@@ -69,6 +86,19 @@ class TrainingSmokeTest(unittest.TestCase):
             self.assertTrue((root / "run" / "training_history.jsonl").exists())
             self.assertTrue((root / "run" / "training_curves.png").exists())
             self.assertTrue((root / "run" / "latest_metrics.json").exists())
+            latest = json.loads(
+                (root / "run" / "latest_metrics.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            for metric in (
+                "val_l1",
+                "val_psnr",
+                "val_ssim",
+                "val_edge_f1",
+                "val_redegradation_l1",
+            ):
+                self.assertIn(metric, latest["metrics"])
 
     def test_remaining_training_stages(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

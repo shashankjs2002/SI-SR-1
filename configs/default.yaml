@@ -66,6 +66,8 @@ training:
   amp: true
   gradient_checkpointing: true
   gradient_clip: 1.0
+  validate_every: 1
+  validation_limit: 64
   train_back_projection_steps: 1
   evidence_calibration_temperature: 0.05
   counterfactual_edit_coverage: 0.15

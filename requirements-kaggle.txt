@@ -7,3 +7,4 @@ accelerate>=1.0
 bitsandbytes>=0.46
 qwen-vl-utils>=0.0.14
 transformers>=4.57
+tqdm>=4.66

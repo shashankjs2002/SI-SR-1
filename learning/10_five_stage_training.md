@@ -328,7 +328,36 @@ pretraining. Record generator and discriminator rates separately.
 Do not change several loss weights and learning rates simultaneously if you want interpretable
 experiments.
 
-## 10. Stage-Gate Criteria
+## 10. Progress and Validation
+
+Training uses nested tqdm progress bars:
+
+- the outer bar shows completed epochs and epoch ETA;
+- the inner bar shows batches, current loss, running average, learning rate, and batch ETA;
+- a validation bar shows running held-out loss and PSNR.
+
+`training.validate_every` controls validation frequency and `training.validation_limit` caps the
+number of validation batches. The cap is useful for development, but final model selection should
+use the complete validation set.
+
+Each validated epoch records:
+
+- `val_l1`;
+- `val_psnr`;
+- `val_ssim`;
+- `val_edge_f1`;
+- `val_redegradation_l1`;
+- stage-specific validation losses.
+
+These values are stored in the checkpoint metadata, `latest_metrics.json`,
+`training_history.jsonl`, and `training_curves.png`. A one-epoch run contains only one point, so it
+cannot display a trend; the chart explicitly labels it as a single-epoch summary.
+
+These per-epoch values use the stage's training forward path without prompt augmentation. They are
+fast model-selection proxies, not the final stochastic DDIM benchmark. Run `geodiff-evaluate` on
+the complete validation and test splits for the final report.
+
+## 11. Stage-Gate Criteria
 
 Do not advance based only on epoch count.
 
