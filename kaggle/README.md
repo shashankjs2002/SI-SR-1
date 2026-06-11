@@ -45,6 +45,9 @@ Prefix matching is case-insensitive. `MAX_TILES` limits only unmatched/training 
 explicit validation and test products remain selected. If an old manifest lacks `source_product`,
 delete the old manifest and patch directory once and rerun preparation.
 
+`RUN_DATA_PREPARATION=False` reuses an existing manifest. If the manifest does not exist, the
+notebook prepares it automatically instead of continuing with an invalid empty workspace.
+
 Do not change `MODEL_SIZE` between training stages in one run. Stage-to-stage checkpoint transfer
 requires identical architecture dimensions.
 
