@@ -16,7 +16,7 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 
 from ..data import SentinelPatchDataset
-from ..diagnostics import DiagnosticRecorder
+from ..diagnostics import DiagnosticRecorder, append_training_history
 from ..losses import (
     OptionalPerceptualLoss,
     charbonnier,
@@ -248,6 +248,16 @@ class Trainer:
         if self.stage == "base":
             prediction = model.base(lr)
             if diagnostics is not None:
+                diagnostics.capture(
+                    "base.bicubic",
+                    F.interpolate(
+                        lr,
+                        scale_factor=model.scale,
+                        mode="bicubic",
+                        align_corners=False,
+                    ),
+                    visual="rgb",
+                )
                 diagnostics.capture("base.hr", prediction, visual="rgb")
                 diagnostics.capture("output.hr", prediction, visual="rgb")
             losses["charbonnier"] = charbonnier(prediction, hr)
@@ -303,6 +313,21 @@ class Trainer:
                     mapped.evidence_confidence,
                     visual="heatmap",
                 )
+                diagnostics.capture(
+                    "mapper.edit_permission",
+                    mapped.edit_permission,
+                    visual="heatmap",
+                )
+                diagnostics.capture(
+                    "decoder.raw_detail_residual",
+                    decoded.detail_residual,
+                    visual="residual",
+                )
+                diagnostics.capture(
+                    "decoder.raw_edit_residual",
+                    decoded.edit_residual,
+                    visual="residual",
+                )
                 diagnostics.capture("decoder.residual", detail, visual="residual")
                 diagnostics.capture("output.hr", prediction, visual="rgb")
             losses["vae_reconstruction"] = charbonnier(reconstruction, target_residual)
@@ -342,6 +367,11 @@ class Trainer:
                 visual="features",
             )
             diagnostics.capture("diffusion.predicted_velocity", velocity, visual="features")
+            diagnostics.capture(
+                "diffusion.velocity_absolute_error",
+                (velocity - diffusion_batch.target_velocity).abs(),
+                visual="heatmap",
+            )
             diagnostics.scalar(
                 "diffusion.timestep_mean", diffusion_batch.timesteps.float().mean()
             )
@@ -360,6 +390,11 @@ class Trainer:
                 diagnostics.capture("latent.denoised", clean, visual="features")
                 diagnostics.capture(
                     "diffusion.decoded_residual", prediction, visual="residual"
+                )
+                diagnostics.capture(
+                    "diffusion.decoded_absolute_error",
+                    (prediction - target_residual).abs(),
+                    visual="heatmap",
                 )
             return prediction, losses
 
@@ -532,6 +567,7 @@ class Trainer:
             if isinstance(loader.sampler, DistributedSampler):
                 loader.sampler.set_epoch(epoch)
             metrics: defaultdict[str, float] = defaultdict(float)
+            debug_exports = 0
             self.model.train()
             if self.text_encoder is not None:
                 self.text_encoder.eval()
@@ -547,6 +583,10 @@ class Trainer:
                 debug_config = self.config.get("debug", {})
                 debug_enabled = bool(debug_config.get("enabled", False)) and self.is_main
                 debug_every = max(1, int(debug_config.get("every_n_steps", 100)))
+                max_debug_exports = max(
+                    1,
+                    int(debug_config.get("max_exports_per_epoch", 5)),
+                )
                 diagnostics = (
                     DiagnosticRecorder(
                         Path(debug_config.get("output_dir", output_dir / "debug"))
@@ -557,10 +597,29 @@ class Trainer:
                         fail_on_nonfinite=bool(
                             debug_config.get("fail_on_nonfinite", True)
                         ),
+                        panel_size=int(debug_config.get("panel_size", 320)),
+                        histogram_bins=int(
+                            debug_config.get("histogram_bins", 64)
+                        ),
+                        max_feature_channels=int(
+                            debug_config.get("max_feature_channels", 16)
+                        ),
+                        save_tensors=bool(
+                            debug_config.get("save_tensors", False)
+                        ),
+                        max_saved_tensors=int(
+                            debug_config.get("max_saved_tensors", 32)
+                        ),
                     )
-                    if debug_enabled and step % debug_every == 0
+                    if (
+                        debug_enabled
+                        and step % debug_every == 0
+                        and debug_exports < max_debug_exports
+                    )
                     else None
                 )
+                if diagnostics is not None:
+                    debug_exports += 1
                 hr = batch["hr"].to(self.device, non_blocking=True)
                 lr = batch["lr"].to(self.device, non_blocking=True)
                 with torch.autocast(
@@ -627,6 +686,12 @@ class Trainer:
                             batch["degradation"].to(self.device),
                             scale=unwrap(self.model).scale,
                             target=hr,
+                            consistency_lr=batch.get(
+                                "clean_lr", batch["lr"]
+                            ).to(self.device),
+                            degradation_severity=unwrap(
+                                self.model
+                            ).degradation_severity,
                         )
                     diagnostics.export(
                         {
@@ -662,4 +727,13 @@ class Trainer:
                         ).state_dict(),
                         "discriminator_optimizer": self.discriminator_optimizer.state_dict(),
                     },
+                )
+                append_training_history(
+                    output_dir / "training_history.jsonl",
+                    epoch=epoch,
+                    stage=self.stage,
+                    metrics=epoch_metrics,
+                    panel_size=int(
+                        self.config.get("debug", {}).get("panel_size", 320)
+                    ),
                 )

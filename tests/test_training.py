@@ -66,6 +66,9 @@ class TrainingSmokeTest(unittest.TestCase):
             )
             Trainer(config).train()
             self.assertTrue((root / "run" / "base_epoch_0000.pt").exists())
+            self.assertTrue((root / "run" / "training_history.jsonl").exists())
+            self.assertTrue((root / "run" / "training_curves.png").exists())
+            self.assertTrue((root / "run" / "latest_metrics.json").exists())
 
     def test_remaining_training_stages(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -258,6 +258,16 @@ class GeoDiffGAN(nn.Module):
             diagnostics.capture("input.lr", lr, visual="rgb")
             diagnostics.capture("conditioning.text", context)
             diagnostics.capture("conditioning.degradation", degradation)
+            diagnostics.capture(
+                "base.bicubic",
+                torch.nn.functional.interpolate(
+                    lr,
+                    scale_factor=self.scale,
+                    mode="bicubic",
+                    align_corners=False,
+                ),
+                visual="rgb",
+            )
             diagnostics.capture("base.hr", base, visual="rgb")
             for name, feature in zip(("f128", "f64", "f32", "f16"), lr_features):
                 diagnostics.capture(f"lr_features.{name}", feature, visual="features")
@@ -302,6 +312,23 @@ class GeoDiffGAN(nn.Module):
             diagnostics.capture(
                 "decoder.raw_edit_residual", raw_edit, visual="residual"
             )
+            diagnostics.capture(
+                "decoder.detail_high_pass",
+                detail_residual,
+                visual="residual",
+            )
+            diagnostics.capture(
+                "decoder.evidence_residual",
+                evidence_residual,
+                visual="residual",
+            )
+            diagnostics.capture(
+                "decoder.permission_edit_residual",
+                edit_residual,
+                visual="residual",
+            )
+            diagnostics.capture("output.ungated_sr", ungated_sr, visual="rgb")
+            diagnostics.capture("output.sr_anchor", sr_anchor, visual="rgb")
             diagnostics.scalar(
                 "mapper.evidence_mean", mapped.evidence_confidence.mean()
             )
@@ -343,6 +370,11 @@ class GeoDiffGAN(nn.Module):
                 iterations=steps,
                 step_size=0.5,
                 severity=self.degradation_severity,
+                debug_callback=(
+                    diagnostics.projection_step
+                    if diagnostics is not None
+                    else None
+                ),
             )
         else:
             estimate = (base + residual).clamp(0, 1)
@@ -358,9 +390,19 @@ class GeoDiffGAN(nn.Module):
                 iterations=steps,
                 step_size=0.15,
                 severity=self.degradation_severity,
+                debug_callback=(
+                    diagnostics.projection_step
+                    if diagnostics is not None
+                    else None
+                ),
             )
         if diagnostics is not None:
             diagnostics.capture("output.pre_projection", estimate, visual="rgb")
+            diagnostics.capture(
+                "output.projection_update",
+                image - estimate,
+                visual="residual",
+            )
             diagnostics.capture("output.hr", image, visual="rgb")
             diagnostics.scalar("output.back_projection_steps", steps)
             diagnostics.scalar("output.mode", mode)

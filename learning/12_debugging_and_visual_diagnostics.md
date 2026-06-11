@@ -31,10 +31,21 @@ Outputs:
 | File | Purpose |
 |---|---|
 | `overview.png` | LR, base, final residual, output, target, and consistency views |
+| `stage_intermediates.png` | tensors selected for the active base/VAE/diffusion/joint/edit stage |
 | `features.png` | feature/latent/gate summaries |
+| `tensor_histograms.png` | distributions and activation-collapse checks |
+| `frequency_spectra.png` | low/high-frequency behavior and periodic artifacts |
+| `policy_overlays.png` | confidence, permission, abstention, and errors on the image |
+| `edges_and_wavelets.png` | directional edge and Haar-band comparisons |
 | `diffusion_trajectory.png` | denoising evolution |
+| `projection_trajectory.png` | every sensor back-projection correction |
+| `loss_breakdown.png` | signed current-step loss components during training |
+| `intermediate_tensors.npz` | optional raw tensors for offline analysis |
 | `report.json` | machine-readable shapes and statistics |
 | `summary.txt` | compact human-readable warnings |
+
+Each stage run also maintains `training_history.jsonl`, `latest_metrics.json`, and
+`training_curves.png` beside its checkpoints.
 
 ## 2. Debugging Hierarchy
 
@@ -223,6 +234,10 @@ Also show:
 - gate heatmap;
 - wavelet bands.
 
+The recorder generates these views directly. Use `debug.max_exports_per_epoch` to bound disk use
+and enable `debug.save_tensors` only for short investigations because compressed feature archives
+can still be large.
+
 Avoid auto-scaling every panel independently; it can exaggerate weak residuals and hide radiometric
 differences.
 
@@ -235,11 +250,14 @@ When asking for help, provide:
 3. `overview.png`;
 4. `features.png`;
 5. `diffusion_trajectory.png`;
-6. config YAML;
-7. checkpoint stage and epoch;
-8. exact command;
-9. GPU type and precision;
-10. whether the input is smoke data or real Sentinel-2.
+6. `projection_trajectory.png`;
+7. `tensor_histograms.png` and `frequency_spectra.png`;
+8. `policy_overlays.png` and `edges_and_wavelets.png`;
+9. config YAML;
+10. checkpoint stage and epoch;
+11. exact command;
+12. GPU type and precision;
+13. whether the input is smoke data or real Sentinel-2.
 
 This package is far more useful than only sharing the final attractive or failed image.
 

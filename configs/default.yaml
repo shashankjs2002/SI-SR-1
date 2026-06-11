@@ -45,8 +45,14 @@ debug:
   enabled: false
   output_dir: runs/debug
   every_n_steps: 100
+  max_exports_per_epoch: 5
   print_tensor_stats: true
   fail_on_nonfinite: true
+  panel_size: 320
+  histogram_bins: 64
+  max_feature_channels: 16
+  save_tensors: false
+  max_saved_tensors: 32
 
 training:
   stage: base

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 
 import torch
 from torch.nn import functional as F
@@ -149,17 +150,25 @@ def back_project(
     iterations: int = 3,
     step_size: float = 0.5,
     severity: str = "mild",
+    debug_callback: Callable[[int, torch.Tensor, torch.Tensor], None] | None = None,
 ) -> torch.Tensor:
     result = estimate
-    for _ in range(iterations):
+    for iteration in range(iterations):
         error = observed_lr - sensor_degrade(
             result,
             parameters,
             scale=scale,
             severity=severity,
         )
-        correction = F.interpolate(error, size=result.shape[-2:], mode="bicubic", align_corners=False)
+        correction = F.interpolate(
+            error,
+            size=result.shape[-2:],
+            mode="bicubic",
+            align_corners=False,
+        )
         result = (result + step_size * correction).clamp(0, 1)
+        if debug_callback is not None:
+            debug_callback(iteration, result, error)
     return result
 
 

@@ -122,7 +122,12 @@ class CoreTests(unittest.TestCase):
         lr = torch.rand(1, 3, 16, 16)
         encoder = HashTextEncoder(32, 8)
         with tempfile.TemporaryDirectory() as directory:
-            diagnostics = DiagnosticRecorder(directory, verbose=False)
+            diagnostics = DiagnosticRecorder(
+                directory,
+                verbose=False,
+                panel_size=160,
+                save_tensors=True,
+            )
             with mock.patch.object(
                 model,
                 "apply_ablation_inputs",
@@ -145,6 +150,7 @@ class CoreTests(unittest.TestCase):
                 output.image,
                 torch.tensor([[0.4, 0.0, 0.0, 0.0]]),
                 scale=4,
+                target=output.image,
             )
             report = diagnostics.export()
             self.assertEqual(output.image.shape, (1, 3, 64, 64))
@@ -152,6 +158,13 @@ class CoreTests(unittest.TestCase):
             self.assertTrue((Path(directory) / "overview.png").exists())
             self.assertTrue((Path(directory) / "features.png").exists())
             self.assertTrue((Path(directory) / "diffusion_trajectory.png").exists())
+            self.assertTrue((Path(directory) / "projection_trajectory.png").exists())
+            self.assertTrue((Path(directory) / "stage_intermediates.png").exists())
+            self.assertTrue((Path(directory) / "tensor_histograms.png").exists())
+            self.assertTrue((Path(directory) / "frequency_spectra.png").exists())
+            self.assertTrue((Path(directory) / "policy_overlays.png").exists())
+            self.assertTrue((Path(directory) / "edges_and_wavelets.png").exists())
+            self.assertTrue((Path(directory) / "intermediate_tensors.npz").exists())
 
     def test_diagnostics_detect_nonfinite(self) -> None:
         stats = tensor_statistics(torch.tensor([1.0, float("nan"), float("inf")]))

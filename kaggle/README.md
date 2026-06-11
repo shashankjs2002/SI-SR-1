@@ -18,7 +18,8 @@ The notebook:
 7. Optionally captions patches with `Qwen/Qwen3-VL-8B-Instruct`.
 8. Writes runtime YAML with calibrated mild degradation and tensor diagnostics.
 9. Runs one or all stages using one GPU or `torchrun` on multiple GPUs.
-10. Evaluates stochastic predictions and exports checkpoints and metrics.
+10. Displays per-stage training curves and detailed intermediate visualizations.
+11. Evaluates stochastic predictions and exports checkpoints and metrics.
 
 The notebook defaults to a quick one-epoch development run. Set
 `FAST_DEV_RUN = False` before producing research results.
@@ -26,6 +27,10 @@ The notebook defaults to a quick one-epoch development run. Set
 The preparation, filtering, and visualization cells reconstruct their required
 paths after a Kaggle kernel restart. Run the clone/install cell again only when
 the package is no longer importable or when pulling newer repository code.
+
+The diagnostic cell displays stage intermediates, activation histograms, Fourier spectra, policy
+overlays, edge/wavelet comparisons, diffusion and projection trajectories, and stores a compressed
+tensor archive for the selected patch.
 
 A single MGRS tile can exercise the pipeline in `FAST_DEV_RUN`, but all patches
 will remain in one tile-level split. Research runs require enough geographically

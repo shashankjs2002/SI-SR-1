@@ -27,9 +27,18 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--diffusion-every", type=int, default=5)
     parser.add_argument("--allow-nonfinite", action="store_true")
+    parser.add_argument("--panel-size", type=int)
+    parser.add_argument("--histogram-bins", type=int)
+    parser.add_argument("--max-feature-channels", type=int)
+    parser.add_argument(
+        "--save-tensors",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
     args = parser.parse_args()
 
     config = load_config(args.config)
+    debug_config = config.get("debug", {})
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = GeoDiffGAN.from_config(config).to(device).eval()
     load_checkpoint(args.checkpoint, model, strict=False)
@@ -57,6 +66,27 @@ def main() -> None:
         args.output,
         verbose=True,
         fail_on_nonfinite=not args.allow_nonfinite,
+        panel_size=(
+            args.panel_size
+            if args.panel_size is not None
+            else int(debug_config.get("panel_size", 320))
+        ),
+        histogram_bins=(
+            args.histogram_bins
+            if args.histogram_bins is not None
+            else int(debug_config.get("histogram_bins", 64))
+        ),
+        max_feature_channels=(
+            args.max_feature_channels
+            if args.max_feature_channels is not None
+            else int(debug_config.get("max_feature_channels", 16))
+        ),
+        save_tensors=(
+            args.save_tensors
+            if args.save_tensors is not None
+            else bool(debug_config.get("save_tensors", False))
+        ),
+        max_saved_tensors=int(debug_config.get("max_saved_tensors", 32)),
     )
     generator = torch.Generator(device=device).manual_seed(args.seed)
     with torch.no_grad():

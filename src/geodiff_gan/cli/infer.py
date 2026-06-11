@@ -26,8 +26,10 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--debug-dir")
     parser.add_argument("--debug-diffusion-every", type=int, default=5)
+    parser.add_argument("--debug-save-tensors", action="store_true")
     args = parser.parse_args()
     config = load_config(args.config)
+    debug_config = config.get("debug", {})
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = GeoDiffGAN.from_config(config).to(device).eval()
     load_checkpoint(args.checkpoint, model, strict=False)
@@ -37,7 +39,22 @@ def main() -> None:
     null_context = text_encoder([""])
     generator = torch.Generator(device=device).manual_seed(args.seed)
     diagnostics = (
-        DiagnosticRecorder(args.debug_dir, verbose=True)
+        DiagnosticRecorder(
+            args.debug_dir,
+            verbose=True,
+            panel_size=int(debug_config.get("panel_size", 320)),
+            histogram_bins=int(debug_config.get("histogram_bins", 64)),
+            max_feature_channels=int(
+                debug_config.get("max_feature_channels", 16)
+            ),
+            save_tensors=(
+                args.debug_save_tensors
+                or bool(debug_config.get("save_tensors", False))
+            ),
+            max_saved_tensors=int(
+                debug_config.get("max_saved_tensors", 32)
+            ),
+        )
         if args.debug_dir
         else None
     )

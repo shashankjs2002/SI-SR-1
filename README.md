@@ -229,16 +229,25 @@ geodiff-debug \
 The folder contains:
 
 - `overview.png`: LR, base, residual, output, target, re-degraded output, and error maps.
+- `stage_intermediates.png`: stage-specific tensors from base, VAE, diffusion, joint, or edit.
 - `features.png`: LR features, denoised latent, mapper content, evidence confidence, edit
   permission, and abstention map.
+- `tensor_histograms.png`: activation distributions for images, latents, policies, and residuals.
+- `frequency_spectra.png`: Fourier spectra for LR, base, generated detail, output, and target.
+- `policy_overlays.png`: confidence, permission, abstention, and error maps over the output.
+- `edges_and_wavelets.png`: target/output edges and Haar LH/HL/HH comparisons.
 - `diffusion_trajectory.png`: selected noisy and predicted-clean latent states.
+- `projection_trajectory.png`: HR estimate and LR error after each back-projection update.
+- `loss_breakdown.png`: current training-step loss components when training diagnostics run.
+- `intermediate_tensors.npz`: optional compressed tensors for offline inspection.
 - `report.json`: shapes, ranges, NaN/Inf counts, losses, gate saturation, residual strength, and
   LR consistency before and after back-projection.
 - `summary.txt`: compact text output suitable for sharing during debugging.
 
 Training diagnostics are opt-in through the `debug` section of `configs/default.yaml`. Keep
-`enabled: false` for normal training. When enabled, the trainer writes one diagnostic directory at
-the configured interval without changing the loss graph.
+`enabled: false` for normal training. When enabled, the trainer writes stage-specific diagnostic
+directories at the configured interval, capped by `max_exports_per_epoch`. Every stage also writes
+`training_history.jsonl`, `latest_metrics.json`, and `training_curves.png`.
 
 ## Ablations and Scientific Use
 
