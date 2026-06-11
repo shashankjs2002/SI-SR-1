@@ -15,6 +15,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--patch-size", type=int, default=512)
     parser.add_argument("--stride", type=int, default=384)
     parser.add_argument("--minimum-valid-fraction", type=float, default=0.95)
+    parser.add_argument(
+        "--max-products",
+        type=int,
+        help="Process only the first N sorted SAFE products (development runs only)",
+    )
     return parser
 
 
@@ -23,6 +28,14 @@ def main() -> None:
     products = discover_safe_products(args.input)
     if not products:
         raise SystemExit(f"No .SAFE products found below {args.input}")
+    if args.max_products is not None:
+        if args.max_products < 1:
+            raise SystemExit("--max-products must be at least 1")
+        products = products[: args.max_products]
+        print(
+            f"limiting preparation to {len(products)} SAFE product(s)",
+            flush=True,
+        )
     records = []
     for product in products:
         print(f"extracting {product}", flush=True)
