@@ -170,7 +170,7 @@ B4, B3, and B2 are scaled by $10{,}000$ to surface-reflectance-like RGB values. 
 Classification Layer masks reject no-data, defective pixels, cloud shadow, medium/high cloud,
 cirrus, snow/ice, non-finite values, zeros, and saturation. Each accepted HR patch is
 $512\times512$ with stride 384, corresponding to approximately
-\SI{5.12}{km}$ by \SI{5.12}{km}. The \SI{20}{m} SCL window is obtained by mapping the
+\SI{5.12}{km} by \SI{5.12}{km}. The \SI{20}{m} SCL window is obtained by mapping the
 \SI{10}{m} RGB bounds into the SCL transform, preventing right/bottom out-of-range reads.
 
 An additional auditable filter detects zero-filled edge and corner background. Rejected files are
