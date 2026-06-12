@@ -51,6 +51,14 @@ Set it to `False` to reuse the current manifest without scanning. If the manifes
 the notebook prepares it automatically. Set `REBUILD_PATCHES=True` only when deliberately changing
 patch extraction settings and regenerating selected products.
 
+If the Kaggle dataset contains `CITY_...SAFE/S2...SAFE`, the outer directory is a label wrapper,
+not a second product. The notebook reports both the raw `.SAFE` directory count and the canonical
+product count, ignores wrappers for extraction, and still uses the outer city label for split
+prefixes.
+
+Set `SENTINEL_INPUT` to the exact dataset root. Using `/kaggle/input` scans every attached dataset,
+which can legitimately produce more canonical products than the number in one dataset.
+
 Do not change `MODEL_SIZE` between training stages in one run. Stage-to-stage checkpoint transfer
 requires identical architecture dimensions.
 

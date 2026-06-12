@@ -13,10 +13,12 @@ from ..data.manifest import (
     write_manifest,
 )
 from ..data.sentinel import (
+    canonical_product_id,
     discover_safe_products,
     extract_product_patches,
     product_matches_prefix,
     reassign_product_splits,
+    source_product_name,
 )
 
 STATE_VERSION = 1
@@ -81,7 +83,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _product_key(product: str | Path) -> str:
-    return Path(product).name.casefold()
+    return canonical_product_id(product).casefold()
 
 
 def _state_path(manifest: Path, configured: str | None) -> Path:
@@ -155,8 +157,28 @@ def _merge_records(
     existing: list[ManifestRecord],
     additions: list[ManifestRecord],
 ) -> list[ManifestRecord]:
-    merged = {record.patch: record for record in existing}
-    merged.update({record.patch: record for record in additions})
+    merged: dict[tuple[str, str, int, int], ManifestRecord] = {}
+    for record in [*existing, *additions]:
+        key = (
+            _product_key(record.source_product),
+            record.tile_id,
+            record.row,
+            record.col,
+        )
+        previous = merged.get(key)
+        canonical_name = canonical_product_id(record.source_product).casefold()
+        is_labeled_wrapper = (
+            Path(record.source_product).name.casefold() != canonical_name
+        )
+        previous_is_labeled_wrapper = (
+            previous is not None
+            and Path(previous.source_product).name.casefold()
+            != canonical_product_id(previous.source_product).casefold()
+        )
+        if previous is None or (
+            is_labeled_wrapper and not previous_is_labeled_wrapper
+        ):
+            merged[key] = record
     return sorted(
         merged.values(),
         key=lambda record: (
@@ -215,10 +237,27 @@ def main() -> None:
             "Duplicate SAFE directory names were found below the input root: "
             f"{duplicate_names}. Product names must be unique for incremental tracking."
         )
+    attached_labels = {
+        _product_key(product): source_product_name(product)
+        for product in products
+    }
     existing_records: list[ManifestRecord] = []
     completed_products: dict[str, str] = {}
     if not args.rebuild and manifest_path.exists():
-        existing_records = load_manifest(manifest_path)
+        loaded_records = load_manifest(manifest_path)
+        for record in loaded_records:
+            record.source_product = attached_labels.get(
+                _product_key(record.source_product),
+                record.source_product,
+            )
+        existing_records = _merge_records([], loaded_records)
+        removed_duplicates = len(loaded_records) - len(existing_records)
+        if removed_duplicates:
+            print(
+                f"removed {removed_duplicates} duplicate wrapper/inner records "
+                "from the active manifest",
+                flush=True,
+            )
         missing_source = [
             record.patch for record in existing_records if not record.source_product
         ]
@@ -303,7 +342,7 @@ def main() -> None:
         )
         validate_tile_split_isolation(records)
         write_manifest(manifest_path, records)
-        completed_products[_product_key(product)] = product.name
+        completed_products[_product_key(product)] = source_product_name(product)
         _write_state(
             state_path,
             current_settings,
@@ -311,7 +350,7 @@ def main() -> None:
             len(records),
         )
         print(
-            f"completed {product.name}: {len(additions)} new patches, "
+            f"completed {source_product_name(product)}: {len(additions)} new patches, "
             f"{len(records)} manifest records total",
             flush=True,
         )

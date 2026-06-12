@@ -12,14 +12,67 @@ from .manifest import (
 )
 
 INVALID_SCL_CLASSES = {0, 1, 3, 8, 9, 10, 11}
+SENTINEL_PRODUCT_PATTERN = re.compile(
+    r"(S2[A-Z]_MSIL2A_[A-Z0-9_]+\.SAFE)$",
+    re.IGNORECASE,
+)
+
+
+def canonical_product_id(product: str | Path) -> str:
+    name = Path(product).name
+    match = SENTINEL_PRODUCT_PATTERN.search(name)
+    return match.group(1) if match else name
+
+
+def is_safe_product_root(product: str | Path) -> bool:
+    product = Path(product)
+    return (
+        product.is_dir()
+        and (product / "manifest.safe").is_file()
+        and (product / "GRANULE").is_dir()
+    )
+
+
+def source_product_name(product: str | Path) -> str:
+    product = Path(product)
+    name = product.name
+    parent = product.parent
+    while parent.suffix.casefold() == ".safe":
+        name = parent.name
+        parent = parent.parent
+    return name
 
 
 def discover_safe_products(root: str | Path) -> list[Path]:
     root = Path(root)
-    products = sorted(root.rglob("*.SAFE"))
-    if root.suffix == ".SAFE":
-        products.insert(0, root)
-    return sorted(set(products))
+    candidates = list(root.rglob("*.SAFE"))
+    if root.suffix.casefold() == ".safe":
+        candidates.insert(0, root)
+    products: dict[str, Path] = {}
+    for candidate in sorted(set(candidates)):
+        if not is_safe_product_root(candidate):
+            continue
+        identity = canonical_product_id(candidate).casefold()
+        products.setdefault(identity, candidate)
+    return [products[key] for key in sorted(products)]
+
+
+def resolve_safe_product_root(product: str | Path) -> Path:
+    product = Path(product)
+    if is_safe_product_root(product):
+        return product
+    nested = discover_safe_products(product)
+    if len(nested) == 1:
+        return nested[0]
+    if not nested:
+        raise ValueError(
+            f"{product} is not a Sentinel-2 SAFE product root: expected direct "
+            "manifest.safe and GRANULE entries"
+        )
+    raise ValueError(
+        f"{product} is a wrapper containing {len(nested)} SAFE products; "
+        "select a canonical inner product"
+    )
 
 
 def _find_band(product: Path, pattern: str) -> Path:
@@ -42,8 +95,18 @@ def tile_id_from_product(product: Path) -> str:
 
 
 def product_matches_prefix(product: str | Path, prefixes: list[str]) -> bool:
-    name = Path(product).name.casefold()
-    return any(name.startswith(prefix.casefold()) for prefix in prefixes)
+    path = Path(product)
+    aliases = [path.name]
+    aliases.extend(
+        parent.name
+        for parent in path.parents
+        if parent.suffix.casefold() == ".safe"
+    )
+    return any(
+        alias.casefold().startswith(prefix.casefold())
+        for alias in aliases
+        for prefix in prefixes
+    )
 
 
 def split_for_product(
@@ -116,17 +179,18 @@ def extract_product_patches(
     except ImportError as error:
         raise RuntimeError("Install rasterio to prepare Sentinel-2 products") from error
 
-    product = Path(product)
+    product = resolve_safe_product_root(product)
     output_dir = Path(output_dir)
+    source_product = source_product_name(product)
     tile_id = tile_id_from_product(product)
     split = split_for_product(
-        product,
+        source_product,
         tile_id,
         validation_prefixes=validation_prefixes,
         test_prefixes=test_prefixes,
         unmatched_split=unmatched_split,
     )
-    destination = output_dir / tile_id / product.stem
+    destination = output_dir / tile_id / Path(source_product).stem
     destination.mkdir(parents=True, exist_ok=True)
     band_paths = [
         _find_band(product, "*_B04_10m.jp2"),
@@ -196,7 +260,7 @@ def extract_product_patches(
                         row=row,
                         col=col,
                         valid_fraction=valid_fraction,
-                        source_product=product.name,
+                        source_product=source_product,
                     )
                 )
     return records

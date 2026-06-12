@@ -197,6 +197,14 @@ Changing patch size, stride, or minimum valid fraction is not an incremental upd
 would mix incompatible examples. The CLI rejects such a state mismatch; use a new output directory
 or an explicit rebuild.
 
+Nested structures such as `CITY_product.SAFE/S2_product.SAFE` contain one product, not two. A valid
+raster root has `manifest.safe` and `GRANULE` directly beneath it. Discovery deduplicates by the
+canonical Sentinel product identifier, reads the inner raster root, and preserves the outer label
+for experiment split prefixes.
+
+On Kaggle, point discovery at one dataset root rather than `/kaggle/input` when multiple datasets
+are attached. Wrapper deduplication and input-root scoping solve different problems.
+
 ## 9. Sampling Balance
 
 Target 40,000-100,000 valid patches across:

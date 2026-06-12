@@ -128,6 +128,11 @@ and only newly attached products are extracted. Progress is checkpointed after e
 `--rebuild` only when intentionally regenerating patches. Patch directories include the SAFE
 product name, preventing multiple acquisitions of the same MGRS tile from overwriting each other.
 
+Some archives create a renamed outer `.SAFE` wrapper containing the actual canonical Sentinel
+`.SAFE` product. Discovery accepts only directories with direct `manifest.safe` and `GRANULE`
+entries, so wrapper/inner pairs are counted once. Raster data is read from the canonical inner
+product while the outer label is retained for prefix split rules such as `CHHATARPUR1`.
+
 All windows from one MGRS tile receive the same split. Preparation stops if prefix rules place the
 same MGRS tile in both validation and test. A study with only a few tiles is invalid: collect enough
 complete tiles to represent train, validation, and test geography.

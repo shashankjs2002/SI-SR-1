@@ -170,6 +170,37 @@ class IncrementalPreparationTest(unittest.TestCase):
             self.assertEqual(extractor.call_count, 1)
             self.assertEqual(extractor.call_args.args[0].name, "NEW.SAFE")
 
+    def test_wrapper_and_inner_manifest_records_are_deduplicated(self) -> None:
+        canonical = (
+            "S2C_MSIL2A_20260527T050651_N0512_R019_"
+            "T44RPQ_20260527T100616.SAFE"
+        )
+        wrapper_record = ManifestRecord(
+            patch="patches/wrapper.npz",
+            tile_id="44RPQ",
+            split="train",
+            row=0,
+            col=0,
+            valid_fraction=1.0,
+            source_product=f"AYODHYA_{canonical}",
+        )
+        inner_record = ManifestRecord(
+            patch="patches/inner.npz",
+            tile_id="44RPQ",
+            split="train",
+            row=0,
+            col=0,
+            valid_fraction=1.0,
+            source_product=canonical,
+        )
+
+        merged = prepare_sentinel._merge_records(
+            [inner_record],
+            [wrapper_record],
+        )
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0], wrapper_record)
+
 
 if __name__ == "__main__":
     unittest.main()

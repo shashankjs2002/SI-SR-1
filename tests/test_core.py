@@ -20,7 +20,11 @@ from geodiff_gan.data.manifest import (
     write_manifest,
 )
 from geodiff_gan.data.sentinel import (
+    canonical_product_id,
+    discover_safe_products,
+    product_matches_prefix,
     reassign_product_splits,
+    source_product_name,
     split_for_product,
 )
 from geodiff_gan.diagnostics import DiagnosticRecorder, tensor_statistics
@@ -305,6 +309,24 @@ class CoreTests(unittest.TestCase):
             ),
             "train",
         )
+
+    def test_nested_safe_wrapper_discovers_only_canonical_product(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            canonical_name = (
+                "S2C_MSIL2A_20260527T050651_N0512_R019_"
+                "T44RPQ_20260527T100616.SAFE"
+            )
+            wrapper = root / f"AYODHYA_{canonical_name}"
+            product = wrapper / canonical_name
+            (product / "GRANULE").mkdir(parents=True)
+            (product / "manifest.safe").write_text("", encoding="utf-8")
+
+            discovered = discover_safe_products(root)
+            self.assertEqual(discovered, [product])
+            self.assertEqual(source_product_name(product), wrapper.name)
+            self.assertEqual(canonical_product_id(wrapper), canonical_name)
+            self.assertTrue(product_matches_prefix(product, ["AYODHYA"]))
 
     def test_safe_product_split_reassignment_prevents_tile_leakage(self) -> None:
         records = [
