@@ -38,37 +38,65 @@ Parameters measure model capacity, but they do not determine peak GPU memory alo
 attention maps, gradients, Adam states, input resolution, batch size, and precision are also major
 memory costs.
 
-## 2. XS, Medium, and Large Presets
+## 2. XS, Small, Medium, and Large Presets
 
-All three presets use the same end-to-end architecture, tensor interfaces, two operating modes,
+All four presets use the same end-to-end architecture, tensor interfaces, two operating modes,
 training curriculum, losses, evidence controls, and spatial-consistency mechanisms. They differ
 only in width, depth, text-encoder implementation for XS, and discriminator capacity.
 
 | Preset | Configuration | Core parameters | Training discriminators | Purpose |
 |---|---|---:|---:|---|
 | XS | `configs/smoke.yaml` | 765,046 | 113,508 | Unit tests and pipeline debugging |
+| Small | `configs/small.yaml` | 12,139,822 | 979,492 | Default lower-cost research model |
 | Medium | `configs/medium.yaml` | 21,127,282 | 1,731,972 | Practical research on 16 GB GPUs |
 | Large | `configs/default.yaml` | 81,856,274 | 6,871,812 | Highest-capacity research model |
 
-The medium model is about 27.6 times larger than XS and contains 25.8% of the large model's core
-parameters. Unlike XS, medium retains the full 768-dimensional SigLIP-compatible context,
-four-level diffusion U-Net, 1,000-step training schedule, and all research mechanisms.
+Small contains 57.5% of medium's core parameters and 14.8% of large's. Unlike XS, small and medium
+retain the full 768-dimensional SigLIP-compatible context, four-level diffusion U-Net, 1,000-step
+training schedule, and all research mechanisms.
 
 Capacity presets are not checkpoint-compatible. Keep one preset for the complete five-stage
 curriculum; changing widths between stages changes parameter tensor shapes.
 
-| Architecture setting | XS | Medium | Large |
-|---|---:|---:|---:|
-| Swin embedding/depth/heads | 16 / 2 / 4 | 40 / 4 / 5 | 60 / 6 / 6 |
-| VAE base channels | 8 | 32 | 64 |
-| LR encoder base channels | 8 | 32 | 64 |
-| Diffusion widths | 16, 32, 48 | 64, 128, 192, 256 | 128, 256, 384, 512 |
-| Context dimension | 32 | 768 | 768 |
-| Mapper channels | 16 | 64 | 128 |
-| Style dimension | 16 | 128 | 256 |
-| Decoder channels | 16, 12, 8, 8 | 64, 48, 32, 24 | 128, 96, 64, 48 |
-| Diffusion schedule | 20 | 1,000 | 1,000 |
-| Discriminator base channels | 8 | 32 | 64 |
+| Architecture setting | XS | Small | Medium | Large |
+|---|---:|---:|---:|---:|
+| Swin embedding/depth/heads | 16 / 2 / 4 | 32 / 4 / 4 | 40 / 4 / 5 | 60 / 6 / 6 |
+| VAE base channels | 8 | 24 | 32 | 64 |
+| LR encoder base channels | 8 | 24 | 32 | 64 |
+| Diffusion widths | 16, 32, 48 | 48, 96, 144, 192 | 64, 128, 192, 256 | 128, 256, 384, 512 |
+| Context dimension | 32 | 768 | 768 | 768 |
+| Mapper channels | 16 | 48 | 64 | 128 |
+| Style dimension | 16 | 96 | 128 | 256 |
+| Decoder channels | 16, 12, 8, 8 | 48, 36, 24, 24 | 64, 48, 32, 24 | 128, 96, 64, 48 |
+| Diffusion schedule | 20 | 1,000 | 1,000 | 1,000 |
+| Discriminator base channels | 8 | 24 | 32 | 64 |
+
+### Small module and stage counts
+
+The small core contains 12,139,822 parameters:
+
+| Core module | Parameters |
+|---|---:|
+| SwinIR base | 119,171 |
+| Residual VAE | 1,378,739 |
+| LR encoder | 625,728 |
+| Diffusion U-Net | 9,138,052 |
+| GeoMapper | 589,250 |
+| Residual GAN decoder | 288,882 |
+
+Its training-only discriminators contain 979,492 parameters. Stage-wise optimized totals are:
+
+| Stage | Total optimized parameters |
+|---|---:|
+| Base | 119,171 |
+| VAE | 2,882,599 |
+| Diffusion | 9,138,052 |
+| Joint, including discriminators | 11,621,404 |
+| Edit, including discriminators | 10,995,676 |
+
+Only capacity settings change. Prompt policy, losses, optimizer defaults, stage freezing,
+degradation conditioning, evidence/edit gates, projection, and uncertainty abstention are inherited
+unchanged from the large configuration.
 
 ## 3. Large Architecture Count
 
@@ -329,6 +357,18 @@ python scripts/check_parameters.py \
 
 The medium model contains 21,127,282 core parameters and 1,731,972 discriminator parameters.
 
+Check the default small architecture:
+
+```bash
+python scripts/check_parameters.py \
+  --config configs/small.yaml \
+  --defaults configs/default.yaml \
+  --patches 702 \
+  --verify
+```
+
+The small model contains 12,139,822 core parameters and 979,492 discriminator parameters.
+
 To count the configured frozen text encoder:
 
 ```bash
@@ -346,8 +386,9 @@ The verification mode checks:
 3. each stage's total equals its trainable core plus active discriminators;
 4. invalid patch counts and world sizes are rejected.
 
-The unit tests lock both XS and medium architecture counts. An intentional architecture change
-must update the expected test values and this chapter.
+The unit tests lock XS, small, and medium architecture counts. They also verify that small has the
+same module/stage contract as large while remaining below medium capacity. An intentional
+architecture change must update the expected test values and this chapter.
 
 ## Mastery Checklist
 

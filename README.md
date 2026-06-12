@@ -27,19 +27,21 @@ checkpoints.
 After creating your GitHub repository, replace `OWNER` in the notebook's `REPOSITORY_URL` cell with
 your GitHub username or organization.
 
-The notebook defaults to `FAST_DEV_RUN = True` and `MODEL_SIZE = "xs"`. Run length and model
-capacity are independent: choose `MODEL_SIZE = "xs"`, `"medium"`, or `"large"`, then use
-`FAST_DEV_RUN` to select a one-epoch pipeline check or the research epoch schedule. Non-dev runs
-default to the 21.13M-parameter medium model; select `"large"` explicitly for the 81.86M model.
+The notebook defaults to `FAST_DEV_RUN = True` and `MODEL_SIZE = "small"`. Run length and model
+capacity are independent: choose `MODEL_SIZE = "xs"`, `"small"`, `"medium"`, or `"large"`, then
+use `FAST_DEV_RUN` to select a one-epoch pipeline check or the research epoch schedule. Small keeps
+the complete research module graph and conditioning path while reducing core capacity to 12.14M.
 
 | Model size | Core parameters | Intended use |
 |---|---:|---|
 | XS | 0.765M | Shape, loss, checkpoint, and pipeline testing |
+| Small | 12.14M | Default lower-cost research architecture |
 | Medium | 21.13M | Practical research training on 16 GB GPUs |
 | Large | 81.86M | Maximum-capacity research experiments |
 
 Keep `MODEL_SIZE` fixed across base, VAE, diffusion, joint, and edit stages. Checkpoints cannot be
-transferred between XS, medium, and large because their parameter tensor shapes differ.
+transferred between XS, small, medium, and large because their parameter tensor shapes differ.
+The notebook stores runs below a model-specific directory to prevent incompatible auto-resume.
 
 ## Model
 
@@ -69,7 +71,7 @@ controlled by a spatial edit-permission map, applies only a soft projection, and
 
 The implementation includes:
 
-- SwinIR-style base branch with six shifted-window blocks and 4x pixel shuffle.
+- SwinIR-style base branch with configurable shifted-window depth and 4x pixel shuffle.
 - Residual VAE with a four-channel latent at one-eighth HR resolution.
 - Conditional `v`-prediction U-Net with LR, degradation, mode, and text conditioning.
 - Four-block dual-policy GeoMapper with separate evidence-confidence and edit-permission maps.

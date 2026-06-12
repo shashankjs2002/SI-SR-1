@@ -26,10 +26,13 @@ The notebook:
 The notebook separates run length from model capacity:
 
 - `FAST_DEV_RUN` controls data limits, epochs, sampling steps, and diagnostic frequency.
-- `MODEL_SIZE` selects `"xs"` (0.765M), `"medium"` (21.13M), or `"large"` (81.86M).
+- `MODEL_SIZE` selects `"xs"` (0.765M), `"small"` (12.14M), `"medium"` (21.13M), or
+  `"large"` (81.86M).
 
-It defaults to XS for development and medium for non-dev training. Select large explicitly when
-the available GPU memory and training budget support it.
+It defaults to small for both development and non-dev runs. Small retains the large architecture's
+modules, four-level diffusion hierarchy, 768-dimensional SigLIP conditioning, training stages,
+losses, gates, projection, and uncertainty logic with narrower channels. Select XS explicitly for
+the fastest pipeline-only check.
 
 The first cell also exposes:
 
@@ -55,6 +58,9 @@ With `AUTO_RESUME_TRAINING=True`, rerunning the training cell finds the numerica
 include generator, discriminators, both optimizers, and AMP scaler state and are written atomically.
 This resumes only files still present under `/kaggle/working`; save a notebook version or Kaggle
 Dataset before a session expires.
+
+Run and generated-config directories include `MODEL_SIZE`, for example `runs/small/base`. This
+prevents automatic resume from loading a shape-incompatible checkpoint from another capacity.
 
 Prefix matching is case-insensitive. `MAX_TILES` limits only unmatched/training SAFE products;
 explicit validation and test products remain selected. If an old manifest lacks `source_product`,

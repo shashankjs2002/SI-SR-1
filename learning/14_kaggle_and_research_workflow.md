@@ -16,7 +16,7 @@ The notebook has two independent controls:
 | Control | Responsibility |
 |---|---|
 | `FAST_DEV_RUN` | Tile limit, epoch count, sampling steps, and diagnostic frequency |
-| `MODEL_SIZE` | `xs`, `medium`, or `large` architecture capacity |
+| `MODEL_SIZE` | `xs`, `small`, `medium`, or `large` architecture capacity |
 
 Dataset and evaluation controls are also independent:
 
@@ -32,9 +32,9 @@ Dataset and evaluation controls are also independent:
 | `PROGRESS_UPDATES_PER_EPOCH` | Number of compact milestone lines per epoch |
 | `TRAINING_DIAGNOSTICS` | Enable expensive training-time tensor exports |
 
-Use XS only to verify execution. Medium preserves the research architecture at 21.13M core
-parameters and is the practical starting point for 16 GB GPUs. Large uses 81.86M core parameters
-and requires a substantially larger compute budget.
+Use XS only to verify execution. Small is the notebook default and preserves the full research
+module graph at 12.14M core parameters. Medium uses 21.13M and provides more capacity on 16 GB
+GPUs. Large uses 81.86M and requires a substantially larger compute budget.
 
 ```mermaid
 flowchart TD
@@ -113,24 +113,25 @@ Persist outputs between sessions as Kaggle datasets or notebook versions.
 Before starting a stage, verify the previous checkpoint exists:
 
 ```text
-runs/base/base_epoch_....pt
-runs/vae/vae_epoch_....pt
-runs/diffusion/diffusion_epoch_....pt
-runs/joint/joint_epoch_....pt
-runs/edit/edit_epoch_....pt
+runs/<model_size>/base/base_epoch_....pt
+runs/<model_size>/vae/vae_epoch_....pt
+runs/<model_size>/diffusion/diffusion_epoch_....pt
+runs/<model_size>/joint/joint_epoch_....pt
+runs/<model_size>/edit/edit_epoch_....pt
 ```
 
 If the schedule changes, filenames change. Update `init_checkpoint` in the stage overlays instead of
 assuming the old path.
 
 The notebook enables same-stage automatic resume. For example, if
-`runs/base/base_epoch_0007.pt` is newest and `epochs: 20`, rerunning starts at epoch 9 in
+`runs/small/base/base_epoch_0007.pt` is newest and `epochs: 20`, rerunning starts at epoch 9 in
 human-readable numbering and writes `base_epoch_0008.pt` next. Resume restores the model,
 optimizer, discriminators, discriminator optimizer, and AMP scaler. Checkpoints are atomic and
 resume occurs at epoch boundaries, not halfway through a dataloader epoch.
 
 Automatic discovery is intentionally stage-local. `init_checkpoint` transfers weights from the
 previous stage; `resume` continues optimization within the same stage.
+Model-specific run directories prevent small from resuming XS, medium, or large tensors.
 
 ## 6. Resource Planning
 
