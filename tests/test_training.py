@@ -12,6 +12,7 @@ import torch
 from geodiff_gan.config import load_config
 from geodiff_gan.data.manifest import ManifestRecord, write_manifest
 from geodiff_gan.training import Trainer
+from geodiff_gan.training.checkpoint import latest_stage_checkpoint
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -66,6 +67,9 @@ class TrainingSmokeTest(unittest.TestCase):
                 "num_workers": 0,
                 "init_checkpoint": None,
                 "resume": None,
+                "auto_resume": False,
+                "progress_mode": "quiet",
+                "progress_updates_per_epoch": 0,
                 "validation_limit": 1,
             }
         )
@@ -99,6 +103,54 @@ class TrainingSmokeTest(unittest.TestCase):
                 "val_redegradation_l1",
             ):
                 self.assertIn(metric, latest["metrics"])
+
+    def test_latest_stage_checkpoint_uses_numeric_epoch_order(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in (
+                "base_epoch_0002.pt",
+                "base_epoch_0010.pt",
+                "vae_epoch_0099.pt",
+            ):
+                (root / name).touch()
+            latest = latest_stage_checkpoint(root, "base")
+            self.assertEqual(latest, root / "base_epoch_0010.pt")
+
+    def test_auto_resume_continues_from_next_epoch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, config = self._fixture(root)
+            output = root / "resume"
+            config["training"].update(
+                {
+                    "stage": "base",
+                    "output_dir": str(output),
+                }
+            )
+            Trainer(config).train()
+
+            resumed = config.copy()
+            resumed["data"] = config["data"].copy()
+            resumed["training"] = config["training"].copy()
+            resumed["training"].update(
+                {
+                    "epochs": 2,
+                    "resume": None,
+                    "auto_resume": True,
+                }
+            )
+            trainer = Trainer(resumed)
+            self.assertEqual(trainer.start_epoch, 1)
+            trainer.train()
+
+            self.assertTrue((output / "base_epoch_0001.pt").exists())
+            history = [
+                json.loads(line)
+                for line in (output / "training_history.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            self.assertEqual([entry["epoch"] for entry in history], [0, 1])
 
     def test_remaining_training_stages(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

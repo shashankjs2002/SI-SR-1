@@ -17,8 +17,9 @@ The notebook:
 5. Visualizes five accepted samples with clean and noisy LR inputs.
 6. Visualizes the exact samples removed by the edge/corner filter.
 7. Optionally captions patches with `Qwen/Qwen3-VL-8B-Instruct`.
-8. Writes runtime YAML with calibrated mild degradation and tensor diagnostics.
-9. Runs one or all stages using one GPU or `torchrun` on multiple GPUs with tqdm loss/ETA bars.
+8. Writes runtime YAML with calibrated mild degradation and optional tensor diagnostics.
+9. Runs one or all stages using one GPU or `torchrun`, with compact progress and automatic
+   same-stage checkpoint resume.
 10. Displays per-stage training curves and detailed intermediate visualizations.
 11. Evaluates validation and test separately, then exports checkpoints and metrics.
 
@@ -39,7 +40,21 @@ UNMATCHED_SAFE_SPLIT = "train"
 VALIDATE_EVERY = 1
 VALIDATION_LIMIT = 4 if FAST_DEV_RUN else 64
 EVALUATION_LIMIT = 4 if FAST_DEV_RUN else 100
+AUTO_RESUME_TRAINING = True
+TRAINING_PROGRESS_MODE = "compact"
+PROGRESS_UPDATES_PER_EPOCH = 2
+TRAINING_DIAGNOSTICS = False
 ```
+
+`compact` emits only milestone updates and one summary per epoch. Use `tqdm` for live notebook
+bars or `quiet` for minimal logs. Training diagnostics are disabled by default because per-batch
+tensor statistics can exhaust Kaggle's cell output; use the dedicated diagnostic cell instead.
+
+With `AUTO_RESUME_TRAINING=True`, rerunning the training cell finds the numerically newest
+`<stage>_epoch_*.pt` under that stage's run directory and continues from the next epoch. Checkpoints
+include generator, discriminators, both optimizers, and AMP scaler state and are written atomically.
+This resumes only files still present under `/kaggle/working`; save a notebook version or Kaggle
+Dataset before a session expires.
 
 Prefix matching is case-insensitive. `MAX_TILES` limits only unmatched/training SAFE products;
 explicit validation and test products remain selected. If an old manifest lacks `source_product`,

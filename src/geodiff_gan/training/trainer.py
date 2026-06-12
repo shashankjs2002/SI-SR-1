@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import random
+import time
 from collections import defaultdict
 from contextlib import contextmanager
 from itertools import islice
@@ -39,7 +41,12 @@ from ..models.discriminators import MultiScaleDiscriminator, WaveletDiscriminato
 from ..models.system import GeoDiffGAN
 from ..metrics import basic_metrics
 from ..text import PromptBatch, TextEncoder, augment_prompts, build_text_encoder
-from .checkpoint import load_checkpoint, save_checkpoint, unwrap
+from .checkpoint import (
+    latest_stage_checkpoint,
+    load_checkpoint,
+    save_checkpoint,
+    unwrap,
+)
 from .stages import STAGES, configure_stage_trainability
 
 
@@ -70,9 +77,16 @@ class Trainer:
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
         self.is_main = not self.distributed or torch.distributed.get_rank() == 0
+        training = config["training"]
+        output_dir = Path(training.get("output_dir", "runs/default"))
+        resume = training.get("resume")
+        if not resume and bool(training.get("auto_resume", False)):
+            resume = latest_stage_checkpoint(output_dir, self.stage)
+            if resume is not None:
+                training["resume"] = str(resume)
         self.model = GeoDiffGAN.from_config(config).to(self.device)
-        init_checkpoint = config["training"].get("init_checkpoint")
-        if init_checkpoint:
+        init_checkpoint = training.get("init_checkpoint")
+        if init_checkpoint and not resume:
             load_checkpoint(init_checkpoint, self.model, strict=False)
         self.text_encoder: TextEncoder | None = None
         if self.stage != "base":
@@ -120,9 +134,14 @@ class Trainer:
         self.amp_enabled = amp_enabled
         self.scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
         self.start_epoch = 0
-        resume = config["training"].get("resume")
         if resume:
             payload = load_checkpoint(resume, self.model, self.optimizer, strict=False)
+            checkpoint_stage = payload.get("stage")
+            if checkpoint_stage != self.stage:
+                raise ValueError(
+                    f"Cannot resume stage {self.stage!r} from checkpoint stage "
+                    f"{checkpoint_stage!r}: {resume}"
+                )
             self.start_epoch = int(payload["epoch"]) + 1
             extra = payload.get("extra", {})
             if "patch_discriminator" in extra:
@@ -133,6 +152,25 @@ class Trainer:
                 )
             if "discriminator_optimizer" in extra:
                 self.discriminator_optimizer.load_state_dict(extra["discriminator_optimizer"])
+            if "scaler" in extra:
+                self.scaler.load_state_dict(extra["scaler"])
+            if self.is_main:
+                print(
+                    f"[{self.stage}] resuming from {resume} at epoch "
+                    f"{self.start_epoch + 1}",
+                    flush=True,
+                )
+
+    @staticmethod
+    def _duration(seconds: float) -> str:
+        seconds = max(0, int(seconds))
+        hours, remainder = divmod(seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        if hours:
+            return f"{hours:d}h{minutes:02d}m"
+        if minutes:
+            return f"{minutes:d}m{seconds:02d}s"
+        return f"{seconds:d}s"
 
     def _synchronize_model_gradients(self) -> None:
         if not self.distributed:
@@ -505,7 +543,10 @@ class Trainer:
             desc=f"{self.stage} validation {epoch + 1}",
             unit="batch",
             leave=False,
-            disable=not self.is_main,
+            disable=(
+                not self.is_main
+                or training.get("progress_mode", "compact") != "tqdm"
+            ),
         )
         with torch.random.fork_rng(devices=cuda_devices):
             torch.manual_seed(seed)
@@ -643,13 +684,35 @@ class Trainer:
             with (output_dir / "resolved_config.json").open("w", encoding="utf-8") as handle:
                 json.dump(self.config, handle, indent=2)
         validate_every = max(1, int(training.get("validate_every", 1)))
+        progress_mode = str(training.get("progress_mode", "compact")).lower()
+        if progress_mode not in ("compact", "tqdm", "quiet"):
+            raise ValueError(
+                "training.progress_mode must be compact, tqdm, or quiet"
+            )
+        progress_updates = max(
+            0,
+            int(training.get("progress_updates_per_epoch", 2)),
+        )
+        use_tqdm = progress_mode == "tqdm" and self.is_main
+        if self.start_epoch >= epochs:
+            if self.is_main:
+                checkpoint = latest_stage_checkpoint(output_dir, self.stage)
+                print(
+                    f"[{self.stage}] already complete: {self.start_epoch}/{epochs} "
+                    f"epochs; checkpoint={checkpoint}",
+                    flush=True,
+                )
+            return
+        stage_started = time.monotonic()
+        completed_epoch_durations: list[float] = []
         epoch_progress = tqdm(
             range(self.start_epoch, epochs),
             desc=f"{self.stage} epochs",
             unit="epoch",
-            disable=not self.is_main,
+            disable=not use_tqdm,
         )
         for epoch in epoch_progress:
+            epoch_started = time.monotonic()
             if isinstance(loader.sampler, DistributedSampler):
                 loader.sampler.set_epoch(epoch)
             metrics: defaultdict[str, float] = defaultdict(float)
@@ -667,7 +730,12 @@ class Trainer:
                 desc=f"{self.stage} train {epoch + 1}/{epochs}",
                 unit="batch",
                 leave=False,
-                disable=not self.is_main,
+                disable=not use_tqdm,
+            )
+            compact_interval = (
+                max(1, math.ceil(len(loader) / progress_updates))
+                if progress_mode == "compact" and progress_updates > 0
+                else None
             )
             for step, batch in enumerate(batch_progress):
                 group_start = (step // accumulation) * accumulation
@@ -799,11 +867,30 @@ class Trainer:
                     metrics[name] += float(value.detach())
                 metrics["total"] += float(generator_loss.detach())
                 completed = step + 1
-                batch_progress.set_postfix(
-                    loss=f"{float(generator_loss.detach()):.4f}",
-                    avg=f"{metrics['total'] / completed:.4f}",
-                    lr=f"{self.optimizer.param_groups[0]['lr']:.2e}",
-                )
+                if use_tqdm:
+                    batch_progress.set_postfix(
+                        loss=f"{float(generator_loss.detach()):.4f}",
+                        avg=f"{metrics['total'] / completed:.4f}",
+                        lr=f"{self.optimizer.param_groups[0]['lr']:.2e}",
+                    )
+                elif (
+                    self.is_main
+                    and compact_interval is not None
+                    and (
+                        completed % compact_interval == 0
+                        or completed == len(loader)
+                    )
+                ):
+                    elapsed = time.monotonic() - epoch_started
+                    batch_eta = elapsed / completed * (len(loader) - completed)
+                    print(
+                        f"[{self.stage}] epoch {epoch + 1}/{epochs} "
+                        f"batch {completed}/{len(loader)} "
+                        f"({completed / len(loader):.0%}) "
+                        f"loss={metrics['total'] / completed:.4f} "
+                        f"epoch_eta={self._duration(batch_eta)}",
+                        flush=True,
+                    )
             reduced_metrics = self._reduce_metrics(metrics)
             validation_metrics = {}
             if (
@@ -817,17 +904,18 @@ class Trainer:
                     key: value / denominator for key, value in reduced_metrics.items()
                 }
                 epoch_metrics.update(validation_metrics)
-                epoch_progress.set_postfix(
-                    train_loss=f"{epoch_metrics.get('total', float('nan')):.4f}",
-                    val_psnr=(
-                        f"{epoch_metrics['val_psnr']:.2f}"
-                        if "val_psnr" in epoch_metrics
-                        else "n/a"
-                    ),
-                )
-                print(f"epoch={epoch} stage={self.stage} metrics={epoch_metrics}", flush=True)
+                checkpoint_path = output_dir / f"{self.stage}_epoch_{epoch:04d}.pt"
+                if use_tqdm:
+                    epoch_progress.set_postfix(
+                        train_loss=f"{epoch_metrics.get('total', float('nan')):.4f}",
+                        val_psnr=(
+                            f"{epoch_metrics['val_psnr']:.2f}"
+                            if "val_psnr" in epoch_metrics
+                            else "n/a"
+                        ),
+                    )
                 save_checkpoint(
-                    output_dir / f"{self.stage}_epoch_{epoch:04d}.pt",
+                    checkpoint_path,
                     self.model,
                     self.optimizer,
                     epoch,
@@ -840,6 +928,7 @@ class Trainer:
                             self.wavelet_discriminator
                         ).state_dict(),
                         "discriminator_optimizer": self.discriminator_optimizer.state_dict(),
+                        "scaler": self.scaler.state_dict(),
                     },
                 )
                 append_training_history(
@@ -851,3 +940,26 @@ class Trainer:
                         self.config.get("debug", {}).get("panel_size", 320)
                     ),
                 )
+                epoch_duration = time.monotonic() - epoch_started
+                completed_epoch_durations.append(epoch_duration)
+                remaining_epochs = epochs - epoch - 1
+                stage_eta = (
+                    sum(completed_epoch_durations)
+                    / len(completed_epoch_durations)
+                    * remaining_epochs
+                )
+                if progress_mode == "compact":
+                    summary = (
+                        f"[{self.stage}] epoch {epoch + 1}/{epochs} complete "
+                        f"loss={epoch_metrics.get('total', float('nan')):.4f}"
+                    )
+                    if "val_psnr" in epoch_metrics:
+                        summary += (
+                            f" val_psnr={epoch_metrics['val_psnr']:.2f}"
+                            f" val_ssim={epoch_metrics['val_ssim']:.4f}"
+                        )
+                    summary += (
+                        f" elapsed={self._duration(time.monotonic() - stage_started)} "
+                        f"stage_eta={self._duration(stage_eta)}"
+                    )
+                    print(summary, flush=True)

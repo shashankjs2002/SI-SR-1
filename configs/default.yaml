@@ -66,6 +66,9 @@ training:
   amp: true
   gradient_checkpointing: true
   gradient_clip: 1.0
+  auto_resume: false
+  progress_mode: compact
+  progress_updates_per_epoch: 2
   validate_every: 1
   validation_limit: 64
   train_back_projection_steps: 1

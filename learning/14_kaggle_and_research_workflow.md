@@ -27,6 +27,10 @@ Dataset and evaluation controls are also independent:
 | `UNMATCHED_SAFE_SPLIT` | Split for all other SAFE products, normally `train` |
 | `VALIDATION_LIMIT` | Maximum validation batches per validated epoch |
 | `EVALUATION_LIMIT` | Maximum patches in each final validation/test report |
+| `AUTO_RESUME_TRAINING` | Continue the latest checkpoint in the current stage directory |
+| `TRAINING_PROGRESS_MODE` | `compact`, `tqdm`, or `quiet` logging |
+| `PROGRESS_UPDATES_PER_EPOCH` | Number of compact milestone lines per epoch |
+| `TRAINING_DIAGNOSTICS` | Enable expensive training-time tensor exports |
 
 Use XS only to verify execution. Medium preserves the research architecture at 21.13M core
 parameters and is the practical starting point for 16 GB GPUs. Large uses 81.86M core parameters
@@ -119,6 +123,15 @@ runs/edit/edit_epoch_....pt
 If the schedule changes, filenames change. Update `init_checkpoint` in the stage overlays instead of
 assuming the old path.
 
+The notebook enables same-stage automatic resume. For example, if
+`runs/base/base_epoch_0007.pt` is newest and `epochs: 20`, rerunning starts at epoch 9 in
+human-readable numbering and writes `base_epoch_0008.pt` next. Resume restores the model,
+optimizer, discriminators, discriminator optimizer, and AMP scaler. Checkpoints are atomic and
+resume occurs at epoch boundaries, not halfway through a dataloader epoch.
+
+Automatic discovery is intentionally stage-local. `init_checkpoint` transfers weights from the
+previous stage; `resume` continues optimization within the same stage.
+
 ## 6. Resource Planning
 
 Memory pressure roughly follows:
@@ -192,11 +205,16 @@ This prevents post-hoc interpretation.
 
 If a Kaggle session ends:
 
+- keep `AUTO_RESUME_TRAINING=True` and rerun the training cell;
 - use `resume` only within the same stage;
 - verify optimizer/scaler states were saved;
 - do not restart a later stage from an arbitrary "best-looking" output;
 - preserve logs and resolved configuration;
 - rerun diagnostics after resuming.
+
+`/kaggle/working` is not permanent across expired sessions. Create a notebook version or Kaggle
+Dataset containing `runs/`, then restore it to the same run directory before relying on automatic
+resume.
 
 If an input dataset path changes, update configuration explicitly and verify manifest identity.
 
