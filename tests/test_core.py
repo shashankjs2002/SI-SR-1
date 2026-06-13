@@ -11,6 +11,7 @@ import torch
 
 from geodiff_gan.config import load_config
 from geodiff_gan.cli.caption_qwen import _resolve_model_class
+from geodiff_gan.cli.evaluate import _resolve_device
 from geodiff_gan.data import SentinelPatchDataset
 from geodiff_gan.data.manifest import (
     ManifestRecord,
@@ -89,6 +90,44 @@ class CoreTests(unittest.TestCase):
         )
         self.assertTrue(edit.metadata[0]["synthetic_edit"])
         self.assertGreater(float(edit.edit_permission.detach().mean()), 0.0)
+
+    def test_sampling_reuses_cached_deterministic_features(self) -> None:
+        model = GeoDiffGAN.from_config(self.config).eval()
+        lr = torch.rand(1, 3, 16, 16)
+        context = HashTextEncoder(32, 8)([""])
+        degradation = torch.rand(1, 4)
+        with torch.no_grad():
+            base = model.base(lr)
+            lr_features = model.lr_encoder(lr)
+        with (
+            mock.patch.object(
+                model.base,
+                "forward",
+                wraps=model.base.forward,
+            ) as base_forward,
+            mock.patch.object(
+                model.lr_encoder,
+                "forward",
+                wraps=model.lr_encoder.forward,
+            ) as encoder_forward,
+        ):
+            output = model.sample(
+                lr,
+                context,
+                degradation=degradation,
+                sample_steps=1,
+                base=base,
+                lr_features=lr_features,
+            )
+        self.assertEqual(output.image.shape, base.shape)
+        base_forward.assert_not_called()
+        encoder_forward.assert_not_called()
+
+    def test_evaluation_device_resolution(self) -> None:
+        self.assertEqual(_resolve_device("cpu"), torch.device("cpu"))
+        if not torch.cuda.is_available():
+            with self.assertRaises(RuntimeError):
+                _resolve_device("cuda")
 
     def test_uncertainty_abstention_returns_to_base(self) -> None:
         model = GeoDiffGAN.from_config(self.config).eval()

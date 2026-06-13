@@ -106,9 +106,11 @@ def basic_metrics(
 
 
 class OptionalMetricSuite:
-    def __init__(self, device: torch.device) -> None:
+    def __init__(self, device: torch.device, enabled: bool = True) -> None:
         self.lpips_model = None
         self.dists_model = None
+        if not enabled:
+            return
         try:
             import lpips
 

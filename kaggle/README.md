@@ -42,12 +42,28 @@ VAL_SAFE_PREFIXES = ["CHHATARPUR2"]
 UNMATCHED_SAFE_SPLIT = "train"
 VALIDATE_EVERY = 1
 VALIDATION_LIMIT = 4 if FAST_DEV_RUN else 64
-EVALUATION_LIMIT = 4 if FAST_DEV_RUN else 100
 AUTO_RESUME_TRAINING = True
 TRAINING_PROGRESS_MODE = "compact"
 PROGRESS_UPDATES_PER_EPOCH = 2
 TRAINING_DIAGNOSTICS = False
 ```
+
+Evaluation uses named cost profiles:
+
+```python
+EVALUATION_PROFILE = "dev" if FAST_DEV_RUN else "quick"
+# dev: 4 patches x 2 samples x 2 steps
+# quick: 10 patches x 2 samples x 10 steps
+# full: 100 patches x 8 samples x 20 steps
+EVALUATION_USE_TEXT = False
+EVALUATION_OPTIONAL_METRICS = False
+EVALUATION_DEVICE = "cuda"
+```
+
+The full profile performs 16,000 diffusion U-Net passes per split and can take hours. Compact
+progress reports startup phases, device selection, every stochastic sample, patch metrics, elapsed
+time, and ETA. Text-free evaluation avoids loading SigLIP. LPIPS/DISTS are opt-in because their
+first initialization may download external weights before patch progress begins.
 
 `compact` emits only milestone updates and one summary per epoch. Use `tqdm` for live notebook
 bars or `quiet` for minimal logs. Training diagnostics are disabled by default because per-batch

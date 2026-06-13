@@ -27,6 +27,9 @@ Dataset and evaluation controls are also independent:
 | `UNMATCHED_SAFE_SPLIT` | Split for all other SAFE products, normally `train` |
 | `VALIDATION_LIMIT` | Maximum validation batches per validated epoch |
 | `EVALUATION_LIMIT` | Maximum patches in each final validation/test report |
+| `EVALUATION_PROFILE` | `dev`, `quick`, or `full` stochastic evaluation cost |
+| `EVALUATION_USE_TEXT` | Load SigLIP and use captions during evaluation |
+| `EVALUATION_OPTIONAL_METRICS` | Load LPIPS/DISTS and external weights |
 | `AUTO_RESUME_TRAINING` | Continue the latest checkpoint in the current stage directory |
 | `TRAINING_PROGRESS_MODE` | `compact`, `tqdm`, or `quiet` logging |
 | `PROGRESS_UPDATES_PER_EPOCH` | Number of compact milestone lines per epoch |
@@ -86,6 +89,18 @@ session.
 - research metrics and ablations.
 
 Architecture capacity is selected separately by `MODEL_SIZE`.
+
+Evaluation cost is approximately:
+
+\[
+N_{\text{patches}}\times N_{\text{samples}}\times N_{\text{diffusion steps}}.
+\]
+
+The full profile is \(100\times8\times20=16{,}000\) diffusion U-Net passes per split. Use `quick`
+while checking checkpoints and reserve `full` for final held-out reporting. The evaluator prints
+its selected CUDA device before model loading and reports sample/patch ETA. If text is disabled, it
+uses zero context without loading SigLIP. LPIPS and DISTS are opt-in because initialization may
+download weights and otherwise appears as a long zero-GPU pause.
 
 ```mermaid
 flowchart LR

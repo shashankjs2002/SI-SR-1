@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from collections import defaultdict
 from itertools import islice
 from pathlib import Path
@@ -16,6 +17,7 @@ from ..data import SentinelPatchDataset
 from ..metrics import OptionalMetricSuite, basic_metrics
 from ..models.system import GeoDiffGAN
 from ..training.checkpoint import load_checkpoint
+from .evaluate import _device_summary, _duration, _resolve_device
 
 
 def main() -> None:
@@ -25,10 +27,26 @@ def main() -> None:
     parser.add_argument("--base-checkpoint")
     parser.add_argument("--split", default="test")
     parser.add_argument("--limit", type=int)
+    parser.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto")
+    parser.add_argument(
+        "--progress",
+        choices=("compact", "tqdm", "quiet"),
+        default="compact",
+    )
+    parser.add_argument("--optional-metrics", action="store_true")
     args = parser.parse_args()
 
     config = load_config(args.config)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = _resolve_device(args.device)
+    amp_enabled = bool(
+        device.type == "cuda"
+        and config.get("training", {}).get("amp", True)
+    )
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+    print(f"[baselines] device={_device_summary(device)}", flush=True)
+    print(f"[baselines] amp={amp_enabled}", flush=True)
+    print(f"[baselines] loading {args.split} dataset", flush=True)
     dataset = SentinelPatchDataset(
         config["data"]["manifest"],
         split=args.split,
@@ -46,22 +64,34 @@ def main() -> None:
     loader = DataLoader(dataset, batch_size=1, shuffle=False)
     model = None
     if args.base_checkpoint:
+        print(f"[baselines] loading checkpoint {args.base_checkpoint}", flush=True)
         model = GeoDiffGAN.from_config(config).to(device).eval()
         load_checkpoint(args.base_checkpoint, model, strict=False)
-    optional_metrics = OptionalMetricSuite(device)
+    if args.optional_metrics:
+        print(
+            "[baselines] loading LPIPS/DISTS; first use may download weights",
+            flush=True,
+        )
+    else:
+        print("[baselines] LPIPS/DISTS disabled", flush=True)
+    optional_metrics = OptionalMetricSuite(device, enabled=args.optional_metrics)
     totals: dict[str, defaultdict[str, float]] = {
         "bicubic": defaultdict(float),
         "base": defaultdict(float),
     }
     count = 0
     total = min(len(loader), args.limit) if args.limit is not None else len(loader)
+    print(f"[baselines] plan patches={total}", flush=True)
+    use_tqdm = args.progress == "tqdm"
     progress = tqdm(
         islice(loader, total),
         total=total,
         desc=f"baselines {args.split}",
         unit="patch",
+        disable=not use_tqdm,
     )
 
+    started = time.monotonic()
     with torch.no_grad():
         for batch in progress:
             lr = batch["lr"].to(device)
@@ -74,7 +104,12 @@ def main() -> None:
                 ).clamp(0, 1)
             }
             if model is not None:
-                predictions["base"] = model.base(lr)
+                with torch.autocast(
+                    device_type=device.type,
+                    dtype=torch.float16,
+                    enabled=amp_enabled,
+                ):
+                    predictions["base"] = model.base(lr).float()
             for name, prediction in predictions.items():
                 values = basic_metrics(
                     prediction,
@@ -101,6 +136,15 @@ def main() -> None:
                     else "n/a"
                 ),
             )
+            if args.progress == "compact":
+                elapsed = time.monotonic() - started
+                remaining = elapsed / count * (total - count)
+                print(
+                    f"[baselines] patch {count}/{total} "
+                    f"bicubic_psnr={totals['bicubic']['psnr'] / count:.2f} "
+                    f"elapsed={_duration(elapsed)} eta={_duration(remaining)}",
+                    flush=True,
+                )
 
     summary = {
         name: {metric: value / max(count, 1) for metric, value in metrics.items()}
@@ -108,11 +152,15 @@ def main() -> None:
         if metrics
     }
     summary["count"] = count
+    summary["device"] = str(device)
+    summary["amp"] = amp_enabled
+    summary["optional_metrics"] = args.optional_metrics
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2)
-    print(summary)
+    print(f"[baselines] complete in {_duration(time.monotonic() - started)}", flush=True)
+    print(summary, flush=True)
 
 
 if __name__ == "__main__":

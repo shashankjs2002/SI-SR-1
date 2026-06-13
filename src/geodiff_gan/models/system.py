@@ -248,12 +248,13 @@ class GeoDiffGAN(nn.Module):
         diagnostics: DiagnosticRecorder | None = None,
         projection_lr: torch.Tensor | None = None,
         conditioning_prepared: bool = False,
+        lr_features: list[torch.Tensor] | None = None,
     ) -> GeoDiffOutput:
         base = self.base(lr) if base is None else base
         consistency_lr = lr if projection_lr is None else projection_lr
         if not conditioning_prepared:
             context, degradation = self.apply_ablation_inputs(context, degradation)
-        lr_features = self.lr_encoder(lr)
+        lr_features = self.lr_encoder(lr) if lr_features is None else lr_features
         if diagnostics is not None:
             diagnostics.capture("input.lr", lr, visual="rgb")
             diagnostics.capture("conditioning.text", context)
@@ -481,6 +482,8 @@ class GeoDiffGAN(nn.Module):
         diagnostics: DiagnosticRecorder | None = None,
         diffusion_debug_interval: int = 0,
         projection_lr: torch.Tensor | None = None,
+        base: torch.Tensor | None = None,
+        lr_features: list[torch.Tensor] | None = None,
     ) -> GeoDiffOutput:
         degradation = (
             default_degradation(lr.shape[0], lr.device, lr.dtype)
@@ -490,8 +493,8 @@ class GeoDiffGAN(nn.Module):
         context, degradation = self.apply_ablation_inputs(context, degradation)
         if null_context is not None and not self.use_text_conditioning:
             null_context = torch.zeros_like(null_context)
-        base = self.base(lr)
-        lr_features = self.lr_encoder(lr)
+        base = self.base(lr) if base is None else base
+        lr_features = self.lr_encoder(lr) if lr_features is None else lr_features
         latent_height = base.shape[-2] // self.vae.downsample_factor
         latent_width = base.shape[-1] // self.vae.downsample_factor
         mode_values = self.mode_tensor(mode, lr.shape[0], lr.device)
@@ -519,4 +522,5 @@ class GeoDiffGAN(nn.Module):
             projection_lr=projection_lr,
             diagnostics=diagnostics,
             conditioning_prepared=True,
+            lr_features=lr_features,
         )
