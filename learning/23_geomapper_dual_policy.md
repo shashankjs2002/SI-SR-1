@@ -224,6 +224,10 @@ C^*(x,y)\approx\exp(-e(x,y)/\tau).
 The evidence loss trains \(C\) to represent local reliability rather than merely shrinking all
 residuals.
 
+The `small_12tile_improved` experiment adds a centered cosine-correlation term between predicted
+confidence and the local accuracy target. This explicitly supervises spatial ranking and
+discourages the nearly uniform low-confidence shortcut observed in the six-tile run.
+
 ## Evidence Versus Uncertainty
 
 Evidence confidence is predicted from one forward pass. Stochastic uncertainty is estimated from

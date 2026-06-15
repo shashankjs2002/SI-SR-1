@@ -15,6 +15,7 @@ model:
   mapper_channels: 128
   style_dim: 256
   decoder_channels: [128, 96, 64, 48]
+  decoder_upsample_mode: pixelshuffle
   diffusion_steps: 1000
   use_text_conditioning: true
   use_degradation_conditioning: true
@@ -71,8 +72,15 @@ training:
   progress_updates_per_epoch: 2
   validate_every: 1
   validation_limit: 64
+  keep_best_and_latest: true
+  checkpoint_metric: val_l1
+  checkpoint_mode: min
+  early_stopping_patience: 0
+  early_stopping_min_epochs: 0
+  early_stopping_min_delta: 0.0
   train_back_projection_steps: 1
   evidence_calibration_temperature: 0.05
+  evidence_selectivity_weight: 0.0
   counterfactual_edit_coverage: 0.15
   discriminator_channels: 64
   output_dir: runs/base

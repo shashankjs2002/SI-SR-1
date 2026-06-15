@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +27,36 @@ def latest_stage_checkpoint(
     if not candidates:
         return None
     return max(candidates, key=lambda item: item[0])[1]
+
+
+def best_stage_checkpoint(
+    output_dir: str | Path,
+    stage: str,
+) -> Path | None:
+    path = Path(output_dir) / f"{stage}_best.pt"
+    return path if path.exists() else None
+
+
+def copy_checkpoint(source: str | Path, destination: str | Path) -> None:
+    source_path = Path(source)
+    destination_path = Path(destination)
+    destination_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination_path.with_suffix(destination_path.suffix + ".tmp")
+    shutil.copy2(source_path, temporary)
+    temporary.replace(destination_path)
+
+
+def prune_stage_epoch_checkpoints(
+    output_dir: str | Path,
+    stage: str,
+    keep: str | Path,
+) -> None:
+    directory = Path(output_dir)
+    keep_path = Path(keep).resolve()
+    pattern = re.compile(rf"^{re.escape(stage)}_epoch_(\d+)\.pt$")
+    for path in directory.glob(f"{stage}_epoch_*.pt"):
+        if pattern.match(path.name) and path.resolve() != keep_path:
+            path.unlink()
 
 
 def save_checkpoint(

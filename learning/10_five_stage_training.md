@@ -353,6 +353,15 @@ These values are stored in the checkpoint metadata, `latest_metrics.json`,
 `training_history.jsonl`, and `training_curves.png`. A one-epoch run contains only one point, so it
 cannot display a trend; the chart explicitly labels it as a single-epoch summary.
 
+By default, each stage retains only:
+
+- `<stage>_best.pt`, selected by minimum validation L1;
+- `<stage>_epoch_XXXX.pt`, the latest checkpoint used for interruption recovery.
+
+Older epoch checkpoints are pruned after the newest checkpoint is written successfully. Metric
+history and training curves are retained for every epoch. If a stage has no validation split, the
+best checkpoint falls back to minimum training total loss.
+
 These per-epoch values use the stage's training forward path without prompt augmentation. They are
 fast model-selection proxies, not the final stochastic DDIM benchmark. Run `geodiff-evaluate` on
 the complete validation and test splits for the final report.

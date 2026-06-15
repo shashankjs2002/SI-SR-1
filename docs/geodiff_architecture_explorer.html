@@ -1,0 +1,1036 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>GeoDiff-GAN Architecture Explorer</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            ink: "#172033",
+            paper: "#f4f7fb",
+            navy: "#10233f",
+            cyan: "#0aa6a6",
+            amber: "#f4a340",
+            violet: "#6d5ce8",
+            rose: "#e85c7a",
+            moss: "#4f8a66"
+          },
+          boxShadow: {
+            card: "0 14px 40px rgba(16,35,63,.10)",
+            lift: "0 18px 54px rgba(16,35,63,.18)"
+          }
+        }
+      }
+    }
+  </script>
+  <style>
+    :root {
+      --ink: #172033;
+      --muted: #66758d;
+      --line: #9aabc2;
+      --active: #0aa6a6;
+      --train: #e85c7a;
+      --frozen: #f4a340;
+      --inactive: #cbd5e1;
+      --canvas-scale: 1;
+    }
+    * { box-sizing: border-box; }
+    body {
+      background:
+        radial-gradient(circle at 9% 0%, rgba(10,166,166,.08), transparent 28rem),
+        radial-gradient(circle at 95% 10%, rgba(109,92,232,.08), transparent 32rem),
+        #f4f7fb;
+      color: var(--ink);
+    }
+    .dot-grid {
+      background-image: radial-gradient(#cbd5e1 1px, transparent 1px);
+      background-size: 22px 22px;
+    }
+    .control {
+      border: 1px solid #d8e0eb;
+      background: rgba(255,255,255,.86);
+      transition: border-color .2s, box-shadow .2s, background .2s;
+    }
+    .control:focus {
+      outline: none;
+      border-color: #0aa6a6;
+      box-shadow: 0 0 0 3px rgba(10,166,166,.12);
+    }
+    .seg-btn {
+      color: #64748b;
+      transition: all .18s ease;
+    }
+    .seg-btn.active {
+      color: #fff;
+      background: #10233f;
+      box-shadow: 0 5px 15px rgba(16,35,63,.18);
+    }
+    #architectureInner {
+      position: relative;
+      width: 1880px;
+      height: 900px;
+      transform-origin: top left;
+      transform: scale(var(--canvas-scale));
+    }
+    .arch-node {
+      position: absolute;
+      width: 176px;
+      min-height: 102px;
+      padding: 13px 14px;
+      border: 1px solid #d7e0eb;
+      border-top: 4px solid var(--node-color, #64748b);
+      border-radius: 15px;
+      background: rgba(255,255,255,.97);
+      box-shadow: 0 9px 24px rgba(16,35,63,.08);
+      cursor: pointer;
+      text-align: left;
+      transition: transform .18s ease, box-shadow .18s ease, opacity .18s ease, filter .18s ease;
+      z-index: 3;
+    }
+    .arch-node:hover, .arch-node:focus-visible {
+      transform: translateY(-4px);
+      box-shadow: 0 16px 34px rgba(16,35,63,.16);
+      outline: none;
+    }
+    .arch-node.active-path {
+      border-color: color-mix(in srgb, var(--node-color) 60%, white);
+      box-shadow: 0 0 0 3px color-mix(in srgb, var(--node-color) 15%, transparent),
+                  0 15px 32px rgba(16,35,63,.13);
+    }
+    .arch-node.inactive {
+      opacity: .31;
+      filter: grayscale(.7);
+    }
+    .arch-node.trainable::after,
+    .arch-node.frozen::after,
+    .arch-node.training-only::after {
+      position: absolute;
+      right: 10px;
+      top: 9px;
+      border-radius: 999px;
+      padding: 2px 7px;
+      font-size: 8px;
+      font-weight: 800;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+    }
+    .arch-node.trainable::after { content: "train"; background: #ffe5eb; color: #b93656; }
+    .arch-node.frozen::after { content: "frozen"; background: #fff1db; color: #a46010; }
+    .arch-node.training-only::after { content: "train only"; background: #eeeaff; color: #5948c7; }
+    .arch-node .node-kicker {
+      color: var(--node-color);
+      font-size: 9px;
+      font-weight: 800;
+      letter-spacing: .12em;
+      text-transform: uppercase;
+    }
+    .arch-node .node-title {
+      margin-top: 5px;
+      padding-right: 22px;
+      color: #172033;
+      font-size: 14px;
+      font-weight: 800;
+      line-height: 1.12;
+    }
+    .arch-node .node-shape {
+      display: inline-block;
+      margin-top: 8px;
+      border-radius: 7px;
+      background: #f2f5f9;
+      padding: 4px 7px;
+      color: #42526a;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 9px;
+      font-weight: 700;
+    }
+    .arch-node .node-note {
+      margin-top: 7px;
+      color: #718096;
+      font-size: 9px;
+      line-height: 1.25;
+    }
+    .lane-label {
+      position: absolute;
+      left: 18px;
+      z-index: 1;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: #6b7b91;
+      font-size: 10px;
+      font-weight: 800;
+      letter-spacing: .14em;
+      text-transform: uppercase;
+    }
+    .lane-label::after {
+      content: "";
+      width: 1630px;
+      height: 1px;
+      background: linear-gradient(90deg, #d4deea, transparent);
+    }
+    .edge {
+      fill: none;
+      stroke: var(--edge-color, #9aabc2);
+      stroke-width: 2.2;
+      marker-end: url(#arrow);
+      transition: opacity .2s, stroke .2s;
+    }
+    .edge.condition { stroke-dasharray: 7 5; }
+    .edge.skip { stroke-dasharray: 3 5; stroke-width: 2; }
+    .edge.feedback { stroke-dasharray: 9 5; stroke-width: 2.5; }
+    .edge.inactive { opacity: .1; }
+    .edge.active { stroke-width: 3; filter: drop-shadow(0 2px 2px rgba(16,35,63,.12)); }
+    .edge-label {
+      font-size: 9px;
+      font-weight: 750;
+      fill: #526278;
+      paint-order: stroke;
+      stroke: #f9fbfd;
+      stroke-width: 5px;
+      stroke-linejoin: round;
+    }
+    .edge-label.inactive { opacity: .12; }
+    .flow-chip {
+      border: 1px solid #dce4ee;
+      background: #fff;
+      transition: all .2s;
+    }
+    .flow-chip.current {
+      border-color: #0aa6a6;
+      background: #e8fbfa;
+      color: #087777;
+      transform: translateY(-2px);
+    }
+    .module-table td, .module-table th {
+      border-bottom: 1px solid #e6ebf2;
+      padding: 9px 8px;
+      vertical-align: top;
+    }
+    .module-table th {
+      color: #6b7b91;
+      font-size: 10px;
+      letter-spacing: .08em;
+      text-align: left;
+      text-transform: uppercase;
+    }
+    .drawer-open #drawerBackdrop { opacity: 1; pointer-events: auto; }
+    .drawer-open #drawer { transform: translateX(0); }
+    @media (max-width: 768px) {
+      #architectureInner { transform: scale(.72); }
+      #architectureViewport { height: 680px; }
+    }
+    @media print {
+      header, #controls, #flowStrip, #drawer, #drawerBackdrop { display: none !important; }
+      body { background: white; }
+      #architectureViewport { overflow: visible; border: none; }
+      #architectureInner { transform: scale(.58); transform-origin: top left; }
+    }
+  </style>
+</head>
+<body class="min-h-screen font-sans antialiased">
+  <header class="border-b border-slate-200/80 bg-white/80 backdrop-blur-xl">
+    <div class="mx-auto flex max-w-[1680px] items-start justify-between gap-8 px-6 py-6 lg:px-10">
+      <div>
+        <div class="mb-2 flex items-center gap-3">
+          <span class="rounded-full bg-cyan/10 px-3 py-1 text-[10px] font-extrabold uppercase tracking-[.18em] text-cyan">Interactive model map</span>
+          <span class="text-xs font-semibold text-slate-400">GeoDiff-GAN · 4× Sentinel-2 SR</span>
+        </div>
+        <h1 class="text-3xl font-black tracking-tight text-navy lg:text-4xl">Architecture Explorer</h1>
+        <p class="mt-2 max-w-3xl text-sm leading-6 text-slate-500">
+          Trace the exact tensor path, inspect every layer, and compare training stages with SR and synthetic edit inference.
+          Click any module to open its implementation-level detail.
+        </p>
+      </div>
+      <div class="hidden shrink-0 items-center gap-3 rounded-2xl border border-slate-200 bg-white px-4 py-3 shadow-card xl:flex">
+        <div class="flex h-10 w-10 items-center justify-center rounded-xl bg-navy text-sm font-black text-white">4×</div>
+        <div>
+          <div class="text-xs font-extrabold text-navy">128² LR → 512² HR</div>
+          <div class="mt-1 text-[10px] text-slate-400">Satellite RGB · residual latent diffusion</div>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <main class="mx-auto max-w-[1680px] px-4 py-5 lg:px-8">
+    <section id="controls" class="rounded-3xl border border-slate-200 bg-white/90 p-4 shadow-card backdrop-blur">
+      <div class="grid gap-4 xl:grid-cols-[1.2fr_1.45fr_1.2fr_1fr_auto]">
+        <div>
+          <label class="mb-2 block text-[10px] font-extrabold uppercase tracking-[.14em] text-slate-400">Execution</label>
+          <div class="flex rounded-xl bg-slate-100 p-1" data-segment="execution">
+            <button class="seg-btn active flex-1 rounded-lg px-3 py-2 text-xs font-bold" data-value="training">Training</button>
+            <button class="seg-btn flex-1 rounded-lg px-3 py-2 text-xs font-bold" data-value="inference">Inference</button>
+          </div>
+        </div>
+        <div id="stageControl">
+          <label class="mb-2 block text-[10px] font-extrabold uppercase tracking-[.14em] text-slate-400">Training phase</label>
+          <select id="stageSelect" class="control w-full rounded-xl px-3 py-2.5 text-xs font-bold text-navy">
+            <option value="base">1 · Conservative SwinIR base</option>
+            <option value="vae">2 · Residual VAE + mapper/decoder</option>
+            <option value="diffusion">3 · Conditional latent diffusion</option>
+            <option value="joint" selected>4 · Joint generator + GAN</option>
+            <option value="edit">5 · Prompt edit adapters + GAN</option>
+          </select>
+        </div>
+        <div id="modeControl">
+          <label class="mb-2 block text-[10px] font-extrabold uppercase tracking-[.14em] text-slate-400">Output policy</label>
+          <div class="flex rounded-xl bg-slate-100 p-1" data-segment="mode">
+            <button class="seg-btn active flex-1 rounded-lg px-3 py-2 text-xs font-bold" data-value="sr">Evidence SR</button>
+            <button class="seg-btn flex-1 rounded-lg px-3 py-2 text-xs font-bold" data-value="edit">Synthetic edit</button>
+          </div>
+        </div>
+        <div>
+          <label class="mb-2 block text-[10px] font-extrabold uppercase tracking-[.14em] text-slate-400">Prompt path</label>
+          <select id="promptSelect" class="control w-full rounded-xl px-3 py-2.5 text-xs font-bold text-navy">
+            <option value="guided">Prompt + CFG null branch</option>
+            <option value="prompt">Prompt only</option>
+            <option value="null">Null / empty prompt</option>
+            <option value="disabled">Text conditioning ablated</option>
+          </select>
+        </div>
+        <div>
+          <label class="mb-2 block text-[10px] font-extrabold uppercase tracking-[.14em] text-slate-400">Model size</label>
+          <select id="presetSelect" class="control rounded-xl px-3 py-2.5 text-xs font-bold text-navy">
+            <option value="large">Large</option>
+            <option value="medium">Medium</option>
+            <option value="xs">XS smoke</option>
+          </select>
+        </div>
+      </div>
+      <div class="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-slate-100 pt-4">
+        <div class="flex flex-wrap items-center gap-2">
+          <button id="showDims" class="rounded-full bg-navy px-3 py-1.5 text-[10px] font-extrabold text-white">Dimensions on</button>
+          <button id="showSkips" class="rounded-full border border-slate-200 bg-white px-3 py-1.5 text-[10px] font-extrabold text-slate-600">Skips on</button>
+          <button id="showInactive" class="rounded-full border border-slate-200 bg-white px-3 py-1.5 text-[10px] font-extrabold text-slate-600">Inactive visible</button>
+        </div>
+        <div class="flex flex-wrap items-center gap-4 text-[10px] font-bold text-slate-500">
+          <span class="flex items-center gap-1.5"><i class="h-2.5 w-2.5 rounded-full bg-rose"></i> trainable</span>
+          <span class="flex items-center gap-1.5"><i class="h-2.5 w-2.5 rounded-full bg-amber"></i> frozen</span>
+          <span class="flex items-center gap-1.5"><i class="h-0.5 w-5 bg-cyan"></i> data</span>
+          <span class="flex items-center gap-1.5"><i class="h-0.5 w-5 border-t-2 border-dashed border-violet"></i> condition / feedback</span>
+        </div>
+        <div class="flex items-center gap-2">
+          <button id="zoomOut" class="h-8 w-8 rounded-lg border border-slate-200 bg-white text-lg font-bold text-slate-500">−</button>
+          <span id="zoomLabel" class="w-10 text-center text-[10px] font-extrabold text-slate-500">100%</span>
+          <button id="zoomIn" class="h-8 w-8 rounded-lg border border-slate-200 bg-white text-lg font-bold text-slate-500">+</button>
+          <button onclick="window.print()" class="ml-2 rounded-lg border border-slate-200 bg-white px-3 py-2 text-[10px] font-extrabold text-slate-600">Print map</button>
+        </div>
+      </div>
+    </section>
+
+    <section id="flowStrip" class="mt-4 rounded-2xl border border-slate-200 bg-white p-3 shadow-card">
+      <div class="flex items-center gap-3 overflow-x-auto pb-1" id="flowSteps"></div>
+    </section>
+
+    <section class="mt-4 overflow-hidden rounded-3xl border border-slate-200 bg-white shadow-card">
+      <div class="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 bg-slate-50/80 px-5 py-3">
+        <div>
+          <div id="scenarioTitle" class="text-sm font-black text-navy"></div>
+          <div id="scenarioSubtitle" class="mt-0.5 text-[10px] font-semibold text-slate-500"></div>
+        </div>
+        <div id="scenarioBadges" class="flex flex-wrap gap-2"></div>
+      </div>
+      <div id="architectureViewport" class="dot-grid relative h-[720px] overflow-auto bg-[#f9fbfd]">
+        <div id="architectureInner">
+          <div class="lane-label" style="top: 34px">conditioning</div>
+          <div class="lane-label" style="top: 196px">generator · forward path</div>
+          <div class="lane-label" style="top: 498px">multi-scale evidence</div>
+          <div class="lane-label" style="top: 690px">training supervision</div>
+          <svg id="edges" class="pointer-events-none absolute inset-0 z-[2] h-full w-full" viewBox="0 0 1880 900" preserveAspectRatio="none">
+            <defs>
+              <marker id="arrow" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                <path d="M 0 0 L 10 5 L 0 10 z" fill="context-stroke"></path>
+              </marker>
+              <marker id="arrowFeedback" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                <path d="M 0 0 L 10 5 L 0 10 z" fill="#6d5ce8"></path>
+              </marker>
+            </defs>
+            <g id="edgeLayer"></g>
+          </svg>
+          <div id="nodeLayer"></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="mt-4 grid gap-4 lg:grid-cols-3">
+      <article class="rounded-2xl border border-slate-200 bg-white p-5 shadow-card">
+        <div class="text-[10px] font-extrabold uppercase tracking-[.14em] text-cyan">Current scenario</div>
+        <h2 id="summaryHeading" class="mt-2 text-lg font-black text-navy"></h2>
+        <p id="summaryText" class="mt-2 text-xs leading-5 text-slate-500"></p>
+      </article>
+      <article class="rounded-2xl border border-slate-200 bg-white p-5 shadow-card">
+        <div class="text-[10px] font-extrabold uppercase tracking-[.14em] text-violet">Spatial conservation</div>
+        <h2 class="mt-2 text-lg font-black text-navy">Where LR evidence is enforced</h2>
+        <p class="mt-2 text-xs leading-5 text-slate-500">
+          The deterministic base anchors low frequencies. Aligned <b>f64</b> conditions the latent;
+          decoder skips restore observed geometry; evidence confidence gates detail; sensor back-projection
+          forces the final HR image to re-degrade toward the measured LR.
+        </p>
+      </article>
+      <article class="rounded-2xl border border-slate-200 bg-white p-5 shadow-card">
+        <div class="text-[10px] font-extrabold uppercase tracking-[.14em] text-rose">GAN placement</div>
+        <h2 class="mt-2 text-lg font-black text-navy">A training signal, not an inference block</h2>
+        <p class="mt-2 text-xs leading-5 text-slate-500">
+          Patch and Haar-wavelet discriminators score real HR and generated HR during joint/edit phases.
+          Their hinge loss updates the residual generator. Both discriminators disappear at inference.
+        </p>
+      </article>
+    </section>
+  </main>
+
+  <div id="drawerBackdrop" class="fixed inset-0 z-40 bg-navy/30 opacity-0 backdrop-blur-sm transition-opacity duration-200 pointer-events-none"></div>
+  <aside id="drawer" class="fixed inset-y-0 right-0 z-50 w-full max-w-[520px] translate-x-full overflow-y-auto border-l border-slate-200 bg-white shadow-lift transition-transform duration-300">
+    <div class="sticky top-0 z-10 flex items-start justify-between border-b border-slate-200 bg-white/95 px-6 py-5 backdrop-blur">
+      <div>
+        <div id="drawerKicker" class="text-[10px] font-extrabold uppercase tracking-[.15em] text-cyan"></div>
+        <h2 id="drawerTitle" class="mt-1 text-2xl font-black text-navy"></h2>
+      </div>
+      <button id="drawerClose" class="flex h-9 w-9 items-center justify-center rounded-xl bg-slate-100 text-xl font-medium text-slate-500">×</button>
+    </div>
+    <div class="space-y-6 p-6">
+      <div id="drawerStatus"></div>
+      <p id="drawerDescription" class="text-sm leading-6 text-slate-600"></p>
+      <div>
+        <h3 class="mb-3 text-[10px] font-extrabold uppercase tracking-[.14em] text-slate-400">Tensor interface</h3>
+        <div id="drawerIO" class="grid grid-cols-2 gap-3"></div>
+      </div>
+      <div>
+        <h3 class="mb-3 text-[10px] font-extrabold uppercase tracking-[.14em] text-slate-400">Internal layers</h3>
+        <div class="overflow-hidden rounded-xl border border-slate-200">
+          <table class="module-table w-full text-xs">
+            <thead><tr><th>Layer / operation</th><th>Output</th></tr></thead>
+            <tbody id="drawerLayers"></tbody>
+          </table>
+        </div>
+      </div>
+      <div>
+        <h3 class="mb-3 text-[10px] font-extrabold uppercase tracking-[.14em] text-slate-400">Why it exists</h3>
+        <div id="drawerRoles" class="space-y-2"></div>
+      </div>
+      <div>
+        <h3 class="mb-3 text-[10px] font-extrabold uppercase tracking-[.14em] text-slate-400">Connections in this scenario</h3>
+        <div id="drawerConnections" class="space-y-2"></div>
+      </div>
+    </div>
+  </aside>
+
+  <script>
+    const presets = {
+      large: {
+        label: "Large / paper model", base: 60, baseDepth: 6, heads: 6, window: 8,
+        vae: 64, lr: 64, widths: [128,256,384,512], context: 768,
+        mapper: 128, style: 256, decoder: [128,96,64,48], steps: 1000, tokens: 64, disc: 64
+      },
+      medium: {
+        label: "Medium / practical model", base: 40, baseDepth: 4, heads: 5, window: 8,
+        vae: 32, lr: 32, widths: [64,128,192,256], context: 768,
+        mapper: 64, style: 128, decoder: [64,48,32,24], steps: 1000, tokens: 64, disc: 32
+      },
+      xs: {
+        label: "XS / smoke-test model", base: 16, baseDepth: 2, heads: 4, window: 4,
+        vae: 8, lr: 8, widths: [16,32,48], context: 32,
+        mapper: 16, style: 16, decoder: [16,12,8,8], steps: 20, tokens: 8, disc: 8
+      }
+    };
+
+    const state = {
+      execution: "training", stage: "joint", mode: "sr", prompt: "guided",
+      preset: "large", dims: true, skips: true, inactive: true, zoom: 1
+    };
+
+    const colors = {
+      input: "#52708f", base: "#4f8a66", feature: "#0aa6a6", latent: "#6d5ce8",
+      mapping: "#2f79b9", output: "#e85c7a", policy: "#f4a340", supervision: "#8b5e83",
+      inactive: "#94a3b8"
+    };
+
+    const pos = {
+      prompt: [70,70], degradation: [292,70], mode: [514,70], noise: [736,70],
+      lr: [68,252], base: [292,252], diffusion: [736,252], mapper: [958,252],
+      decoder: [1180,252], compose: [1402,252], backproject: [1624,252],
+      lrEncoder: [292,515], f128: [514,515], f64: [736,515], f32: [958,515], f16: [1180,515],
+      hr: [68,716], targetResidual: [292,716], vae: [514,716],
+      discriminator: [1180,716], losses: [1402,716], output: [1624,515]
+    };
+
+    function shape(c, h, w) { return `B × ${c} × ${h} × ${w}`; }
+    function vector(c) { return `B × ${c}`; }
+    function tokens(p) { return `B × T≤${p.tokens} × ${p.context}`; }
+
+    function moduleData(p) {
+      const W = p.widths;
+      const diffLevels = W.map((w,i) => `${w} × ${64/(2**i)}²`).join(" → ");
+      return {
+        lr: {
+          kicker:"Observed input", title:"40 m LR RGB", color:colors.input, shape:shape(3,128,128),
+          note:"Measured evidence",
+          description:"The synthetic 40 m observation. Every stochastic path remains conditioned on this tensor, and final sensor back-projection checks consistency against it.",
+          input:"Sentinel-2 HR degraded by recorded PSF/MTF, area downsampling, noise and quantization",
+          output:shape(3,128,128),
+          layers:[["Surface reflectance","RGB in [0,1]"],["Patch tensor",shape(3,128,128)]],
+          roles:["Primary spatial and radiometric evidence","Condition for base, LR encoder, discriminator and back-projection"]
+        },
+        prompt: {
+          kicker:"Optional condition", title:"Text encoder", color:colors.latent, shape:tokens(p),
+          note:"Frozen SigLIP / hash in XS",
+          description:"Captions are encoded once by a frozen text encoder. Cross-attention uses token embeddings; GeoMapper uses their token mean. Null prompts retain the same shape.",
+          input:"Prompt strings or empty strings", output:tokens(p),
+          layers:[["Tokenizer",`T ≤ ${p.tokens} tokens`],["Frozen text encoder",tokens(p)],["Null context","same shape"]],
+          roles:["Adds semantic context to diffusion","Controls GeoMapper styles and edit permission","Never changes spatial size directly"]
+        },
+        degradation: {
+          kicker:"Physical condition", title:"Degradation vector", color:colors.policy, shape:vector(4),
+          note:"PSF · noise · quantization · compression",
+          description:"Recorded degradation parameters condition every diffusion residual block and define the forward sensor model used for consistency and back-projection.",
+          input:"Four normalized degradation parameters", output:vector(4),
+          layers:[["Linear",vector(p.widths[0]*4)],["SiLU + Linear",vector(p.widths[0]*4)]],
+          roles:["Tells diffusion how the LR was formed","Parameterizes sensor re-degradation"]
+        },
+        mode: {
+          kicker:"Policy condition", title:"Mode token", color:colors.policy, shape:"B × {0,1}",
+          note:"0 = SR · 1 = edit",
+          description:"A learned binary embedding separates evidence-constrained reconstruction from explicitly synthetic editing.",
+          input:"Mode id", output:vector(p.widths[0]*4),
+          layers:[["Embedding(2)",vector(p.widths[0]*4)]],
+          roles:["Conditions diffusion residual blocks","Forces edit permission to zero in SR mode","Selects residual composition and projection strength"]
+        },
+        noise: {
+          kicker:"Latent source", title:"Noise / noisy latent", color:colors.latent, shape:shape(4,64,64),
+          note:"Training q(zₜ|z₀) · inference N(0,I)",
+          description:"Training adds scheduled Gaussian noise to the VAE latent. Inference starts from pure random noise and iteratively denoises it with DDIM.",
+          input:state.execution === "training" ? `${shape(4,64,64)} z₀ + timestep t` : "Gaussian N(0,I)",
+          output:shape(4,64,64),
+          layers:[["Cosine schedule",`${p.steps} train timesteps`],["DDIM inference","user-selected sample steps"]],
+          roles:["Creates the diffusion learning target","Provides stochastic sample diversity at inference"]
+        },
+        base: {
+          kicker:"Deterministic anchor", title:"SwinIR base", color:colors.base, shape:shape(3,512,512),
+          note:`${p.baseDepth} shifted-window blocks`,
+          description:"A radiometrically conservative branch reconstructs low-frequency structure and predictable edges. The generative branch only adds a residual to this anchor.",
+          input:shape(3,128,128), output:shape(3,512,512),
+          layers:[
+            ["3×3 shallow conv",shape(p.base,128,128)],
+            [`${p.baseDepth} window transformers`,`${shape(p.base,128,128)} · window ${p.window} · ${p.heads} heads`],
+            ["body conv + shallow skip",shape(p.base,128,128)],
+            ["Conv + PixelShuffle ×2",shape(p.base,256,256)],
+            ["Conv + PixelShuffle ×2",shape(p.base,512,512)],
+            ["3×3 RGB conv + bicubic skip",shape(3,512,512)]
+          ],
+          roles:["Preserves low-frequency radiometry","Reduces the amount the generative branch may invent","Provides the residual target HR − base during training"]
+        },
+        lrEncoder: {
+          kicker:"Evidence pyramid", title:"LR encoder", color:colors.feature, shape:"4 spatial feature maps",
+          note:"Convolution + residual blocks",
+          description:"Builds an aligned spatial feature pyramid. The current implementation consumes f64 and f128; f32 and f16 are computed but not yet fused downstream.",
+          input:shape(3,128,128), output:`f128 · f64 · f32 · f16`,
+          layers:[
+            ["Stem 3×3 + residual",shape(p.lr,128,128)],
+            ["Stride-2 conv + residual",shape(p.lr*2,64,64)],
+            ["Stride-2 conv + residual",shape(p.lr*4,32,32)],
+            ["Stride-2 conv + residual",shape(p.lr*4,16,16)]
+          ],
+          roles:["Locks latent generation to observed geometry","Supplies decoder skip evidence","Builds unused coarse features for future multi-scale fusion"]
+        },
+        f128: {
+          kicker:"Fine LR evidence", title:"f128", color:colors.feature, shape:shape(p.lr,128,128),
+          note:"Used by decoder at 128/256/512",
+          description:"Fine-resolution LR feature map. It is injected into the last three decoder stages; bilinear interpolation expands it to 256² and 512² where required.",
+          input:shape(3,128,128), output:shape(p.lr,128,128),
+          layers:[["Stem conv",shape(p.lr,128,128)],["Residual block",shape(p.lr,128,128)]],
+          roles:["Carries roads, boundaries and local texture layout","Skip-connected into decoder stages 128², 256² and 512²"]
+        },
+        f64: {
+          kicker:"Latent-aligned evidence", title:"f64", color:colors.feature, shape:shape(p.lr*2,64,64),
+          note:"Diffusion + GeoMapper + decoder",
+          description:"The key alignment tensor: its 64×64 grid exactly matches the VAE latent. It is concatenated with noisy latent in diffusion and with denoised latent in GeoMapper.",
+          input:shape(p.lr,128,128), output:shape(p.lr*2,64,64),
+          layers:[["4×4 stride-2 conv",shape(p.lr*2,64,64)],["Residual block",shape(p.lr*2,64,64)]],
+          roles:["Spatial condition for latent diffusion","LR evidence input for confidence gating","Skip connection at decoder 64² stage"]
+        },
+        f32: {
+          kicker:"Coarse feature", title:"f32", color:colors.feature, shape:shape(p.lr*4,32,32),
+          note:"Computed · currently unused downstream",
+          description:"A coarse semantic feature map produced by the encoder. The present generator does not consume it after creation; the explorer deliberately shows this as an unconnected architectural opportunity.",
+          input:shape(p.lr*2,64,64), output:shape(p.lr*4,32,32),
+          layers:[["4×4 stride-2 conv",shape(p.lr*4,32,32)],["Residual block",shape(p.lr*4,32,32)]],
+          roles:["Available coarse context","Candidate input for future explicit multi-scale fusion"]
+        },
+        f16: {
+          kicker:"Coarsest feature", title:"f16", color:colors.feature, shape:shape(p.lr*4,16,16),
+          note:"Computed · currently unused downstream",
+          description:"The coarsest LR encoder feature. It is currently retained for diagnostics and possible future architectural ablations, but has no consumer in the present forward generator.",
+          input:shape(p.lr*4,32,32), output:shape(p.lr*4,16,16),
+          layers:[["4×4 stride-2 conv",shape(p.lr*4,16,16)],["Residual block",shape(p.lr*4,16,16)]],
+          roles:["Encodes broad context","Candidate for U-Net or mapper coarse fusion"]
+        },
+        hr: {
+          kicker:"Paired ground truth", title:"Native 10 m HR", color:colors.supervision, shape:shape(3,512,512),
+          note:"Training only",
+          description:"The native Sentinel-2 target provides supervision. It is not available at inference.",
+          input:"Cloud-masked native RGB patch", output:shape(3,512,512),
+          layers:[["Reflectance scaling","RGB in [0,1]"],["Validity masking",shape(3,512,512)]],
+          roles:["Reconstruction target","Real sample for both discriminators","Source of residual VAE target"]
+        },
+        targetResidual: {
+          kicker:"Residual target", title:"HR − base", color:colors.supervision, shape:shape(3,512,512),
+          note:"What the generative branch must model",
+          description:"Subtracting the deterministic base removes much predictable image content, allowing the VAE and diffusion model to focus on unresolved detail.",
+          input:`HR ${shape(3,512,512)} + base ${shape(3,512,512)}`, output:shape(3,512,512),
+          layers:[["Elementwise subtraction",shape(3,512,512)]],
+          roles:["Ground truth for residual VAE","Source of clean diffusion latent z₀"]
+        },
+        vae: {
+          kicker:"Latent codec", title:"Residual VAE", color:colors.latent, shape:shape(4,64,64),
+          note:"Encoder trains in phase 2 · frozen later",
+          description:"Compresses the target residual by 8× spatially into four latent channels. Its decoder is used for VAE reconstruction and diffusion-only diagnostics, not as the final adversarial SR decoder.",
+          input:shape(3,512,512), output:`μ, logσ², z₀ · ${shape(4,64,64)}`,
+          layers:[
+            ["Stem",shape(p.vae,512,512)],
+            ["Downsample 1",shape(p.vae*2,256,256)],
+            ["Downsample 2",shape(p.vae*4,128,128)],
+            ["Downsample 3",shape(p.vae*4,64,64)],
+            ["1×1 moments",shape(8,64,64)],
+            ["Reparameterize",shape(4,64,64)],
+            ["VAE decoder",shape(3,512,512)]
+          ],
+          roles:["Defines compact residual latent distribution","Produces clean z₀ for diffusion training","VAE decoder is separate from the GAN residual decoder"]
+        },
+        diffusion: {
+          kicker:"Stochastic generator", title:"Conditional diffusion U-Net", color:colors.latent, shape:shape(4,64,64),
+          note:`v-prediction · widths ${W.join("/")}`,
+          description:"Predicts velocity in latent space. It is conditioned spatially by f64, globally by timestep/degradation/mode, and semantically by text cross-attention.",
+          input:`zₜ ${shape(4,64,64)} + f64 ${shape(p.lr*2,64,64)}`, output:`v̂ / ẑ₀ ${shape(4,64,64)}`,
+          layers:[
+            ["Input concatenation",shape(4+p.lr*2,64,64)],
+            ["3×3 projection",shape(W[0],64,64)],
+            ["Down path",diffLevels],
+            ["Cross-attention","32² and 16² levels + middle (where present)"],
+            ["Middle",shape(W[W.length-1],64/(2**(W.length-1)),64/(2**(W.length-1)))],
+            ["Up path","PixelShuffle ×2 + U-Net concatenation skips"],
+            ["Output norm + 3×3",shape(4,64,64)]
+          ],
+          roles:["Models multiple plausible high-frequency residuals","Uses f64 to retain spatial alignment","Uses prompt tokens without directly painting RGB"]
+        },
+        mapper: {
+          kicker:"Dual-policy bridge", title:"GeoMapper", color:colors.mapping, shape:shape(p.mapper,64,64),
+          note:"Content + 4 FiLM styles + 2 policy maps",
+          description:"Converts denoised latent into decoder-ready spatial content and layer-wise styles while predicting separate evidence confidence and edit permission maps.",
+          input:`ẑ₀ ${shape(4,64,64)} + f64 ${shape(p.lr*2,64,64)} + text + mode`,
+          output:`content ${shape(p.mapper,64,64)} · 4×${vector(p.style)} · 2 policy maps`,
+          layers:[
+            ["Concat ẑ₀ + f64",shape(4+p.lr*2,64,64)],
+            ["3×3 input conv",shape(p.mapper,64,64)],
+            ["4 residual blocks",shape(p.mapper,64,64)],
+            ["Text mean + linear",shape(p.mapper,64,64)],
+            ["LR evidence 1×1",shape(p.mapper,64,64)],
+            ["Evidence gate",shape(1,64,64)],
+            ["Edit-permission gate",shape(1,64,64)],
+            ["Prompt-gated content",shape(p.mapper,64,64)],
+            ["4 style MLP heads",`4 × ${vector(p.style)}`]
+          ],
+          roles:["Translates latent semantics into spatial decoder control","Separates factual support from synthetic edit permission","Limits prompt influence in SR mode"]
+        },
+        decoder: {
+          kicker:"Adversarial generator", title:"Dual-head SR decoder", color:colors.output, shape:shape(3,512,512),
+          note:"Shared FiLM trunk · detail + edit heads",
+          description:"This is the generator component trained against the GAN discriminators. It upsamples mapped content through four FiLM stages and injects LR features before producing two residual heads.",
+          input:`content ${shape(p.mapper,64,64)} + 4 styles + LR skips`,
+          output:`detail ${shape(3,512,512)} + edit ${shape(3,512,512)}`,
+          layers:[
+            ["Input 3×3",shape(p.decoder[0],64,64)],
+            ["f64 projection + FiLM block",shape(p.decoder[0],64,64)],
+            ["PixelShuffle + f128 + FiLM",shape(p.decoder[1],128,128)],
+            ["PixelShuffle + resized f128 + FiLM",shape(p.decoder[2],256,256)],
+            ["PixelShuffle + resized f128 + FiLM",shape(p.decoder[3],512,512)],
+            ["Detail head + tanh",shape(3,512,512)],
+            ["Edit head + tanh",shape(3,512,512)]
+          ],
+          roles:["Generates realistic residual texture","Receives direct observed-geometry skips","GAN feedback reaches this decoder during joint/edit training"]
+        },
+        compose: {
+          kicker:"Evidence policy", title:"Residual composition", color:colors.policy, shape:shape(3,512,512),
+          note:state.mode === "sr" ? "High-pass detail × evidence" : "Evidence detail + permitted full-band edit",
+          description:"The dual policy determines which decoder output may affect the image. SR admits only high-pass, evidence-gated detail; edit mode additionally permits prompt-conditioned full-band changes.",
+          input:"Base + two residual heads + two policy maps", output:shape(3,512,512),
+          layers:[
+            ["High-pass(detail)",shape(3,512,512)],
+            ["Resize evidence map",shape(1,512,512)],
+            ["Resize edit permission",shape(1,512,512)],
+            ["SR residual","H(detail) ⊙ evidence"],
+            ["Edit residual","SR residual + edit ⊙ permission"],
+            ["Add deterministic base",shape(3,512,512)]
+          ],
+          roles:["Prevents low-frequency hallucination in SR","Marks stronger changes as synthetic edits","Keeps base as the reconstruction anchor"]
+        },
+        backproject: {
+          kicker:"Physics correction", title:"Sensor back-projection", color:colors.base, shape:shape(3,512,512),
+          note:state.mode === "sr" ? "3 steps · step size 0.5" : "1 soft step · step size 0.15",
+          description:"Repeatedly degrades the current HR estimate with the recorded sensor model, compares it with observed LR, and projects the error back to HR.",
+          input:`HR estimate + LR ${shape(3,128,128)} + degradation ${vector(4)}`, output:shape(3,512,512),
+          layers:[
+            ["Sensor degrade",shape(3,128,128)],
+            ["LR error",shape(3,128,128)],
+            ["Upsample correction",shape(3,512,512)],
+            [state.mode === "sr" ? "3 correction steps" : "1 soft correction step",shape(3,512,512)]
+          ],
+          roles:["Enforces LR measurement consistency","Reduces unsupported spatial drift","Is deliberately weaker in synthetic edit mode"]
+        },
+        output: {
+          kicker:"Model result", title:state.mode === "sr" ? "10 m SR output" : "Synthetic edit output",
+          color:colors.output, shape:shape(3,512,512),
+          note:state.mode === "edit" ? "metadata: synthetic_edit=true" : "evidence-constrained reconstruction",
+          description:state.mode === "sr"
+            ? "The reconstructed 10 m output combines the conservative base with evidence-gated stochastic detail and sensor consistency."
+            : "The generated visualization may include prompt-driven full-band changes and is explicitly labeled synthetic.",
+          input:shape(3,512,512), output:shape(3,512,512),
+          layers:[["Clamp","RGB in [0,1]"],["Metadata",state.mode === "edit" ? "synthetic_edit=true" : "synthetic_edit=false"]],
+          roles:["Final image for evaluation or visualization","Carries mode and policy metadata"]
+        },
+        discriminator: {
+          kicker:"GAN critics", title:"Patch + wavelet discriminators", color:colors.supervision, shape:"real/fake logits",
+          note:"Joint/edit training only · removed at inference",
+          description:"Two critics compare generated output with real HR, conditioned on LR. Their generator hinge loss encourages realistic local texture and high-frequency statistics.",
+          input:`real/fake HR ${shape(3,512,512)} + LR ${shape(3,128,128)}`, output:"Patch logits at multiple scales + wavelet logits",
+          layers:[
+            ["Conditional concat","HR 3ch + upsampled LR 3ch = 6ch"],
+            ["PatchGAN scale 1","512² input → 62² logits"],
+            ["PatchGAN scale 2","256² input → 30² logits"],
+            ["PatchGAN scale 3","128² input → 14² logits"],
+            ["Haar LH/HL/HH","9ch high-frequency at 256²"],
+            ["Wavelet + LR concat","18ch at 256² → 30² logits"]
+          ],
+          roles:["Improves local realism","Targets high-frequency spectral statistics","Never appears in the inference forward pass"]
+        },
+        losses: {
+          kicker:"Optimization", title:"Ground truths & losses", color:colors.supervision, shape:"scalar objectives",
+          note:"Stage-dependent supervision",
+          description:"Losses turn paired HR evidence, diffusion targets, LR consistency and discriminator judgments into gradients for the currently trainable modules.",
+          input:"Prediction + HR + LR + latent targets + critic scores", output:"Weighted scalar loss",
+          layers:[
+            ["Base","Charbonnier + SSIM + gradient + consistency"],
+            ["VAE","residual reconstruction + KL + HR + wavelet + confidence"],
+            ["Diffusion","SNR-weighted velocity target"],
+            ["Joint","reconstruction + perceptual + wavelet + consistency + GAN"],
+            ["Edit","joint losses + localization + permission + prompt alignment"]
+          ],
+          roles:["Provides each phase its ground truth signal","Routes GAN feedback into the generator","Calibrates evidence confidence against local HR error"]
+        }
+      };
+    }
+
+    function trainingSets(stage) {
+      const trainable = {
+        base:["base"],
+        vae:["vae","lrEncoder","mapper","decoder"],
+        diffusion:["diffusion"],
+        joint:["diffusion","lrEncoder","mapper","decoder"],
+        edit:["diffusion","mapper","decoder"]
+      }[stage];
+      const used = {
+        base:["lr","base","hr","losses","output"],
+        vae:["lr","prompt","mode","base","lrEncoder","f128","f64","f32","f16","hr","targetResidual","vae","mapper","decoder","compose","output","losses"],
+        diffusion:["lr","prompt","degradation","mode","noise","base","lrEncoder","f128","f64","f32","f16","hr","targetResidual","vae","diffusion","losses"],
+        joint:["lr","prompt","degradation","mode","noise","base","lrEncoder","f128","f64","f32","f16","hr","targetResidual","vae","diffusion","mapper","decoder","compose","backproject","output","discriminator","losses"],
+        edit:["lr","prompt","degradation","mode","noise","base","lrEncoder","f128","f64","f32","f16","hr","targetResidual","vae","diffusion","mapper","decoder","compose","backproject","output","discriminator","losses"]
+      }[stage];
+      return { trainable:new Set(trainable), used:new Set(used) };
+    }
+
+    function inferenceSets() {
+      return {
+        trainable:new Set(),
+        used:new Set(["lr","prompt","degradation","mode","noise","base","lrEncoder","f128","f64","f32","f16","diffusion","mapper","decoder","compose","backproject","output"])
+      };
+    }
+
+    function currentSets() {
+      return state.execution === "training" ? trainingSets(state.stage) : inferenceSets();
+    }
+
+    function edgesForScenario() {
+      const E = [
+        ["lr","base","data","LR"],
+        ["lr","lrEncoder","data","LR"],
+        ["lrEncoder","f128","data","stem"],
+        ["f128","f64","data","↓2"],
+        ["f64","f32","data","↓2"],
+        ["f32","f16","data","↓2"],
+        ["prompt","diffusion","condition","cross-attention"],
+        ["prompt","mapper","condition","mean context"],
+        ["degradation","diffusion","condition","condition MLP"],
+        ["degradation","backproject","condition","sensor params"],
+        ["mode","diffusion","condition","mode embedding"],
+        ["mode","mapper","condition","SR / edit"],
+        ["mode","compose","condition","policy"],
+        ["f64","diffusion","skip","spatial condition"],
+        ["f64","mapper","skip","LR evidence"],
+        ["f64","decoder","skip","64² skip"],
+        ["f128","decoder","skip","128² / 256² / 512² skips"],
+        ["noise","diffusion","data",state.execution === "training" ? "zₜ" : "N(0,I)"],
+        ["diffusion","mapper","data","denoised ẑ₀"],
+        ["mapper","decoder","data","content + 4 styles"],
+        ["mapper","compose","condition","evidence + permission"],
+        ["decoder","compose","data","detail + edit residuals"],
+        ["base","compose","data","HR anchor"],
+        ["compose","backproject","data","HR estimate"],
+        ["lr","backproject","skip","measured LR"],
+        ["backproject","output","data","consistent HR"],
+        ["hr","targetResidual","data","HR"],
+        ["base","targetResidual","data","subtract"],
+        ["targetResidual","vae","data","residual"],
+        ["vae","noise","data","z₀"],
+        ["output","discriminator","feedback","fake HR"],
+        ["hr","discriminator","feedback","real HR"],
+        ["lr","discriminator","feedback","condition"],
+        ["discriminator","losses","feedback","hinge GAN"],
+        ["output","losses","feedback","reconstruction"],
+        ["hr","losses","feedback","ground truth"],
+        ["diffusion","losses","feedback","v target"],
+        ["losses","decoder","feedback","generator gradient"],
+        ["losses","diffusion","feedback","gradient"]
+      ];
+      if (state.execution === "training" && state.stage === "vae") {
+        E.push(["vae","mapper","data","sampled z₀"]);
+      }
+      if (state.execution === "training" && state.stage === "base") {
+        E.push(["base","output","data","base is output"]);
+      }
+      return E;
+    }
+
+    function edgeActive([from,to,type]) {
+      const {used} = currentSets();
+      if (!used.has(from) || !used.has(to)) return false;
+      if (type === "skip" && !state.skips) return false;
+      if (state.execution === "training") {
+        if (state.stage === "base") return [["lr","base"],["base","output"],["hr","losses"],["output","losses"]].some(x => x[0]===from && x[1]===to);
+        if (state.stage === "vae" && ["diffusion","noise","backproject","discriminator"].includes(from)) return false;
+        if (state.stage === "vae" && ["diffusion","noise","backproject","discriminator"].includes(to)) return false;
+        if (state.stage === "diffusion" && ["mapper","decoder","compose","backproject","output","discriminator"].includes(from)) return false;
+        if (state.stage === "diffusion" && ["mapper","decoder","compose","backproject","output","discriminator"].includes(to)) return false;
+        if (!["joint","edit"].includes(state.stage) && (from === "discriminator" || to === "discriminator")) return false;
+      } else if (["hr","targetResidual","vae","discriminator","losses"].includes(from) || ["hr","targetResidual","vae","discriminator","losses"].includes(to)) return false;
+      if (state.prompt === "disabled" && from === "prompt") return false;
+      return true;
+    }
+
+    function nodeStatus(id) {
+      const {trainable, used} = currentSets();
+      if (!used.has(id)) return "inactive";
+      if (state.execution === "inference") return "active-path";
+      if (trainable.has(id)) return "active-path trainable";
+      if (["discriminator"].includes(id) && ["joint","edit"].includes(state.stage)) return "active-path trainable training-only";
+      if (["lr","hr","targetResidual","f128","f64","f32","f16","noise","prompt","degradation","mode","losses","output"].includes(id)) return "active-path";
+      return "active-path frozen";
+    }
+
+    function renderNodes() {
+      const p = presets[state.preset], data = moduleData(p);
+      const layer = document.getElementById("nodeLayer");
+      layer.innerHTML = "";
+      Object.entries(pos).forEach(([id,[x,y]]) => {
+        const d = data[id];
+        const button = document.createElement("button");
+        button.className = `arch-node ${nodeStatus(id)}`;
+        button.dataset.id = id;
+        button.style.left = `${x}px`;
+        button.style.top = `${y}px`;
+        button.style.setProperty("--node-color", d.color);
+        if (!state.inactive && button.classList.contains("inactive")) button.style.display = "none";
+        button.innerHTML = `
+          <div class="node-kicker">${d.kicker}</div>
+          <div class="node-title">${d.title}</div>
+          ${state.dims ? `<div class="node-shape">${d.shape}</div>` : ""}
+          <div class="node-note">${d.note}</div>`;
+        button.addEventListener("click", () => openDrawer(id));
+        layer.appendChild(button);
+      });
+    }
+
+    function anchor(id, side) {
+      const [x,y] = pos[id];
+      const w = 176, h = 106;
+      if (side === "left") return [x,y+h/2];
+      if (side === "right") return [x+w,y+h/2];
+      if (side === "top") return [x+w/2,y];
+      return [x+w/2,y+h];
+    }
+
+    function pathFor(from,to,type) {
+      const [fx,fy] = pos[from], [tx,ty] = pos[to];
+      const horizontal = Math.abs(tx-fx) >= Math.abs(ty-fy);
+      let a,b;
+      if (horizontal) {
+        const right = tx > fx;
+        a = anchor(from,right ? "right":"left");
+        b = anchor(to,right ? "left":"right");
+      } else {
+        const down = ty > fy;
+        a = anchor(from,down ? "bottom":"top");
+        b = anchor(to,down ? "top":"bottom");
+      }
+      const [x1,y1]=a,[x2,y2]=b;
+      if (type === "feedback") {
+        const bendY = Math.max(y1,y2) + 58;
+        return {d:`M ${x1} ${y1} C ${x1} ${bendY}, ${x2} ${bendY}, ${x2} ${y2}`, label:[(x1+x2)/2,bendY-5]};
+      }
+      if (horizontal) {
+        const mid=(x1+x2)/2;
+        return {d:`M ${x1} ${y1} C ${mid} ${y1}, ${mid} ${y2}, ${x2} ${y2}`, label:[mid,(y1+y2)/2-6]};
+      }
+      const mid=(y1+y2)/2;
+      return {d:`M ${x1} ${y1} C ${x1} ${mid}, ${x2} ${mid}, ${x2} ${y2}`, label:[(x1+x2)/2+5,mid-5]};
+    }
+
+    function renderEdges() {
+      const layer = document.getElementById("edgeLayer");
+      layer.innerHTML = "";
+      edgesForScenario().forEach(edge => {
+        const [from,to,type,label] = edge;
+        if (!pos[from] || !pos[to]) return;
+        const active = edgeActive(edge);
+        if (!state.inactive && !active) return;
+        const geom = pathFor(from,to,type);
+        const path = document.createElementNS("http://www.w3.org/2000/svg","path");
+        path.setAttribute("d",geom.d);
+        path.setAttribute("class",`edge ${type} ${active ? "active":"inactive"}`);
+        path.style.setProperty("--edge-color",type === "feedback" ? "#6d5ce8" : type === "condition" ? "#f4a340" : type === "skip" ? "#0aa6a6" : "#72859f");
+        if (type === "feedback") path.setAttribute("marker-end","url(#arrowFeedback)");
+        layer.appendChild(path);
+        if (active && label) {
+          const text = document.createElementNS("http://www.w3.org/2000/svg","text");
+          text.setAttribute("x",geom.label[0]);
+          text.setAttribute("y",geom.label[1]);
+          text.setAttribute("class","edge-label");
+          text.setAttribute("text-anchor","middle");
+          text.textContent=label;
+          layer.appendChild(text);
+        }
+      });
+    }
+
+    const stageCopy = {
+      base:["Phase 1 · deterministic base","Only SwinIR learns from paired HR; no VAE, diffusion, mapper, decoder or GAN is involved."],
+      vae:["Phase 2 · residual representation","The VAE, LR encoder, GeoMapper and dual-head decoder learn from the true residual HR − base. GAN loss is still off."],
+      diffusion:["Phase 3 · latent diffusion","Only the diffusion U-Net learns the SNR-weighted velocity target. Base, VAE and LR encoder act as frozen target/condition providers."],
+      joint:["Phase 4 · joint adversarial refinement","Diffusion, LR encoder, GeoMapper and decoder learn jointly. Patch and wavelet critics add a low-weight realism gradient."],
+      edit:["Phase 5 · prompt-edit specialization","Diffusion, GeoMapper and decoder learn prompt alignment and edit localization. LR encoder is frozen; GAN critics remain training-only."]
+    };
+
+    function flowItems() {
+      if (state.execution === "inference") return [
+        "LR evidence","Base + LR pyramid","DDIM latent sampling","GeoMapper policies","Dual-head residual","Compose by mode","Back-project","HR output"
+      ];
+      return {
+        base:["LR evidence","SwinIR 4×","Compare to HR","Base losses","Update base"],
+        vae:["HR − frozen base","VAE latent","GeoMapper","Residual decoder","HR / VAE losses","Update VAE + bridge"],
+        diffusion:["HR − base","Frozen VAE z₀","Add noise at t","Predict velocity","SNR loss","Update U-Net"],
+        joint:["Latent diffusion","GeoMapper policies","Residual decoder","Compose + project","Real/fake critics","Joint losses","Update generator + critics"],
+        edit:["Counterfactual prompts","Edit diffusion","Permission map","Full-band edit head","Soft LR consistency","Prompt + GAN losses","Update edit path"]
+      }[state.stage];
+    }
+
+    function renderScenario() {
+      const title = document.getElementById("scenarioTitle");
+      const subtitle = document.getElementById("scenarioSubtitle");
+      const badges = document.getElementById("scenarioBadges");
+      const summaryHeading = document.getElementById("summaryHeading");
+      const summaryText = document.getElementById("summaryText");
+      const p = presets[state.preset];
+      if (state.execution === "training") {
+        title.textContent = stageCopy[state.stage][0];
+        subtitle.textContent = `${p.label} · active parameters are marked trainable; orange modules provide frozen features or targets`;
+        summaryHeading.textContent = stageCopy[state.stage][0];
+        summaryText.textContent = stageCopy[state.stage][1];
+      } else {
+        const promptLabel = {guided:"prompt with classifier-free guidance",prompt:"prompt without CFG",null:"empty prompt",disabled:"text ablation"}[state.prompt];
+        title.textContent = `${state.mode === "sr" ? "Evidence SR" : "Synthetic edit"} inference · ${promptLabel}`;
+        subtitle.textContent = `${p.label} · discriminators and HR/VAE target encoder are absent`;
+        summaryHeading.textContent = state.mode === "sr" ? "Reconstruction inference" : "Synthetic edit inference";
+        summaryText.textContent = state.mode === "sr"
+          ? "Random latent detail is constrained by LR features, evidence confidence, the deterministic base and three sensor back-projection steps."
+          : "Prompt-conditioned full-band changes are admitted only through edit permission, followed by one softer consistency step and synthetic-edit metadata.";
+      }
+      const badgeData = [
+        [state.execution === "training" ? "Training graph" : "Inference graph","bg-navy text-white"],
+        [state.mode === "sr" ? "SR policy" : "Edit policy","bg-amber/15 text-amber"],
+        [state.prompt === "disabled" ? "Text off" : state.prompt === "null" ? "Null prompt" : "Text on","bg-violet/10 text-violet"],
+        [p.label,"bg-cyan/10 text-cyan"]
+      ];
+      badges.innerHTML = badgeData.map(([x,c])=>`<span class="rounded-full px-3 py-1 text-[9px] font-extrabold ${c}">${x}</span>`).join("");
+      document.getElementById("flowSteps").innerHTML = flowItems().map((s,i)=>
+        `<div class="flex shrink-0 items-center gap-2">
+          <div class="flow-chip ${i===0?"current":""} rounded-xl px-3 py-2 text-[10px] font-extrabold">${i+1}. ${s}</div>
+          ${i<flowItems().length-1?'<span class="text-slate-300">→</span>':""}
+        </div>`).join("");
+    }
+
+    function openDrawer(id) {
+      const p=presets[state.preset], d=moduleData(p)[id], status=nodeStatus(id);
+      document.body.classList.add("drawer-open");
+      document.getElementById("drawerKicker").textContent=d.kicker;
+      document.getElementById("drawerTitle").textContent=d.title;
+      document.getElementById("drawerDescription").textContent=d.description;
+      const statusText = status.includes("inactive") ? "Not used in selected scenario"
+        : status.includes("trainable") ? "Active and trainable"
+        : state.execution === "training" && status.includes("frozen") ? "Active, parameters frozen"
+        : "Active forward-path module";
+      const statusColor = status.includes("inactive") ? "bg-slate-100 text-slate-500"
+        : status.includes("trainable") ? "bg-rose/10 text-rose"
+        : status.includes("frozen") ? "bg-amber/15 text-amber"
+        : "bg-cyan/10 text-cyan";
+      document.getElementById("drawerStatus").innerHTML=`<span class="rounded-full px-3 py-1.5 text-[10px] font-extrabold ${statusColor}">${statusText}</span>`;
+      document.getElementById("drawerIO").innerHTML=`
+        <div class="rounded-xl bg-slate-50 p-3"><div class="text-[9px] font-extrabold uppercase tracking-wider text-slate-400">Input</div><div class="mt-1 text-xs font-bold leading-5 text-navy">${d.input}</div></div>
+        <div class="rounded-xl bg-slate-50 p-3"><div class="text-[9px] font-extrabold uppercase tracking-wider text-slate-400">Output</div><div class="mt-1 text-xs font-bold leading-5 text-navy">${d.output}</div></div>`;
+      document.getElementById("drawerLayers").innerHTML=d.layers.map(([a,b])=>`<tr><td class="font-bold text-navy">${a}</td><td class="font-mono text-[10px] text-slate-500">${b}</td></tr>`).join("");
+      document.getElementById("drawerRoles").innerHTML=d.roles.map(r=>`<div class="flex gap-2 rounded-xl bg-slate-50 p-3 text-xs leading-5 text-slate-600"><span class="mt-1 h-2 w-2 shrink-0 rounded-full" style="background:${d.color}"></span>${r}</div>`).join("");
+      const connections=edgesForScenario().filter(e=>(e[0]===id||e[1]===id)&&edgeActive(e));
+      document.getElementById("drawerConnections").innerHTML=connections.length ? connections.map(([a,b,t,l])=>{
+        const incoming=b===id;
+        return `<div class="flex items-center justify-between gap-3 rounded-xl border border-slate-200 px-3 py-2 text-xs">
+          <span class="font-bold text-navy">${incoming ? "← "+moduleData(p)[a].title : moduleData(p)[b].title+" →"}</span>
+          <span class="text-[9px] font-bold text-slate-400">${l}</span>
+        </div>`;
+      }).join("") : `<div class="rounded-xl bg-slate-50 p-3 text-xs text-slate-500">No active connections in this selected scenario.</div>`;
+    }
+
+    function render() {
+      document.getElementById("stageControl").style.opacity=state.execution==="training" ? "1":".35";
+      document.getElementById("stageSelect").disabled=state.execution!=="training";
+      document.getElementById("modeControl").style.opacity=(state.execution==="inference"||state.stage==="edit"||state.stage==="joint") ? "1":".45";
+      if (state.execution==="training") state.mode=state.stage==="edit" ? "edit":"sr";
+      document.querySelectorAll('[data-segment="mode"] .seg-btn').forEach(b=>b.classList.toggle("active",b.dataset.value===state.mode));
+      renderNodes(); renderEdges(); renderScenario();
+      document.documentElement.style.setProperty("--canvas-scale",state.zoom);
+      document.getElementById("architectureInner").parentElement.style.setProperty("--scaled-width",`${1880*state.zoom}px`);
+      document.getElementById("zoomLabel").textContent=`${Math.round(state.zoom*100)}%`;
+    }
+
+    document.querySelectorAll("[data-segment]").forEach(group=>{
+      group.addEventListener("click",e=>{
+        const btn=e.target.closest(".seg-btn"); if(!btn)return;
+        const key=group.dataset.segment;
+        state[key]=btn.dataset.value;
+        group.querySelectorAll(".seg-btn").forEach(b=>b.classList.toggle("active",b===btn));
+        render();
+      });
+    });
+    document.getElementById("stageSelect").addEventListener("change",e=>{state.stage=e.target.value;render();});
+    document.getElementById("promptSelect").addEventListener("change",e=>{state.prompt=e.target.value;render();});
+    document.getElementById("presetSelect").addEventListener("change",e=>{state.preset=e.target.value;render();});
+    document.getElementById("showDims").addEventListener("click",e=>{state.dims=!state.dims;e.target.textContent=`Dimensions ${state.dims?"on":"off"}`;e.target.classList.toggle("bg-navy",state.dims);e.target.classList.toggle("text-white",state.dims);render();});
+    document.getElementById("showSkips").addEventListener("click",e=>{state.skips=!state.skips;e.target.textContent=`Skips ${state.skips?"on":"off"}`;render();});
+    document.getElementById("showInactive").addEventListener("click",e=>{state.inactive=!state.inactive;e.target.textContent=`Inactive ${state.inactive?"visible":"hidden"}`;render();});
+    document.getElementById("zoomOut").addEventListener("click",()=>{state.zoom=Math.max(.65,state.zoom-.1);render();});
+    document.getElementById("zoomIn").addEventListener("click",()=>{state.zoom=Math.min(1.25,state.zoom+.1);render();});
+    document.getElementById("drawerClose").addEventListener("click",()=>document.body.classList.remove("drawer-open"));
+    document.getElementById("drawerBackdrop").addEventListener("click",()=>document.body.classList.remove("drawer-open"));
+    document.addEventListener("keydown",e=>{if(e.key==="Escape")document.body.classList.remove("drawer-open");});
+    render();
+  </script>
+</body>
+</html>

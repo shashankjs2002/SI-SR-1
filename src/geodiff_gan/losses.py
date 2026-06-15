@@ -80,8 +80,9 @@ def evidence_calibration_loss(
     target: torch.Tensor,
     temperature: float = 0.05,
     smoothing_window: int = 9,
+    selectivity_weight: float = 0.0,
 ) -> torch.Tensor:
-    """Calibrate confidence against local paired-target reconstruction accuracy."""
+    """Calibrate confidence magnitude and spatial ranking against local accuracy."""
     with torch.no_grad():
         error = (ungated_prediction - target).abs().mean(dim=1, keepdim=True)
         error = F.avg_pool2d(
@@ -96,7 +97,32 @@ def evidence_calibration_loss(
             size=confidence.shape[-2:],
             mode="area",
         )
-    return F.smooth_l1_loss(confidence, target_confidence)
+    calibration = F.smooth_l1_loss(confidence, target_confidence)
+    if selectivity_weight <= 0:
+        return calibration
+
+    confidence_centered = confidence.flatten(1)
+    confidence_centered = confidence_centered - confidence_centered.mean(
+        dim=1,
+        keepdim=True,
+    )
+    target_centered = target_confidence.flatten(1)
+    target_centered = target_centered - target_centered.mean(
+        dim=1,
+        keepdim=True,
+    )
+    target_norm = target_centered.norm(dim=1)
+    valid = target_norm > 1e-6
+    if not valid.any():
+        return calibration
+    correlation = F.cosine_similarity(
+        confidence_centered[valid],
+        target_centered[valid],
+        dim=1,
+        eps=1e-6,
+    )
+    selectivity = (1 - correlation).mean()
+    return calibration + float(selectivity_weight) * selectivity
 
 
 def edit_localization_loss(

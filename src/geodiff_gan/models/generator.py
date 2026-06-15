@@ -56,6 +56,24 @@ class DecoderOutput:
     edit_residual: torch.Tensor
 
 
+class ResizeConvUpsample(nn.Module):
+    """Artifact-resistant 2x upsampling followed by a learned convolution."""
+
+    def __init__(self, in_channels: int, out_channels: int) -> None:
+        super().__init__()
+        self.convolution = nn.Conv2d(in_channels, out_channels, 3, padding=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = F.interpolate(
+            x,
+            scale_factor=2,
+            mode="bilinear",
+            align_corners=False,
+            antialias=True,
+        )
+        return self.convolution(x)
+
+
 class GeoMapper(nn.Module):
     def __init__(
         self,
@@ -150,10 +168,16 @@ class ResidualSRDecoder(nn.Module):
         style_dim: int = 256,
         lr_channels: int = 64,
         stage_channels: tuple[int, ...] = (128, 96, 64, 48),
+        upsample_mode: str = "pixelshuffle",
     ) -> None:
         super().__init__()
         if len(stage_channels) != 4:
             raise ValueError("Decoder expects four stages at 64, 128, 256, and 512 pixels")
+        if upsample_mode not in ("pixelshuffle", "resize_conv"):
+            raise ValueError(
+                "Decoder upsample_mode must be 'pixelshuffle' or 'resize_conv'"
+            )
+        self.upsample_mode = upsample_mode
         self.input = nn.Conv2d(content_channels, stage_channels[0], 3, padding=1)
         self.blocks = nn.ModuleList()
         self.upsamples = nn.ModuleList()
@@ -162,12 +186,17 @@ class ResidualSRDecoder(nn.Module):
         skip_dims = (lr_channels * 2, lr_channels, lr_channels, lr_channels)
         for index, channels in enumerate(stage_channels):
             if index:
-                self.upsamples.append(
-                    nn.Sequential(
-                        nn.Conv2d(current, channels * 4, 3, padding=1),
-                        nn.PixelShuffle(2),
+                if upsample_mode == "pixelshuffle":
+                    self.upsamples.append(
+                        nn.Sequential(
+                            nn.Conv2d(current, channels * 4, 3, padding=1),
+                            nn.PixelShuffle(2),
+                        )
                     )
-                )
+                else:
+                    self.upsamples.append(
+                        ResizeConvUpsample(current, channels)
+                    )
                 current = channels
             self.skip_projections.append(nn.Conv2d(skip_dims[index], current, 1))
             self.blocks.append(FiLMResidualBlock(current, style_dim))

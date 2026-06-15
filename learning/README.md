@@ -54,6 +54,7 @@ and a visually sharp satellite image is not automatically a spatially faithful r
 | 26 | [Text and prompt conditioning](26_text_prompt_conditioning.md) | Trace frozen text embeddings, guidance, and alignment |
 | 27 | [Uncertainty and abstention](27_uncertainty_and_abstention.md) | Quantify stochastic disagreement and reliability-aware blending |
 | 28 | [Complete system integration](28_complete_system_integration.md) | Join all modules, equations, tensor shapes, and training stages |
+| 29 | [Twelve-tile improved small-model run](29_twelve_tile_small_improvement_run.md) | Apply artifact, confidence, detail, checkpoint, and early-stopping improvements |
 
 ## Recommended Pace
 
@@ -63,7 +64,7 @@ flowchart LR
     B["Week 2<br/>Ch. 04-07<br/>Generative SR"] -->
     C["Week 3<br/>Ch. 08-10<br/>GeoDiff-GAN"] -->
     D["Week 4<br/>Ch. 11-18<br/>Evaluation and research"] -->
-    E["Week 5<br/>Ch. 19-28<br/>Module internals"]
+    E["Week 5<br/>Ch. 19-29<br/>Modules and improved experiment"]
 ```
 
 For each chapter:

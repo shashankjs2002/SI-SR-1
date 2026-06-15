@@ -221,6 +221,10 @@ statistics. Inspect decoder FFTs for lattice peaks. Possible remedies include:
 - phase-consistency regularization;
 - spectral artifact penalties.
 
+The `small_12tile_improved` preset implements the resize-convolution ablation. Each stage performs
+antialiased bilinear 2x resizing followed by a 3x3 convolution. Stage shapes, FiLM modulation,
+LR skips, and the dual output heads remain unchanged.
+
 ## Failure Modes
 
 | Symptom | Cause |
@@ -236,4 +240,3 @@ statistics. Inspect decoder FFTs for lattice peaks. Possible remedies include:
 See `ResidualSRDecoder` in
 [`models/generator.py`](../src/geodiff_gan/models/generator.py) and `high_pass` in
 [`models/blocks.py`](../src/geodiff_gan/models/blocks.py).
-

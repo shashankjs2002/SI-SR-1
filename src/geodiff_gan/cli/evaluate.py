@@ -70,6 +70,11 @@ def main() -> None:
     parser.add_argument("--split", default="test")
     parser.add_argument("--samples", type=int, default=8)
     parser.add_argument("--steps", type=int, default=20)
+    parser.add_argument(
+        "--back-projection-steps",
+        type=int,
+        help="Override SR/edit back-projection iterations for ablation.",
+    )
     parser.add_argument("--mode", choices=("sr", "edit"), default="sr")
     parser.add_argument("--limit", type=int)
     parser.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto")
@@ -93,6 +98,8 @@ def main() -> None:
         parser.error("--samples must be at least 1")
     if args.steps < 1:
         parser.error("--steps must be at least 1")
+    if args.back_projection_steps is not None and args.back_projection_steps < 0:
+        parser.error("--back-projection-steps must be non-negative")
     config = load_config(args.config)
     device = _resolve_device(args.device)
     amp_enabled = bool(
@@ -205,6 +212,7 @@ def main() -> None:
                         projection_lr=clean_lr,
                         mode=args.mode,
                         sample_steps=args.steps,
+                        back_projection_steps=args.back_projection_steps,
                         generator=generator,
                         base=base,
                         lr_features=lr_features,
@@ -311,6 +319,7 @@ def main() -> None:
     summary["count"] = count
     summary["samples_per_patch"] = args.samples
     summary["diffusion_steps"] = args.steps
+    summary["back_projection_steps"] = args.back_projection_steps
     summary["device"] = str(device)
     summary["amp"] = amp_enabled
     summary["optional_metrics"] = args.optional_metrics

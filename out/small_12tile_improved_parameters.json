@@ -1,0 +1,167 @@
+{
+  "core_model": {
+    "scalar_parameters": 12054034,
+    "trainable_scalar_parameters": 12054034,
+    "parameter_tensors": 531,
+    "trainable_parameter_tensors": 531,
+    "fp32_parameter_memory_mb": 45.98249053955078,
+    "fp16_parameter_memory_mb": 22.99124526977539
+  },
+  "core_modules": {
+    "base": {
+      "scalar_parameters": 119171,
+      "trainable_scalar_parameters": 119171,
+      "parameter_tensors": 58,
+      "trainable_parameter_tensors": 58
+    },
+    "vae": {
+      "scalar_parameters": 1378739,
+      "trainable_scalar_parameters": 1378739,
+      "parameter_tensors": 68,
+      "trainable_parameter_tensors": 68
+    },
+    "lr_encoder": {
+      "scalar_parameters": 625728,
+      "trainable_scalar_parameters": 625728,
+      "parameter_tensors": 40,
+      "trainable_parameter_tensors": 40
+    },
+    "diffusion": {
+      "scalar_parameters": 9138052,
+      "trainable_scalar_parameters": 9138052,
+      "parameter_tensors": 239,
+      "trainable_parameter_tensors": 239
+    },
+    "scheduler": {
+      "scalar_parameters": 0,
+      "trainable_scalar_parameters": 0,
+      "parameter_tensors": 0,
+      "trainable_parameter_tensors": 0
+    },
+    "mapper": {
+      "scalar_parameters": 589250,
+      "trainable_scalar_parameters": 589250,
+      "parameter_tensors": 62,
+      "trainable_parameter_tensors": 62
+    },
+    "decoder": {
+      "scalar_parameters": 203094,
+      "trainable_scalar_parameters": 203094,
+      "parameter_tensors": 64,
+      "trainable_parameter_tensors": 64
+    }
+  },
+  "discriminators": {
+    "modules": {
+      "conditional_multiscale_patchgan": {
+        "scalar_parameters": 731163,
+        "trainable_scalar_parameters": 731163,
+        "parameter_tensors": 30,
+        "trainable_parameter_tensors": 30
+      },
+      "haar_wavelet_discriminator": {
+        "scalar_parameters": 248329,
+        "trainable_scalar_parameters": 248329,
+        "parameter_tensors": 10,
+        "trainable_parameter_tensors": 10
+      }
+    },
+    "scalar_parameters": 979492
+  },
+  "training_stages": {
+    "base": {
+      "trainable_modules": [
+        "base"
+      ],
+      "core_trainable_parameters": 119171,
+      "discriminator_trainable_parameters": 0,
+      "total_optimized_parameters": 119171,
+      "uses_discriminators": false
+    },
+    "vae": {
+      "trainable_modules": [
+        "vae",
+        "lr_encoder",
+        "mapper",
+        "decoder"
+      ],
+      "core_trainable_parameters": 2796811,
+      "discriminator_trainable_parameters": 0,
+      "total_optimized_parameters": 2796811,
+      "uses_discriminators": false
+    },
+    "diffusion": {
+      "trainable_modules": [
+        "diffusion"
+      ],
+      "core_trainable_parameters": 9138052,
+      "discriminator_trainable_parameters": 0,
+      "total_optimized_parameters": 9138052,
+      "uses_discriminators": false
+    },
+    "joint": {
+      "trainable_modules": [
+        "diffusion",
+        "lr_encoder",
+        "mapper",
+        "decoder"
+      ],
+      "core_trainable_parameters": 10556124,
+      "discriminator_trainable_parameters": 979492,
+      "total_optimized_parameters": 11535616,
+      "uses_discriminators": true
+    },
+    "edit": {
+      "trainable_modules": [
+        "diffusion",
+        "mapper",
+        "decoder"
+      ],
+      "core_trainable_parameters": 9930396,
+      "discriminator_trainable_parameters": 979492,
+      "total_optimized_parameters": 10909888,
+      "uses_discriminators": true
+    }
+  },
+  "training_configuration": {
+    "epochs": 20,
+    "batch_size_per_gpu": 1,
+    "gradient_accumulation": 8,
+    "world_size": 1,
+    "effective_batch_size": 8,
+    "generator_learning_rate": 0.0001,
+    "discriminator_learning_rate": 0.0001,
+    "weight_decay": 0.0001,
+    "generator_adamw_betas": [
+      0.9,
+      0.99
+    ],
+    "discriminator_adamw_betas": [
+      0.0,
+      0.99
+    ],
+    "gradient_clip": 1.0,
+    "amp": true,
+    "gradient_checkpointing": true,
+    "loss_weights": {
+      "charbonnier": 1.0,
+      "consistency": 1.0,
+      "ssim": 0.2,
+      "gradient": 0.15,
+      "perceptual": 0.1,
+      "wavelet": 0.1,
+      "kl": 0.0001,
+      "vae_reconstruction": 1.0,
+      "diffusion": 1.0,
+      "evidence_calibration": 0.15,
+      "edit_localization": 0.05,
+      "edit_permission": 0.05,
+      "prompt_alignment": 0.05,
+      "adversarial": 0.01
+    }
+  },
+  "excluded_external_models": {
+    "training_text_encoder": "Frozen and model-dependent; use --include-text-encoder to count it.",
+    "qwen_captioner": "Offline data-preparation model; never loaded with GeoDiff-GAN training."
+  }
+}

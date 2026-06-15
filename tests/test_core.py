@@ -33,6 +33,7 @@ from geodiff_gan.metrics import edge_f1
 from geodiff_gan.models.base import WindowTransformerBlock
 from geodiff_gan.models.blocks import CrossAttention2d, high_pass
 from geodiff_gan.models.degradation import back_project, random_degradation, sensor_degrade
+from geodiff_gan.models.generator import ResizeConvUpsample
 from geodiff_gan.models.system import GeoDiffGAN
 from geodiff_gan.text import HashTextEncoder, PromptBatch, augment_prompts
 
@@ -122,6 +123,37 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(output.image.shape, base.shape)
         base_forward.assert_not_called()
         encoder_forward.assert_not_called()
+
+    def test_resize_conv_decoder_preserves_expected_output_shape(self) -> None:
+        config = load_config(
+            ROOT / "configs/smoke.yaml",
+            ROOT / "configs/default.yaml",
+        )
+        config["model"]["decoder_upsample_mode"] = "resize_conv"
+        model = GeoDiffGAN.from_config(config).eval()
+        self.assertTrue(
+            all(
+                isinstance(module, ResizeConvUpsample)
+                for module in model.decoder.upsamples
+            )
+        )
+        lr = torch.rand(1, 3, 16, 16)
+        context = HashTextEncoder(32, 8)([""])
+        degradation = torch.rand(1, 4)
+        with torch.no_grad():
+            base = model.base(lr)
+            residual = torch.rand_like(base) - 0.5
+            latent, _, _ = model.vae.encode(residual, sample=False)
+            output = model.decode_latent(
+                latent,
+                lr,
+                context,
+                degradation,
+                mode="sr",
+                base=base,
+                back_projection_steps=0,
+            )
+        self.assertEqual(output.image.shape, (1, 3, 64, 64))
 
     def test_evaluation_device_resolution(self) -> None:
         self.assertEqual(_resolve_device("cpu"), torch.device("cpu"))

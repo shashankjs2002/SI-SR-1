@@ -12,7 +12,11 @@ import torch
 from geodiff_gan.config import load_config
 from geodiff_gan.data.manifest import ManifestRecord, write_manifest
 from geodiff_gan.training import Trainer
-from geodiff_gan.training.checkpoint import latest_stage_checkpoint
+from geodiff_gan.training.checkpoint import (
+    best_stage_checkpoint,
+    latest_stage_checkpoint,
+    prune_stage_epoch_checkpoints,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -87,6 +91,10 @@ class TrainingSmokeTest(unittest.TestCase):
             )
             Trainer(config).train()
             self.assertTrue((root / "run" / "base_epoch_0000.pt").exists())
+            self.assertEqual(
+                best_stage_checkpoint(root / "run", "base"),
+                root / "run" / "base_best.pt",
+            )
             self.assertTrue((root / "run" / "training_history.jsonl").exists())
             self.assertTrue((root / "run" / "training_curves.png").exists())
             self.assertTrue((root / "run" / "latest_metrics.json").exists())
@@ -116,6 +124,29 @@ class TrainingSmokeTest(unittest.TestCase):
             latest = latest_stage_checkpoint(root, "base")
             self.assertEqual(latest, root / "base_epoch_0010.pt")
 
+    def test_checkpoint_pruning_keeps_only_latest_epoch_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkpoints = [
+                root / "base_epoch_0000.pt",
+                root / "base_epoch_0001.pt",
+                root / "base_epoch_0002.pt",
+            ]
+            for checkpoint in checkpoints:
+                checkpoint.touch()
+            (root / "base_best.pt").touch()
+
+            prune_stage_epoch_checkpoints(
+                root,
+                "base",
+                keep=checkpoints[-1],
+            )
+
+            self.assertEqual(
+                sorted(path.name for path in root.glob("base*.pt")),
+                ["base_best.pt", "base_epoch_0002.pt"],
+            )
+
     def test_auto_resume_continues_from_next_epoch(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -144,6 +175,8 @@ class TrainingSmokeTest(unittest.TestCase):
             trainer.train()
 
             self.assertTrue((output / "base_epoch_0001.pt").exists())
+            self.assertFalse((output / "base_epoch_0000.pt").exists())
+            self.assertTrue((output / "base_best.pt").exists())
             history = [
                 json.loads(line)
                 for line in (output / "training_history.jsonl")
@@ -151,6 +184,79 @@ class TrainingSmokeTest(unittest.TestCase):
                 .splitlines()
             ]
             self.assertEqual([entry["epoch"] for entry in history], [0, 1])
+
+    def test_early_stopping_uses_validation_metric(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, config = self._fixture(root, include_validation=True)
+            output = root / "early_stop"
+            config["training"].update(
+                {
+                    "stage": "base",
+                    "epochs": 8,
+                    "output_dir": str(output),
+                    "early_stopping_patience": 2,
+                    "early_stopping_min_epochs": 2,
+                    "early_stopping_min_delta": 0.0,
+                }
+            )
+            trainer = Trainer(config)
+            validation_results = [
+                {"val_l1": 0.1},
+                {"val_l1": 0.11},
+                {"val_l1": 0.12},
+            ]
+            with mock.patch.object(
+                trainer,
+                "_validate",
+                side_effect=validation_results,
+            ):
+                trainer.train()
+
+            history = [
+                json.loads(line)
+                for line in (output / "training_history.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            self.assertEqual(len(history), 3)
+            self.assertTrue((output / "base_best.pt").exists())
+            self.assertTrue((output / "base_epoch_0002.pt").exists())
+            self.assertFalse((output / "base_epoch_0001.pt").exists())
+
+    def test_early_stopping_ignores_epochs_without_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, config = self._fixture(root, include_validation=True)
+            output = root / "sparse_validation"
+            config["training"].update(
+                {
+                    "stage": "base",
+                    "epochs": 3,
+                    "output_dir": str(output),
+                    "validate_every": 2,
+                    "early_stopping_patience": 1,
+                    "early_stopping_min_epochs": 1,
+                }
+            )
+            trainer = Trainer(config)
+            with mock.patch.object(
+                trainer,
+                "_validate",
+                return_value={"val_l1": 0.1},
+            ) as validate:
+                trainer.train()
+
+            self.assertEqual(validate.call_count, 1)
+            history = [
+                json.loads(line)
+                for line in (output / "training_history.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            self.assertEqual(len(history), 3)
+            self.assertTrue((output / "base_best.pt").exists())
+            self.assertTrue((output / "base_epoch_0002.pt").exists())
 
     def test_remaining_training_stages(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

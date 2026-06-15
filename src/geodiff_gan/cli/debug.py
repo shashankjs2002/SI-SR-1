@@ -23,6 +23,11 @@ def main() -> None:
     parser.add_argument("--mode", choices=("sr", "edit"), default="sr")
     parser.add_argument("--prompt")
     parser.add_argument("--steps", type=int, default=20)
+    parser.add_argument(
+        "--back-projection-steps",
+        type=int,
+        help="Override SR/edit back-projection iterations for ablation.",
+    )
     parser.add_argument("--guidance", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--diffusion-every", type=int, default=5)
@@ -36,6 +41,8 @@ def main() -> None:
         default=None,
     )
     args = parser.parse_args()
+    if args.back_projection_steps is not None and args.back_projection_steps < 0:
+        parser.error("--back-projection-steps must be non-negative")
 
     config = load_config(args.config)
     debug_config = config.get("debug", {})
@@ -97,6 +104,7 @@ def main() -> None:
             projection_lr=clean_lr,
             mode=args.mode,
             sample_steps=args.steps,
+            back_projection_steps=args.back_projection_steps,
             guidance_scale=args.guidance,
             null_context=null_context,
             generator=generator,

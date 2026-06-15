@@ -42,8 +42,11 @@ from ..models.system import GeoDiffGAN
 from ..metrics import basic_metrics
 from ..text import PromptBatch, TextEncoder, augment_prompts, build_text_encoder
 from .checkpoint import (
+    best_stage_checkpoint,
+    copy_checkpoint,
     latest_stage_checkpoint,
     load_checkpoint,
+    prune_stage_epoch_checkpoints,
     save_checkpoint,
     unwrap,
 )
@@ -134,6 +137,7 @@ class Trainer:
         self.amp_enabled = amp_enabled
         self.scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
         self.start_epoch = 0
+        self.resume_extra: dict[str, Any] = {}
         if resume:
             payload = load_checkpoint(resume, self.model, self.optimizer, strict=False)
             checkpoint_stage = payload.get("stage")
@@ -144,6 +148,7 @@ class Trainer:
                 )
             self.start_epoch = int(payload["epoch"]) + 1
             extra = payload.get("extra", {})
+            self.resume_extra = extra
             if "patch_discriminator" in extra:
                 unwrap(self.patch_discriminator).load_state_dict(extra["patch_discriminator"])
             if "wavelet_discriminator" in extra:
@@ -171,6 +176,20 @@ class Trainer:
         if minutes:
             return f"{minutes:d}m{seconds:02d}s"
         return f"{seconds:d}s"
+
+    @staticmethod
+    def _checkpoint_improved(
+        value: float,
+        best: float | None,
+        mode: str,
+    ) -> bool:
+        if best is None:
+            return True
+        if mode == "min":
+            return value < best
+        if mode == "max":
+            return value > best
+        raise ValueError("training.checkpoint_mode must be 'min' or 'max'")
 
     def _synchronize_model_gradients(self) -> None:
         if not self.distributed:
@@ -359,6 +378,7 @@ class Trainer:
             losses["vae_reconstruction"] = charbonnier(reconstruction, target_residual)
             losses["kl"] = kl_loss(mean, log_variance)
             losses["charbonnier"] = charbonnier(prediction, hr)
+            losses["gradient"] = gradient_loss(prediction, hr)
             losses["wavelet"] = wavelet_loss(prediction, hr)
             losses["evidence_calibration"] = evidence_calibration_loss(
                 mapped.evidence_confidence,
@@ -367,6 +387,12 @@ class Trainer:
                 temperature=float(
                     self.config["training"].get(
                         "evidence_calibration_temperature", 0.05
+                    )
+                ),
+                selectivity_weight=float(
+                    self.config["training"].get(
+                        "evidence_selectivity_weight",
+                        0.0,
                     )
                 ),
             )
@@ -459,6 +485,10 @@ class Trainer:
             losses["perceptual"] = self.perceptual(
                 reconstruction, reconstruction_target
             )
+            losses["gradient"] = gradient_loss(
+                reconstruction,
+                reconstruction_target,
+            )
             losses["wavelet"] = wavelet_loss(
                 reconstruction, reconstruction_target
             )
@@ -467,6 +497,7 @@ class Trainer:
             losses["charbonnier"] = zero
             losses["ssim"] = zero
             losses["perceptual"] = zero
+            losses["gradient"] = zero
             losses["wavelet"] = zero
         losses["consistency"] = degradation_consistency(
             prediction,
@@ -482,6 +513,12 @@ class Trainer:
             temperature=float(
                 self.config["training"].get(
                     "evidence_calibration_temperature", 0.05
+                )
+            ),
+            selectivity_weight=float(
+                self.config["training"].get(
+                    "evidence_selectivity_weight",
+                    0.0,
                 )
             ),
         )
@@ -684,6 +721,73 @@ class Trainer:
             with (output_dir / "resolved_config.json").open("w", encoding="utf-8") as handle:
                 json.dump(self.config, handle, indent=2)
         validate_every = max(1, int(training.get("validate_every", 1)))
+        keep_best_and_latest = bool(
+            training.get("keep_best_and_latest", True)
+        )
+        checkpoint_metric = str(
+            training.get("checkpoint_metric", "val_l1")
+        )
+        checkpoint_mode = str(
+            training.get("checkpoint_mode", "min")
+        ).lower()
+        if checkpoint_mode not in ("min", "max"):
+            raise ValueError("training.checkpoint_mode must be 'min' or 'max'")
+        best_checkpoint_path = output_dir / f"{self.stage}_best.pt"
+        best_checkpoint_value: float | None = None
+        best_checkpoint_metric: str | None = None
+        existing_best = best_stage_checkpoint(output_dir, self.stage)
+        if existing_best is not None:
+            best_payload = torch.load(
+                existing_best,
+                map_location="cpu",
+                weights_only=False,
+            )
+            selection = best_payload.get("extra", {}).get(
+                "checkpoint_selection",
+                {},
+            )
+            if (
+                selection.get("mode") == checkpoint_mode
+                and selection.get("value") is not None
+            ):
+                best_checkpoint_metric = str(selection["metric"])
+                best_checkpoint_value = float(selection["value"])
+        early_stopping_patience = max(
+            0,
+            int(training.get("early_stopping_patience", 0)),
+        )
+        early_stopping_min_epochs = max(
+            0,
+            int(training.get("early_stopping_min_epochs", 0)),
+        )
+        early_stopping_min_delta = max(
+            0.0,
+            float(training.get("early_stopping_min_delta", 0.0)),
+        )
+        early_stopping_metric = str(
+            training.get("early_stopping_metric", checkpoint_metric)
+        )
+        early_stopping_mode = str(
+            training.get("early_stopping_mode", checkpoint_mode)
+        ).lower()
+        if early_stopping_mode not in ("min", "max"):
+            raise ValueError(
+                "training.early_stopping_mode must be 'min' or 'max'"
+            )
+        resumed_early_state = self.resume_extra.get("early_stopping", {})
+        if (
+            resumed_early_state.get("mode") == early_stopping_mode
+            and resumed_early_state.get("best_value") is not None
+        ):
+            early_stopping_metric = str(resumed_early_state["metric"])
+            early_best_value = float(resumed_early_state["best_value"])
+        else:
+            early_best_value = None
+        early_bad_epochs = (
+            int(resumed_early_state.get("bad_epochs", 0))
+            if early_best_value is not None
+            else 0
+        )
         progress_mode = str(training.get("progress_mode", "compact")).lower()
         if progress_mode not in ("compact", "tqdm", "quiet"):
             raise ValueError(
@@ -898,6 +1002,7 @@ class Trainer:
                 and (epoch + 1) % validate_every == 0
             ):
                 validation_metrics = self._validate(validation_loader, epoch)
+            stop_training = False
             if self.is_main:
                 denominator = max(len(loader), 1)
                 epoch_metrics = {
@@ -905,6 +1010,88 @@ class Trainer:
                 }
                 epoch_metrics.update(validation_metrics)
                 checkpoint_path = output_dir / f"{self.stage}_epoch_{epoch:04d}.pt"
+                selection_metric = checkpoint_metric
+                selection_value = epoch_metrics.get(selection_metric)
+                if selection_value is None:
+                    if "val_loss_total" in epoch_metrics:
+                        selection_metric = "val_loss_total"
+                        selection_value = epoch_metrics[selection_metric]
+                    elif len(validation_loader.dataset) == 0:
+                        selection_metric = "total"
+                        selection_value = epoch_metrics.get(selection_metric)
+                if (
+                    selection_value is not None
+                    and best_checkpoint_metric != selection_metric
+                ):
+                    best_checkpoint_metric = selection_metric
+                    best_checkpoint_value = None
+                is_best = (
+                    selection_value is not None
+                    and self._checkpoint_improved(
+                        float(selection_value),
+                        best_checkpoint_value,
+                        checkpoint_mode,
+                    )
+                )
+                checkpoint_selection = {
+                    "metric": selection_metric,
+                    "mode": checkpoint_mode,
+                    "value": (
+                        float(selection_value)
+                        if selection_value is not None
+                        else None
+                    ),
+                    "is_best": is_best,
+                }
+                early_metric_used = early_stopping_metric
+                early_value = epoch_metrics.get(early_metric_used)
+                if early_value is None:
+                    if "val_loss_total" in epoch_metrics:
+                        early_metric_used = "val_loss_total"
+                        early_value = epoch_metrics[early_metric_used]
+                    elif len(validation_loader.dataset) == 0:
+                        early_metric_used = "total"
+                        early_value = epoch_metrics.get(early_metric_used)
+                if (
+                    early_value is not None
+                    and early_metric_used != early_stopping_metric
+                ):
+                    early_stopping_metric = early_metric_used
+                    early_best_value = None
+                    early_bad_epochs = 0
+                if early_value is not None:
+                    early_value = float(early_value)
+                    if early_best_value is None:
+                        early_improved = True
+                    elif early_stopping_mode == "min":
+                        early_improved = (
+                            early_value
+                            < early_best_value - early_stopping_min_delta
+                        )
+                    else:
+                        early_improved = (
+                            early_value
+                            > early_best_value + early_stopping_min_delta
+                        )
+                    if early_improved:
+                        early_best_value = early_value
+                        early_bad_epochs = 0
+                    else:
+                        early_bad_epochs += 1
+                    stop_training = (
+                        early_stopping_patience > 0
+                        and epoch + 1 >= early_stopping_min_epochs
+                        and early_bad_epochs >= early_stopping_patience
+                    )
+                early_stopping_state = {
+                    "metric": early_stopping_metric,
+                    "mode": early_stopping_mode,
+                    "best_value": early_best_value,
+                    "bad_epochs": early_bad_epochs,
+                    "patience": early_stopping_patience,
+                    "min_delta": early_stopping_min_delta,
+                    "stopped": stop_training,
+                }
                 if use_tqdm:
                     epoch_progress.set_postfix(
                         train_loss=f"{epoch_metrics.get('total', float('nan')):.4f}",
@@ -923,6 +1110,8 @@ class Trainer:
                     self.config,
                     extra={
                         "metrics": epoch_metrics,
+                        "checkpoint_selection": checkpoint_selection,
+                        "early_stopping": early_stopping_state,
                         "patch_discriminator": unwrap(self.patch_discriminator).state_dict(),
                         "wavelet_discriminator": unwrap(
                             self.wavelet_discriminator
@@ -931,6 +1120,15 @@ class Trainer:
                         "scaler": self.scaler.state_dict(),
                     },
                 )
+                if keep_best_and_latest:
+                    if is_best:
+                        copy_checkpoint(checkpoint_path, best_checkpoint_path)
+                        best_checkpoint_value = float(selection_value)
+                    prune_stage_epoch_checkpoints(
+                        output_dir,
+                        self.stage,
+                        keep=checkpoint_path,
+                    )
                 append_training_history(
                     output_dir / "training_history.jsonl",
                     epoch=epoch,
@@ -958,8 +1156,36 @@ class Trainer:
                             f" val_psnr={epoch_metrics['val_psnr']:.2f}"
                             f" val_ssim={epoch_metrics['val_ssim']:.4f}"
                         )
+                    if keep_best_and_latest and is_best:
+                        summary += (
+                            f" best_{selection_metric}="
+                            f"{float(selection_value):.6f}"
+                        )
+                    if early_stopping_patience > 0:
+                        summary += (
+                            f" early_stop={early_bad_epochs}/"
+                            f"{early_stopping_patience}"
+                        )
                     summary += (
                         f" elapsed={self._duration(time.monotonic() - stage_started)} "
                         f"stage_eta={self._duration(stage_eta)}"
                     )
                     print(summary, flush=True)
+                if stop_training:
+                    print(
+                        f"[{self.stage}] early stopping after epoch {epoch + 1}: "
+                        f"{early_stopping_metric} did not improve by "
+                        f"{early_stopping_min_delta:g} for "
+                        f"{early_bad_epochs} validation checks",
+                        flush=True,
+                    )
+            if self.distributed:
+                stop_tensor = torch.tensor(
+                    int(stop_training),
+                    device=self.device,
+                    dtype=torch.int32,
+                )
+                torch.distributed.broadcast(stop_tensor, src=0)
+                stop_training = bool(stop_tensor.item())
+            if stop_training:
+                break

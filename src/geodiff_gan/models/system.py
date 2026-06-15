@@ -57,6 +57,7 @@ class GeoDiffGAN(nn.Module):
         mapper_channels: int = 128,
         style_dim: int = 256,
         decoder_channels: tuple[int, ...] = (128, 96, 64, 48),
+        decoder_upsample_mode: str = "pixelshuffle",
         diffusion_steps: int = 1000,
         use_text_conditioning: bool = True,
         use_degradation_conditioning: bool = True,
@@ -110,6 +111,7 @@ class GeoDiffGAN(nn.Module):
             style_dim=style_dim,
             lr_channels=lr_channels,
             stage_channels=decoder_channels,
+            upsample_mode=decoder_upsample_mode,
         )
 
     @classmethod
@@ -130,6 +132,10 @@ class GeoDiffGAN(nn.Module):
             mapper_channels=model.get("mapper_channels", 128),
             style_dim=model.get("style_dim", 256),
             decoder_channels=tuple(model.get("decoder_channels", [128, 96, 64, 48])),
+            decoder_upsample_mode=model.get(
+                "decoder_upsample_mode",
+                "pixelshuffle",
+            ),
             diffusion_steps=model.get("diffusion_steps", 1000),
             use_text_conditioning=model.get("use_text_conditioning", True),
             use_degradation_conditioning=model.get("use_degradation_conditioning", True),
@@ -482,6 +488,7 @@ class GeoDiffGAN(nn.Module):
         diagnostics: DiagnosticRecorder | None = None,
         diffusion_debug_interval: int = 0,
         projection_lr: torch.Tensor | None = None,
+        back_projection_steps: int | None = None,
         base: torch.Tensor | None = None,
         lr_features: list[torch.Tensor] | None = None,
     ) -> GeoDiffOutput:
@@ -520,6 +527,7 @@ class GeoDiffGAN(nn.Module):
             mode,
             base=base,
             projection_lr=projection_lr,
+            back_projection_steps=back_projection_steps,
             diagnostics=diagnostics,
             conditioning_prepared=True,
             lr_features=lr_features,
