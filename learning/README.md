@@ -42,6 +42,18 @@ and a visually sharp satellite image is not automatically a spatially faithful r
 | 14 | [Kaggle execution and research workflow](14_kaggle_and_research_workflow.md) | Run experiments reproducibly and organize evidence |
 | 15 | [Paper, thesis, and viva guide](15_paper_thesis_and_viva.md) | Explain and defend the work precisely |
 | 16 | [Parameter counts and training configuration](16_parameter_counts_and_training_configuration.md) | Audit capacity, stage freezing, optimizers, and update counts |
+| 17 | [Small model six-tile diagnostic analysis](17_small_six_tile_diagnostic_analysis.md) | Interpret residual, confidence, frequency, wavelet, edge, and projection diagnostics |
+| 18 | [Sensor back-projection](18_sensor_back_projection.md) | Derive and trace the complete sensor-consistency correction |
+| 19 | [Deterministic SwinIR base](19_swinir_deterministic_base.md) | Understand conservative window-attention reconstruction |
+| 20 | [Residual VAE](20_residual_vae.md) | Derive the residual latent representation and KL training |
+| 21 | [Multi-scale LR feature encoder](21_lr_feature_encoder.md) | Trace spatial evidence features across resolutions |
+| 22 | [Conditional latent diffusion](22_conditional_latent_diffusion.md) | Derive velocity training, U-Net conditioning, and DDIM sampling |
+| 23 | [GeoMapper and dual-policy gating](23_geomapper_dual_policy.md) | Understand spatial content, styles, evidence, and edit permission |
+| 24 | [Dual-head FiLM SR decoder](24_dual_head_sr_decoder.md) | Trace detail and edit residual generation |
+| 25 | [Dual-discriminator GAN](25_dual_discriminator_gan.md) | Understand multi-scale PatchGAN and wavelet critics |
+| 26 | [Text and prompt conditioning](26_text_prompt_conditioning.md) | Trace frozen text embeddings, guidance, and alignment |
+| 27 | [Uncertainty and abstention](27_uncertainty_and_abstention.md) | Quantify stochastic disagreement and reliability-aware blending |
+| 28 | [Complete system integration](28_complete_system_integration.md) | Join all modules, equations, tensor shapes, and training stages |
 
 ## Recommended Pace
 
@@ -50,7 +62,8 @@ flowchart LR
     A["Week 1<br/>Ch. 00-03<br/>Foundations"] -->
     B["Week 2<br/>Ch. 04-07<br/>Generative SR"] -->
     C["Week 3<br/>Ch. 08-10<br/>GeoDiff-GAN"] -->
-    D["Week 4<br/>Ch. 11-15<br/>Evaluation and research"]
+    D["Week 4<br/>Ch. 11-18<br/>Evaluation and research"] -->
+    E["Week 5<br/>Ch. 19-28<br/>Module internals"]
 ```
 
 For each chapter:
