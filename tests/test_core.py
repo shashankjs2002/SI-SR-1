@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -319,6 +320,110 @@ class CoreTests(unittest.TestCase):
             self.assertTrue(torch.equal(first["lr"], second["lr"]))
             self.assertTrue(torch.equal(first["clean_lr"], second["clean_lr"]))
             self.assertTrue(torch.equal(first["degradation"], second["degradation"]))
+
+    def test_dataset_reads_multi_caption_jsonl_with_relative_patch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            patch = root / "HR" / "AYODHYA" / "patch.npz"
+            patch.parent.mkdir(parents=True)
+            np.savez_compressed(
+                patch,
+                hr=np.random.default_rng(4).random((3, 64, 64)).astype(np.float32),
+            )
+            manifest = root / "manifest.jsonl"
+            write_manifest(
+                manifest,
+                [
+                    ManifestRecord(
+                        patch=str(patch),
+                        tile_id="TEST_TILE",
+                        split="train",
+                        row=0,
+                        col=0,
+                        valid_fraction=1.0,
+                    )
+                ],
+            )
+            captions = root / "captions.jsonl"
+            captions.write_text(
+                json.dumps(
+                    {
+                        "patch": "HR/AYODHYA/patch.npz",
+                        "tile_id": "TEST_TILE",
+                        "caption": "fallback caption",
+                        "captions": {
+                            "brief": "brief caption",
+                            "descriptive": "descriptive caption",
+                            "analytical": {"land_cover": ["built-up area"]},
+                        },
+                    },
+                    ensure_ascii=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            dataset = SentinelPatchDataset(
+                manifest,
+                split="train",
+                caption_file=captions,
+                caption_field="brief",
+                augment=False,
+            )
+            self.assertEqual(dataset[0]["caption"], "brief caption")
+
+    def test_dataset_random_caption_sampling_uses_caption_variants(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            patch = root / "HR" / "AYODHYA" / "patch.npz"
+            patch.parent.mkdir(parents=True)
+            np.savez_compressed(
+                patch,
+                hr=np.random.default_rng(5).random((3, 64, 64)).astype(np.float32),
+            )
+            manifest = root / "manifest.jsonl"
+            write_manifest(
+                manifest,
+                [
+                    ManifestRecord(
+                        patch=str(patch),
+                        tile_id="TEST_TILE",
+                        split="train",
+                        row=0,
+                        col=0,
+                        valid_fraction=1.0,
+                    )
+                ],
+            )
+            captions = root / "captions.jsonl"
+            captions.write_text(
+                json.dumps(
+                    {
+                        "patch": "HR/AYODHYA/patch.npz",
+                        "tile_id": "TEST_TILE",
+                        "caption": "fallback caption",
+                        "captions": {
+                            "brief": "brief caption",
+                            "descriptive": "descriptive caption",
+                            "analytical": "analytical caption",
+                        },
+                    },
+                    ensure_ascii=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            dataset = SentinelPatchDataset(
+                manifest,
+                split="train",
+                caption_file=captions,
+                caption_sampling="random",
+                augment=False,
+                random_degradation=False,
+            )
+            self.assertIn(
+                dataset[0]["caption"],
+                {"brief caption", "descriptive caption", "analytical caption"},
+            )
 
     def test_adaptive_edge_f1_handles_low_contrast_edges(self) -> None:
         target = torch.full((1, 3, 32, 32), 0.2)

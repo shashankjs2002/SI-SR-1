@@ -216,12 +216,31 @@ class Trainer:
 
     def _loader(self, split: str) -> DataLoader:
         data = self.config["data"]
+        is_train = split == "train"
+        train_degradation_sampling = str(
+            data.get("train_degradation_sampling", "random")
+        )
+        if train_degradation_sampling not in ("random", "fixed"):
+            raise ValueError("data.train_degradation_sampling must be 'random' or 'fixed'")
         dataset = SentinelPatchDataset(
             data["manifest"],
             split=split,
             scale=self.config["model"].get("scale", 4),
             caption_file=data.get("captions"),
-            augment=split == "train",
+            caption_field=data.get("caption_field", "caption"),
+            caption_sampling=(
+                data.get("caption_sampling", "fixed") if is_train else "fixed"
+            ),
+            random_caption_fields=tuple(
+                data.get(
+                    "random_caption_fields",
+                    ("brief", "descriptive", "analytical"),
+                )
+            ),
+            augment=is_train,
+            random_degradation=(
+                is_train and train_degradation_sampling == "random"
+            ),
             degradation_seed=int(data.get("degradation_seed", 0)),
             degradation_severity=data.get("degradation_severity", "mild"),
         )

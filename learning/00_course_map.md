@@ -150,6 +150,7 @@ You should finish the course able to answer:
 6. Why is a low LR error necessary but not sufficient for faithful SR?
 7. Why are tile-level splits essential?
 8. Which proposed contributions require ablation before they can be called novel?
+9. How are offline satellite captions generated, sanitized, and consumed by the text encoder?
 
 ## Exercise
 
@@ -172,3 +173,5 @@ plausible detail; it does not observe missing sub-pixel information.
 - [ ] I can explain SR mode and edit mode without conflating their claims.
 
 Next: [01 - Mathematical Foundations](01_mathematical_foundations.md).
+
+Captioning appendix: [30 - Caption Generation Pipeline](30_caption_generation_pipeline.md).

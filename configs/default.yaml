@@ -29,6 +29,10 @@ model:
 data:
   manifest: data/manifest.jsonl
   captions: data/captions.jsonl
+  caption_field: caption
+  caption_sampling: fixed
+  random_caption_fields: [brief, descriptive, analytical]
+  train_degradation_sampling: random
   degradation_seed: 42
   degradation_severity: mild
 

@@ -52,7 +52,10 @@ def main() -> None:
         split=args.split,
         scale=config["model"].get("scale", 4),
         caption_file=config["data"].get("captions"),
+        caption_field=config["data"].get("caption_field", "caption"),
+        caption_sampling="fixed",
         augment=False,
+        random_degradation=False,
         degradation_seed=int(config["data"].get("degradation_seed", 0)),
         degradation_severity=config["data"].get("degradation_severity", "mild"),
     )
