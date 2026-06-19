@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 
 
@@ -57,11 +57,15 @@ def validate_tile_split_isolation(records: list[ManifestRecord]) -> None:
 
 def load_manifest(path: str | Path, split: str | None = None) -> list[ManifestRecord]:
     records = []
+    record_fields = {field.name for field in fields(ManifestRecord)}
     with Path(path).open("r", encoding="utf-8") as handle:
         for line in handle:
             if not line.strip():
                 continue
-            record = ManifestRecord(**json.loads(line))
+            value = json.loads(line)
+            record = ManifestRecord(
+                **{key: item for key, item in value.items() if key in record_fields}
+            )
             if split is None or record.split == split:
                 records.append(record)
     return records

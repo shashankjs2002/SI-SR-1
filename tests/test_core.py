@@ -454,6 +454,28 @@ class CoreTests(unittest.TestCase):
             loaded = load_manifest(manifest)
             self.assertEqual(loaded[0], record)
 
+    def test_manifest_loader_ignores_optional_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = Path(directory) / "manifest.jsonl"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "patch": "patch.npz",
+                        "tile_id": "43PGQ",
+                        "split": "train",
+                        "row": 0,
+                        "col": 0,
+                        "valid_fraction": 1.0,
+                        "split_block": [0, 1],
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            loaded = load_manifest(manifest)
+            self.assertEqual(len(loaded), 1)
+            self.assertEqual(loaded[0].tile_id, "43PGQ")
+
     def test_safe_product_prefixes_override_dataset_splits(self) -> None:
         self.assertEqual(
             split_for_product(
