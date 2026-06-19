@@ -25,6 +25,12 @@ caption = [
   "transformers>=4.57",
 ]
 metrics = ["lpips>=0.1.4", "DISTS-pytorch>=0.1"]
+benchmark = [
+  "einops>=0.8",
+  "matplotlib>=3.8",
+  "pandas>=2",
+  "timm>=1.0.15",
+]
 dev = ["pytest>=8", "ruff>=0.5"]
 
 [project.scripts]
@@ -36,6 +42,7 @@ geodiff-evaluate = "geodiff_gan.cli.evaluate:main"
 geodiff-baselines = "geodiff_gan.cli.baselines:main"
 geodiff-debug = "geodiff_gan.cli.debug:main"
 geodiff-parameters = "geodiff_gan.cli.parameters:main"
+geodiff-benchmark-sota = "geodiff_gan.cli.benchmark_sota:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
