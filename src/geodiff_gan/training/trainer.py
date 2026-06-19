@@ -92,7 +92,7 @@ class Trainer:
         if init_checkpoint and not resume:
             load_checkpoint(init_checkpoint, self.model, strict=False)
         self.text_encoder: TextEncoder | None = None
-        if self.stage != "base":
+        if self.stage != "base" and self.model.use_text_conditioning:
             self.text_encoder = build_text_encoder(config).to(self.device).eval()
             self.text_encoder.requires_grad_(False)
             if self.text_encoder.context_dim != self.model.context_dim:
@@ -279,7 +279,13 @@ class Trainer:
             captions = augmented.prompts
             prompt_kinds = augmented.kinds
         if self.text_encoder is None:
-            raise RuntimeError(f"Stage {self.stage} requires a configured text encoder")
+            context = torch.zeros(
+                len(captions),
+                1,
+                self.model.context_dim,
+                device=self.device,
+            )
+            return context, context.clone(), captions, prompt_kinds
         context = self.text_encoder(captions)
         null_context = self.text_encoder([""] * len(captions))
         return (

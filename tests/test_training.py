@@ -112,6 +112,31 @@ class TrainingSmokeTest(unittest.TestCase):
             ):
                 self.assertIn(metric, latest["metrics"])
 
+    def test_nonbase_stage_can_disable_text_encoder(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, config = self._fixture(root)
+            config["model"]["use_text_conditioning"] = False
+            config["training"].update(
+                {
+                    "stage": "diffusion",
+                    "output_dir": str(root / "run"),
+                }
+            )
+            with mock.patch(
+                "geodiff_gan.training.trainer.build_text_encoder"
+            ) as build_text_encoder:
+                trainer = Trainer(config)
+            build_text_encoder.assert_not_called()
+            context, null_context, prompts, kinds = trainer._contexts(
+                ["caption-free sample"],
+                training=False,
+            )
+            self.assertEqual(tuple(context.shape), (1, 1, trainer.model.context_dim))
+            self.assertTrue(torch.equal(context, null_context))
+            self.assertEqual(prompts, ["caption-free sample"])
+            self.assertEqual(kinds, ["original"])
+
     def test_latest_stage_checkpoint_uses_numeric_epoch_order(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
