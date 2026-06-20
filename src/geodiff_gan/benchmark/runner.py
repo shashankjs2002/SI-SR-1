@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import random
+import subprocess
 import time
 from collections import defaultdict
 from dataclasses import dataclass
@@ -57,6 +59,7 @@ class BenchmarkConfig:
     source_root: Path
     manifest: Path
     output: Path
+    architecture_mode: str = "official"
     max_updates: int = 50000
     batch_size: int = 1
     accumulation: int = 8
@@ -95,6 +98,29 @@ def _seed_everything(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def _source_revision(source_root: Path, model: str) -> str | None:
+    repository = source_root / MODEL_SPECS[model].directory
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repository,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    return result.stdout.strip() or None
+
+
+def _model_signature(model: nn.Module) -> str:
+    layout = "\n".join(
+        f"{name}:{tuple(value.shape)}:{value.dtype}"
+        for name, value in model.state_dict().items()
+    )
+    return hashlib.sha256(layout.encode("utf-8")).hexdigest()
 
 
 def _dataset(config: BenchmarkConfig, split: str, augment: bool) -> SentinelPatchDataset:
@@ -194,7 +220,12 @@ def train(config: BenchmarkConfig) -> dict[str, Any]:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
-    model = build_benchmark_model(config.model, config.source_root).to(device)
+    model = build_benchmark_model(
+        config.model,
+        config.source_root,
+        architecture_mode=config.architecture_mode,
+    ).to(device)
+    model_signature = _model_signature(model)
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
     train_dataset = CroppedDataset(
         _dataset(config, "train", augment=True),
@@ -231,6 +262,18 @@ def train(config: BenchmarkConfig) -> dict[str, Any]:
     stale_validations = 0
     if latest_path.exists():
         state = torch.load(latest_path, map_location="cpu", weights_only=False)
+        checkpoint_mode = state.get("architecture_mode")
+        if checkpoint_mode != config.architecture_mode:
+            raise RuntimeError(
+                f"Checkpoint architecture_mode={checkpoint_mode!r} does not match "
+                f"requested mode={config.architecture_mode!r}. Use a separate output "
+                "directory; do not resume incompatible adapted and official models."
+            )
+        if state.get("model_signature") != model_signature:
+            raise RuntimeError(
+                "Checkpoint model signature does not match the selected official "
+                "preset. Use a new output directory instead of mixing architectures."
+            )
         model.load_state_dict(state["model"])
         optimizer.load_state_dict(state["optimizer"])
         scheduler.load_state_dict(state["scheduler"])
@@ -242,8 +285,10 @@ def train(config: BenchmarkConfig) -> dict[str, Any]:
     metadata = {
         "model": config.model,
         "spec": MODEL_SPECS[config.model].__dict__,
+        "source_revision": _source_revision(config.source_root, config.model),
         "parameters": parameter_count,
-        "pixelshuffle": False,
+        "architecture_mode": config.architecture_mode,
+        "model_signature": model_signature,
         "config": {
             key: str(value) if isinstance(value, Path) else value
             for key, value in config.__dict__.items()
@@ -325,6 +370,8 @@ def train(config: BenchmarkConfig) -> dict[str, Any]:
                 "update": update,
                 "best_l1": best_l1,
                 "stale_validations": stale_validations,
+                "architecture_mode": config.architecture_mode,
+                "model_signature": model_signature,
             }
             torch.save(state, latest_path)
             if improved:

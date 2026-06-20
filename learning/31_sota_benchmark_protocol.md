@@ -83,28 +83,19 @@ gradient clipping, cosine schedule, validation cadence, and early-stopping rule.
 This tests architecture quality under one satellite-specific objective. It does
 not reproduce each paper's original training recipe.
 
-## No-PixelShuffle constraint
+## Architecture fidelity
 
-The official attention/state-space/aggregation backbones are retained. Their
-sub-pixel reconstruction heads are replaced with a shared two-stage
-resize-convolution head.
+The main benchmark uses `architecture_mode=official`. It retains each official
+repository's released x4 architecture, including the original PixelShuffle,
+sub-pixel, or MoE reconstruction head where applicable.
 
-MFG-HMoE uses a specialized resize-convolution head that retains:
+The models are retrained with a shared Sentinel-2 data and optimization
+protocol. This is a controlled architecture comparison, not a reproduction of
+each paper's original dataset and schedule.
 
-- heterogeneous 1 x 1 and 3 x 3 experts;
-- dual group/expert routing;
-- spatial routing features from multilevel aggregation.
-
-Every constructed model is scanned for `torch.nn.PixelShuffle`; training stops
-if one remains.
-
-The resulting names must be written as:
-
-- `SwinIR + resize-conv adapter`;
-- `HAT-S + resize-conv adapter`;
-- and so on.
-
-They are not exact reproductions of published upsampling heads.
+`architecture_mode=resize_conv_ablation` is optional. It replaces the official
+heads and changes the architectures. Such results must be labelled as
+adaptations and cannot be used as faithful competitor baselines.
 
 ## Recommended experiment sequence
 
@@ -115,6 +106,9 @@ They are not exact reproductions of published upsampling heads.
 4. Run `paper` for 50,000 updates only on the shortlisted models.
 5. Repeat the final comparison on geographically unseen tiles.
 6. Report parameter count, GPU memory, training time, and inference time.
+
+Official and adapted modes use separate output directories. The checkpoint
+loader rejects attempts to resume one mode from the other.
 
 ## Interpretation
 

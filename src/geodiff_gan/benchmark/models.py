@@ -45,7 +45,7 @@ MODEL_SPECS: dict[str, ModelSpec] = {
         False,
     ),
     "srformer": ModelSpec(
-        "SRFormer-light",
+        "SRFormer",
         "SRFormer: Permuted Self-Attention for Single Image Super-Resolution",
         2023,
         "ICCV",
@@ -54,7 +54,7 @@ MODEL_SPECS: dict[str, ModelSpec] = {
         False,
     ),
     "dat": ModelSpec(
-        "DAT-light",
+        "DAT",
         "Dual Aggregation Transformer for Image Super-Resolution",
         2023,
         "ICCV",
@@ -345,12 +345,12 @@ def _build_swinir(root: Path) -> nn.Module:
         depths=(6, 6, 6, 6, 6, 6),
         num_heads=(6, 6, 6, 6, 6, 6),
         window_size=8,
-        mlp_ratio=4,
+        mlp_ratio=2,
         upscale=4,
         img_range=1.0,
         upsampler="",
         resi_connection="1conv",
-        use_checkpoint=True,
+        use_checkpoint=False,
     )
     return TransformerBackboneSR(backbone, 180)
 
@@ -374,7 +374,7 @@ def _build_hat(root: Path) -> nn.Module:
         img_range=1.0,
         upsampler="",
         resi_connection="1conv",
-        use_checkpoint=True,
+        use_checkpoint=False,
     )
     return TransformerBackboneSR(backbone, 144)
 
@@ -392,12 +392,12 @@ def _build_srformer(root: Path) -> nn.Module:
         package_path=arch_path,
     )
     backbone = module.SRFormer(
-        img_size=64,
+        img_size=48,
         in_chans=3,
         embed_dim=180,
         depths=(6, 6, 6, 6, 6, 6),
         num_heads=(6, 6, 6, 6, 6, 6),
-        window_size=16,
+        window_size=24,
         mlp_ratio=2,
         upscale=4,
         img_range=1.0,
@@ -417,13 +417,13 @@ def _build_dat(root: Path) -> nn.Module:
         embed_dim=180,
         depth=(6, 6, 6, 6, 6, 6),
         num_heads=(6, 6, 6, 6, 6, 6),
-        split_size=(8, 16),
-        expansion_factor=2,
+        split_size=(8, 32),
+        expansion_factor=4,
         upscale=4,
         img_range=1.0,
         upsampler="",
         resi_connection="1conv",
-        use_chk=True,
+        use_chk=False,
     )
     return TransformerBackboneSR(backbone, 180)
 
@@ -466,7 +466,7 @@ def _build_mfghmoe(root: Path) -> nn.Module:
         img_range=1.0,
         upsampler="",
         resi_connection="1conv",
-        use_checkpoint=True,
+        use_checkpoint=False,
     )
     return MFGHMoEBackboneSR(backbone, module.HMoE)
 
@@ -491,7 +491,7 @@ def _build_ttst(root: Path) -> nn.Module:
         img_range=1.0,
         upsampler="",
         resi_connection="1conv",
-        use_checkpoint=True,
+        use_checkpoint=False,
     )
     return TransformerBackboneSR(backbone, 180)
 
@@ -513,12 +513,12 @@ def _build_fremamba(root: Path) -> nn.Module:
         img_range=1.0,
         upsampler="",
         resi_connection="1conv",
-        use_checkpoint=True,
+        use_checkpoint=False,
     )
     return TransformerBackboneSR(backbone, 96)
 
 
-BUILDERS = {
+RESIZE_CONV_BUILDERS = {
     "swinir": _build_swinir,
     "hat": _build_hat,
     "srformer": _build_srformer,
@@ -530,23 +530,234 @@ BUILDERS = {
 }
 
 
-def assert_no_pixelshuffle(model: nn.Module) -> None:
-    offenders = [
+def _build_official_swinir(root: Path) -> nn.Module:
+    module = _load_file("official_swinir_faithful", root / "models" / "network_swinir.py")
+    return module.SwinIR(
+        img_size=64,
+        patch_size=1,
+        in_chans=3,
+        embed_dim=180,
+        depths=(6, 6, 6, 6, 6, 6),
+        num_heads=(6, 6, 6, 6, 6, 6),
+        window_size=8,
+        mlp_ratio=2,
+        upscale=4,
+        img_range=1.0,
+        upsampler="pixelshuffle",
+        resi_connection="1conv",
+        use_checkpoint=False,
+    )
+
+
+def _build_official_hat(root: Path) -> nn.Module:
+    _install_basicsr_stubs()
+    module = _load_file(
+        "official_hat_arch_faithful",
+        root / "hat" / "archs" / "hat_arch.py",
+    )
+    return module.HAT(
+        img_size=64,
+        in_chans=3,
+        embed_dim=144,
+        depths=(6, 6, 6, 6, 6, 6),
+        num_heads=(6, 6, 6, 6, 6, 6),
+        window_size=16,
+        compress_ratio=24,
+        squeeze_factor=24,
+        conv_scale=0.01,
+        overlap_ratio=0.5,
+        mlp_ratio=2,
+        upscale=4,
+        img_range=1.0,
+        upsampler="pixelshuffle",
+        resi_connection="1conv",
+        use_checkpoint=False,
+    )
+
+
+def _build_official_srformer(root: Path) -> nn.Module:
+    _install_basicsr_stubs()
+    arch_path = root / "basicsr" / "archs"
+    arch_util = types.ModuleType("official_srformer_faithful.arch_util")
+    arch_util.to_2tuple = lambda value: value if isinstance(value, tuple) else (value, value)
+    arch_util.trunc_normal_ = torch.nn.init.trunc_normal_
+    sys.modules["official_srformer_faithful.arch_util"] = arch_util
+    module = _load_file(
+        "official_srformer_faithful.srformer_arch",
+        arch_path / "srformer_arch.py",
+        package_path=arch_path,
+    )
+    return module.SRFormer(
+        img_size=48,
+        in_chans=3,
+        embed_dim=180,
+        depths=(6, 6, 6, 6, 6, 6),
+        num_heads=(6, 6, 6, 6, 6, 6),
+        window_size=24,
+        mlp_ratio=2,
+        upscale=4,
+        img_range=1.0,
+        upsampler="pixelshuffle",
+        resi_connection="1conv",
+        use_checkpoint=False,
+    )
+
+
+def _build_official_dat(root: Path) -> nn.Module:
+    _install_basicsr_stubs()
+    module = _load_file(
+        "official_dat_arch_faithful",
+        root / "basicsr" / "archs" / "dat_arch.py",
+    )
+    return module.DAT(
+        img_size=64,
+        in_chans=3,
+        embed_dim=180,
+        depth=(6, 6, 6, 6, 6, 6),
+        num_heads=(6, 6, 6, 6, 6, 6),
+        split_size=(8, 32),
+        expansion_factor=4,
+        upscale=4,
+        img_range=1.0,
+        upsampler="pixelshuffle",
+        resi_connection="1conv",
+        use_chk=False,
+    )
+
+
+def _build_official_omnisr(root: Path) -> nn.Module:
+    with _source_path(root):
+        module = _load_file(
+            "official_omnisr_faithful",
+            root / "components" / "OmniSR.py",
+        )
+        return module.OmniSR(
+            num_in_ch=3,
+            num_out_ch=3,
+            num_feat=64,
+            upsampling=4,
+            res_num=5,
+            block_num=1,
+            bias=True,
+            window_size=8,
+            pe=True,
+            ffn_bias=True,
+            block_script_name="OSA",
+            block_class_name="OSA_Block",
+        )
+
+
+def _build_official_mfghmoe(root: Path) -> nn.Module:
+    _install_basicsr_stubs()
+    module = _load_file(
+        "official_mfghmoe_arch_faithful",
+        root / "hmoe" / "archs" / "mfghmoe_arch.py",
+    )
+    return module.MFGHMOE(
+        img_size=64,
+        in_chans=3,
+        embed_dim=180,
+        depths=(6, 6, 6, 6, 6, 6),
+        num_heads=(6, 6, 6, 6, 6, 6),
+        window_size=16,
+        mlp_ratio=2,
+        upscale=4,
+        img_range=1.0,
+        upsampler="pixelshuffle",
+        resi_connection="1conv",
+        use_checkpoint=False,
+    )
+
+
+def _build_official_ttst(root: Path) -> nn.Module:
+    _install_basicsr_stubs()
+    _install_thop_stub()
+    module = _load_file(
+        "official_ttst_arch_faithful",
+        root / "model_archs" / "TTST_arc.py",
+    )
+    return module.TTST(
+        img_size=64,
+        in_chans=3,
+        embed_dim=180,
+        depths=(6, 6, 6, 6, 6, 6),
+        num_heads=(6, 6, 6, 6, 6, 6),
+        window_size=8,
+        compress_ratio=3,
+        squeeze_factor=30,
+        conv_scale=0.01,
+        overlap_ratio=0.5,
+        mlp_ratio=2,
+        upscale=4,
+        img_range=1.0,
+        upsampler="pixelshuffle",
+        resi_connection="1conv",
+        use_checkpoint=False,
+    )
+
+
+def _build_official_fremamba(root: Path) -> nn.Module:
+    _install_basicsr_stubs()
+    module = _load_file(
+        "official_fremamba_arch_faithful",
+        root / "model_archs" / "fremamba.py",
+    )
+    return module.FreMamba(
+        img_size=64,
+        in_chans=3,
+        embed_dim=96,
+        depths=(6, 6, 6, 6, 6, 6),
+        d_state=16,
+        mlp_ratio=2,
+        upscale=4,
+        img_range=1.0,
+        upsampler="pixelshuffle",
+        resi_connection="1conv",
+        use_checkpoint=False,
+    )
+
+
+OFFICIAL_BUILDERS = {
+    "swinir": _build_official_swinir,
+    "hat": _build_official_hat,
+    "srformer": _build_official_srformer,
+    "dat": _build_official_dat,
+    "omnisr": _build_official_omnisr,
+    "mfghmoe": _build_official_mfghmoe,
+    "ttst": _build_official_ttst,
+    "fremamba": _build_official_fremamba,
+}
+
+
+def pixelshuffle_modules(model: nn.Module) -> list[str]:
+    return [
         name for name, module in model.named_modules() if isinstance(module, nn.PixelShuffle)
     ]
-    if offenders:
-        raise RuntimeError(f"PixelShuffle remains in benchmark model: {offenders}")
 
 
-def build_benchmark_model(name: str, source_root: str | Path) -> nn.Module:
+def build_benchmark_model(
+    name: str,
+    source_root: str | Path,
+    architecture_mode: str = "official",
+) -> nn.Module:
     key = name.lower()
     if key not in MODEL_SPECS:
         raise KeyError(f"Unknown model {name!r}; choose from {sorted(MODEL_SPECS)}")
+    if architecture_mode not in ("official", "resize_conv_ablation"):
+        raise ValueError(
+            "architecture_mode must be 'official' or 'resize_conv_ablation'"
+        )
     root = Path(source_root) / MODEL_SPECS[key].directory
     if not root.exists():
         raise FileNotFoundError(
             f"Official source missing at {root}. Clone {MODEL_SPECS[key].repository} first."
         )
-    model = BUILDERS[key](root)
-    assert_no_pixelshuffle(model)
+    if architecture_mode == "official":
+        return OFFICIAL_BUILDERS[key](root)
+    model = RESIZE_CONV_BUILDERS[key](root)
+    offenders = pixelshuffle_modules(model)
+    if offenders:
+        raise RuntimeError(
+            f"PixelShuffle remains in resize-convolution ablation: {offenders}"
+        )
     return model

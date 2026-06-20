@@ -6,18 +6,24 @@ from pathlib import Path
 
 import torch
 
-from ..benchmark.models import MODEL_SPECS, build_benchmark_model
+from ..benchmark.models import MODEL_SPECS, build_benchmark_model, pixelshuffle_modules
 from ..benchmark.runner import BenchmarkConfig, train
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Train a no-PixelShuffle external SR backbone on Sentinel-2 patches"
+        description="Train faithful or explicitly adapted SR backbones on Sentinel-2 patches"
     )
     parser.add_argument("--model", choices=sorted(MODEL_SPECS), required=True)
     parser.add_argument("--source-root", required=True)
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--output", required=True)
+    parser.add_argument(
+        "--architecture-mode",
+        choices=("official", "resize_conv_ablation"),
+        default="official",
+        help="Use the paper's released x4 head by default. Adapted heads are ablations only.",
+    )
     parser.add_argument("--max-updates", type=int, default=50000)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--accumulation", type=int, default=8)
@@ -41,11 +47,15 @@ def main() -> None:
     parser.add_argument(
         "--probe-only",
         action="store_true",
-        help="Build the model, verify no PixelShuffle, and print its parameter count.",
+        help="Build the model, run an x4 forward pass, and print architecture metadata.",
     )
     args = parser.parse_args()
     if args.probe_only:
-        model = build_benchmark_model(args.model, args.source_root)
+        model = build_benchmark_model(
+            args.model,
+            args.source_root,
+            architecture_mode=args.architecture_mode,
+        )
         model.eval()
         with torch.no_grad():
             output = model(torch.rand(1, 3, 32, 32))
@@ -53,8 +63,9 @@ def main() -> None:
             json.dumps(
                 {
                     "model": args.model,
+                    "architecture_mode": args.architecture_mode,
                     "parameters": sum(value.numel() for value in model.parameters()),
-                    "pixelshuffle": False,
+                    "pixelshuffle_modules": pixelshuffle_modules(model),
                     "probe_input": [1, 3, 32, 32],
                     "probe_output": list(output.shape),
                 },
@@ -67,6 +78,7 @@ def main() -> None:
         source_root=Path(args.source_root),
         manifest=Path(args.manifest),
         output=Path(args.output),
+        architecture_mode=args.architecture_mode,
         max_updates=args.max_updates,
         batch_size=args.batch_size,
         accumulation=args.accumulation,

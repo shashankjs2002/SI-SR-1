@@ -55,11 +55,13 @@ Default papers with official training repositories:
 FreMamba/FMSR, IEEE TMM 2024, is an optional eighth model because its compiled
 Mamba CUDA extension is more environment-sensitive.
 
-**No benchmark adapter contains `torch.nn.PixelShuffle`.** The published
-backbones are retained, but their reconstruction heads are replaced with a
-shared resize-convolution head. MFG-HMoE retains heterogeneous experts and
-dual routing in its adapted head. Results must be described as
-"no-PixelShuffle adaptations", not exact reproductions of the papers.
+The default `official` mode retains each repository's published x4
+reconstruction head, including PixelShuffle or MoE upsampling where used.
+This is required for a claimable architecture comparison.
+
+An optional `resize_conv_ablation` mode studies upsampling artifacts. It changes
+the competitor architectures and therefore cannot be reported as a faithful
+baseline against the named published methods.
 """
     ),
     markdown(
@@ -207,6 +209,7 @@ throughput differs substantially.
     ),
     code(
         """PROFILE = "screening"  # smoke | screening | paper
+ARCHITECTURE_MODE = "official"  # official | resize_conv_ablation
 DEFAULT_MODELS = [
     "swinir", "hat", "srformer", "dat", "omnisr", "ttst", "mfghmoe"
 ]
@@ -251,6 +254,7 @@ BATCH_SETTINGS = {
     "fremamba": (1, 8),
 }
 print("Profile:", PROFILE, SETTINGS)
+print("Architecture mode:", ARCHITECTURE_MODE)
 print("Models:", MODELS_TO_RUN)
 """
     ),
@@ -283,9 +287,9 @@ else:
     markdown(
         """## 6. Probe every architecture before training
 
-Each probe builds the official backbone, replaces its published upsampler with
-the shared no-PixelShuffle adapter, asserts that no PixelShuffle module remains,
-and runs a real 32x32 to 128x128 forward pass.
+Each probe builds the selected architecture and runs a real 32x32 to 128x128
+forward pass. In `official` mode, the reported PixelShuffle modules are expected
+for papers that use sub-pixel reconstruction.
 """
     ),
     code(
@@ -296,7 +300,8 @@ for model_name in MODELS_TO_RUN:
         "--model", model_name,
         "--source-root", SOURCE_ROOT,
         "--manifest", MANIFEST,
-        "--output", BENCHMARK_ROOT / model_name,
+        "--output", BENCHMARK_ROOT / ARCHITECTURE_MODE / model_name,
+        "--architecture-mode", ARCHITECTURE_MODE,
         "--probe-only",
     ]
     completed = subprocess.run(
@@ -328,13 +333,14 @@ print("All probes passed.")
         """TRAINING_RESULTS = {}
 for model_name in MODELS_TO_RUN:
     batch_size, accumulation = BATCH_SETTINGS[model_name]
-    output = BENCHMARK_ROOT / PROFILE / model_name
+    output = BENCHMARK_ROOT / ARCHITECTURE_MODE / PROFILE / model_name
     command = [
         PYTHON, "-m", "geodiff_gan.cli.benchmark_sota",
         "--model", model_name,
         "--source-root", SOURCE_ROOT,
         "--manifest", MANIFEST,
         "--output", output,
+        "--architecture-mode", ARCHITECTURE_MODE,
         "--max-updates", SETTINGS["max_updates"],
         "--batch-size", batch_size,
         "--accumulation", accumulation,
@@ -367,7 +373,9 @@ figure, axes = plt.subplots(
     len(MODELS_TO_RUN), 2, figsize=(14, 4 * len(MODELS_TO_RUN)), squeeze=False
 )
 for row, model_name in enumerate(MODELS_TO_RUN):
-    history_path = BENCHMARK_ROOT / PROFILE / model_name / "history.jsonl"
+    history_path = (
+        BENCHMARK_ROOT / ARCHITECTURE_MODE / PROFILE / model_name / "history.jsonl"
+    )
     history = pd.DataFrame(
         json.loads(line)
         for line in history_path.read_text(encoding="utf-8").splitlines()
@@ -396,12 +404,18 @@ plt.show()
     code(
         """rows = []
 for model_name in MODELS_TO_RUN:
-    output = BENCHMARK_ROOT / PROFILE / model_name
+    output = BENCHMARK_ROOT / ARCHITECTURE_MODE / PROFILE / model_name
     metrics = json.loads((output / "test_metrics.json").read_text(encoding="utf-8"))
     run_info = json.loads((output / "run.json").read_text(encoding="utf-8"))
     rows.append({
-        "family": "external no-PixelShuffle adapter",
+        "family": (
+            "faithful official architecture"
+            if ARCHITECTURE_MODE == "official"
+            else "resize-conv architecture ablation"
+        ),
         "method": model_name,
+        "architecture_mode": run_info["architecture_mode"],
+        "source_revision": run_info.get("source_revision"),
         "parameters": run_info["parameters"],
         **metrics,
     })
@@ -418,13 +432,17 @@ for variant in ("small_improved", "medium", "large"):
 
 comparison = pd.DataFrame(rows)
 preferred = [
-    "family", "method", "parameters", "count", "l1", "psnr", "ssim",
+    "family", "method", "architecture_mode", "source_revision",
+    "parameters", "count", "l1", "psnr", "ssim",
     "edge_f1", "redegradation_l1", "lpips", "dists",
 ]
 comparison = comparison[[name for name in preferred if name in comparison.columns]]
 comparison = comparison.sort_values("psnr", ascending=False)
 display(comparison.round(6))
-comparison.to_csv(BENCHMARK_ROOT / PROFILE / "all_model_comparison.csv", index=False)
+comparison.to_csv(
+    BENCHMARK_ROOT / ARCHITECTURE_MODE / PROFILE / "all_model_comparison.csv",
+    index=False,
+)
 """
     ),
     markdown("## 10. Metric comparison plots"),
@@ -467,7 +485,7 @@ means when available.
         """from PIL import Image
 
 image_roots = {
-    name: BENCHMARK_ROOT / PROFILE / name / "images" / "test"
+    name: BENCHMARK_ROOT / ARCHITECTURE_MODE / PROFILE / name / "images" / "test"
     for name in MODELS_TO_RUN
 }
 reference_model = next(name for name, root in image_roots.items() if list(root.glob("*_hr.png")))
@@ -510,8 +528,11 @@ for reference_hr in reference_files[:5]:
 5. GeoDiff-GAN uses a more complex multi-stage and stochastic training pipeline.
    For a strict architecture-only claim, rerun GeoDiff under a matched update or
    wall-clock budget and report both comparisons.
-6. These are no-PixelShuffle adaptations. Do not compare their numbers directly
-   to the original papers' DIV2K/UCMerced/AID tables.
+6. `official` mode is architecturally faithful, but the models are retrained
+   under our Sentinel-2 data and loss protocol. Do not present these numbers as
+   the papers' original DIV2K/UCMerced/AID scores.
+7. `resize_conv_ablation` changes competitor architectures. It can answer an
+   upsampling-ablation question but cannot serve as a published-method baseline.
 """
     ),
     markdown("## 13. Backup manifest, metrics, histories, and checkpoints"),
@@ -519,11 +540,11 @@ for reference_hr in reference_files[:5]:
         """BACKUP_ROOT = THESIS_ROOT / "backups"
 BACKUP_ROOT.mkdir(parents=True, exist_ok=True)
 timestamp = time.strftime("%Y%m%d_%H%M%S")
-archive_base = BACKUP_ROOT / f"sota_benchmark_{PROFILE}_{timestamp}"
+archive_base = BACKUP_ROOT / f"sota_benchmark_{ARCHITECTURE_MODE}_{PROFILE}_{timestamp}"
 archive_path = shutil.make_archive(
     str(archive_base),
     "gztar",
-    root_dir=BENCHMARK_ROOT / PROFILE,
+    root_dir=BENCHMARK_ROOT / ARCHITECTURE_MODE / PROFILE,
 )
 print("Backup:", archive_path)
 print(
