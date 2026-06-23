@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GeoDiff-GAN SR Mode Architecture</title>
+  <style>
+    :root {
+      color-scheme: light;
+      font-family: Inter, "Segoe UI", Arial, sans-serif;
+      background: #f4f7fb;
+      color: #102a43;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      padding: 24px;
+    }
+
+    header {
+      max-width: 1600px;
+      margin: 0 auto 18px;
+    }
+
+    h1 {
+      margin: 0 0 6px;
+      font-size: 26px;
+    }
+
+    p {
+      margin: 0;
+      color: #52667a;
+    }
+
+    .viewer {
+      max-width: 1600px;
+      margin: auto;
+      padding: 20px;
+      overflow: auto;
+      background: white;
+      border: 1px solid #dbe4ee;
+      border-radius: 12px;
+      box-shadow: 0 8px 28px rgba(31, 54, 78, 0.08);
+    }
+
+    .mermaid {
+      min-width: 1450px;
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>GeoDiff-GAN: Detailed SR-Mode Architecture</h1>
+    <p>Solid paths are used during inference. Faded dashed paths represent training-only supervision.</p>
+  </header>
+
+  <main class="viewer">
+    <pre class="mermaid">
+flowchart LR
+    LR["Observed LR RGB&lt;br/&gt;B x 3 x 128 x 128&lt;br/&gt;Synthetic 40 m evidence"]
+
+    subgraph COND["Conditioning"]
+        DEG["Degradation vector&lt;br/&gt;B x 4&lt;br/&gt;Blur, noise, quantization, compression"]
+        MODE["SR mode token&lt;br/&gt;B x 1&lt;br/&gt;m = 0"]
+        TEXT["Optional text context&lt;br/&gt;B x T x D&lt;br/&gt;Null context when prompt absent"]
+        NOISE["Initial Gaussian latent&lt;br/&gt;B x 4 x 64 x 64"]
+    end
+
+    subgraph BASE["Deterministic Reconstruction Branch"]
+        SWIN["SwinIR base&lt;br/&gt;Input convolution&lt;br/&gt;Shifted-window blocks&lt;br/&gt;Learned 4x reconstruction"]
+        BASEHR["Conservative HR base&lt;br/&gt;B x 3 x 512 x 512"]
+        LR --> SWIN --> BASEHR
+    end
+
+    subgraph ENCODER["Multi-scale LR Evidence Encoder"]
+        STEM["LR stem features&lt;br/&gt;f128: B x C x 128 x 128"]
+        DOWN1["Downsample block&lt;br/&gt;f64: B x 2C x 64 x 64"]
+        DOWN2["Downsample block&lt;br/&gt;f32: B x 4C x 32 x 32"]
+        DOWN3["Downsample block&lt;br/&gt;f16: B x 4C x 16 x 16"]
+        LR --> STEM --> DOWN1 --> DOWN2 --> DOWN3
+    end
+
+    subgraph DIFF["Conditional Latent Diffusion"]
+        CONCAT["Latent spatial conditioning&lt;br/&gt;Concatenate z_t with f64&lt;br/&gt;64 x 64 grid"]
+        UNET["Conditional diffusion U-Net&lt;br/&gt;Encoder, middle and decoder blocks&lt;br/&gt;Cross-attention at selected scales&lt;br/&gt;v-prediction"]
+        SAMPLER["Iterative denoising&lt;br/&gt;t = T to 0"]
+        Z0["Denoised residual latent&lt;br/&gt;B x 4 x 64 x 64"]
+        NOISE --> CONCAT --> UNET --> SAMPLER --> Z0
+        DOWN1 --> CONCAT
+        DEG --> UNET
+        MODE --> UNET
+        TEXT --> UNET
+    end
+
+    subgraph MAP["GeoMapper: Evidence-Controlled Bridge"]
+        FUSE["Spatial fusion&lt;br/&gt;Denoised latent + f64"]
+        RESBLOCKS["Spatial residual mapping blocks&lt;br/&gt;B x Cm x 64 x 64"]
+        CONTENT["Content tensor&lt;br/&gt;B x Cm x 64 x 64"]
+        STYLE["Layer-wise FiLM styles&lt;br/&gt;s0, s1, s2, s3&lt;br/&gt;Each B x Ds"]
+        EVIDENCE["Evidence confidence map&lt;br/&gt;c_e: B x 1 x 64 x 64"]
+        EDITZERO["Edit permission&lt;br/&gt;Forced to zero in SR mode"]
+        Z0 --> FUSE
+        DOWN1 --> FUSE
+        FUSE --> RESBLOCKS
+        RESBLOCKS --> CONTENT
+        RESBLOCKS --> STYLE
+        RESBLOCKS --> EVIDENCE
+        MODE --> EDITZERO
+        TEXT -. "policy-limited influence" .-> RESBLOCKS
+    end
+
+    subgraph DECODER["Residual SR Decoder"]
+        D64["64 x 64 decoder block&lt;br/&gt;Content + FiLM"]
+        D128["Upsample to 128 x 128&lt;br/&gt;Resize-convolution + f128 skip"]
+        D256["Upsample to 256 x 256&lt;br/&gt;Resize-convolution"]
+        D512["Upsample to 512 x 512&lt;br/&gt;Resize-convolution"]
+        DETAIL["Raw detail residual&lt;br/&gt;B x 3 x 512 x 512"]
+        HP["High-pass filter H(.)&lt;br/&gt;Remove unsafe low-frequency changes"]
+        GATE["Evidence gating&lt;br/&gt;r_SR = H(r_detail) multiplied by c_e"]
+        RESIDUAL["Evidence-supported residual&lt;br/&gt;B x 3 x 512 x 512"]
+        CONTENT --> D64 --> D128 --> D256 --> D512 --> DETAIL
+        STYLE --> D64
+        STYLE --> D128
+        STYLE --> D256
+        STYLE --> D512
+        STEM --> D128
+        DOWN1 --> D64
+        DETAIL --> HP --> GATE --> RESIDUAL
+        EVIDENCE --> GATE
+    end
+
+    subgraph COMPOSE["SR Composition and Physical Consistency"]
+        ADD["Residual addition&lt;br/&gt;x_pre = base + r_SR"]
+        PRE["Pre-projection HR&lt;br/&gt;B x 3 x 512 x 512"]
+        DEGRADE["Differentiable sensor degradation&lt;br/&gt;HR to simulated LR"]
+        ERROR["LR consistency error&lt;br/&gt;clean LR - degraded output"]
+        PROJECT["Iterative sensor back-projection&lt;br/&gt;Default: 3 correction steps"]
+        OUTPUT["Final 10 m SR output&lt;br/&gt;B x 3 x 512 x 512"]
+        BASEHR --> ADD
+        RESIDUAL --> ADD
+        ADD --> PRE --> PROJECT --> OUTPUT
+        PROJECT --> DEGRADE --> ERROR --> PROJECT
+        LR -. "clean LR projection target" .-> ERROR
+        DEG --> DEGRADE
+    end
+
+    subgraph TRAINING["Training-Only Supervision"]
+        HR["Native 10 m HR target&lt;br/&gt;B x 3 x 512 x 512"]
+        VAE["Residual VAE target encoder&lt;br/&gt;Encodes HR - base"]
+        PATCH["Conditional multi-scale PatchGAN"]
+        WAVE["Haar-wavelet discriminator"]
+        LOSSES["Reconstruction objectives&lt;br/&gt;Charbonnier, SSIM, gradient,&lt;br/&gt;LPIPS, wavelet and consistency"]
+        HR -.-> VAE
+        VAE -. "clean residual latent" .-> UNET
+        HR -.-> PATCH
+        OUTPUT -.-> PATCH
+        HR -.-> WAVE
+        OUTPUT -.-> WAVE
+        HR -.-> LOSSES
+        OUTPUT -.-> LOSSES
+    end
+
+    classDef observed fill:#eaf2fb,stroke:#54799e,color:#102a43;
+    classDef deterministic fill:#eaf7ee,stroke:#4d9563,color:#163d24;
+    classDef stochastic fill:#f1edff,stroke:#8067d8,color:#302066;
+    classDef evidence fill:#e9fbfb,stroke:#32a6aa,color:#124b4e;
+    classDef policy fill:#fff2e2,stroke:#e79a39,color:#6a3700;
+    classDef decoder fill:#fff0f3,stroke:#d86a83,color:#641e32;
+    classDef output fill:#edf8ef,stroke:#579669,color:#153f22;
+    classDef training fill:#f5f5f5,stroke:#aaaaaa,color:#666666,stroke-dasharray:5 5;
+
+    class LR observed;
+    class SWIN,BASEHR deterministic;
+    class NOISE,CONCAT,UNET,SAMPLER,Z0 stochastic;
+    class STEM,DOWN1,DOWN2,DOWN3,FUSE,RESBLOCKS,CONTENT evidence;
+    class DEG,MODE,TEXT,STYLE,EVIDENCE,EDITZERO,HP,GATE policy;
+    class D64,D128,D256,D512,DETAIL,RESIDUAL decoder;
+    class ADD,PRE,DEGRADE,ERROR,PROJECT,OUTPUT output;
+    class HR,VAE,PATCH,WAVE,LOSSES training;
+    </pre>
+  </main>
+
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+
+    mermaid.initialize({
+      startOnLoad: true,
+      theme: "base",
+      securityLevel: "loose",
+      flowchart: {
+        htmlLabels: true,
+        curve: "basis",
+        nodeSpacing: 28,
+        rankSpacing: 45,
+        useMaxWidth: false
+      },
+      themeVariables: {
+        fontFamily: 'Inter, "Segoe UI", Arial, sans-serif',
+        fontSize: "13px",
+        lineColor: "#60758b",
+        clusterBkg: "#fbfcfe",
+        clusterBorder: "#cdd8e4"
+      }
+    });
+  </script>
+</body>
+</html>
