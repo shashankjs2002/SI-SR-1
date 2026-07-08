@@ -31,6 +31,9 @@ class SentinelPatchDataset(Dataset):
         random_degradation: bool | None = None,
         degradation_seed: int = 0,
         degradation_severity: str = "mild",
+        target_key: str = "hr",
+        condition_key: str | None = None,
+        output_channels: int = 3,
     ) -> None:
         self.records = load_manifest(manifest, split=split)
         self.scale = scale
@@ -38,6 +41,9 @@ class SentinelPatchDataset(Dataset):
         self.random_degradation = augment if random_degradation is None else random_degradation
         self.degradation_seed = degradation_seed
         self.degradation_severity = degradation_severity
+        self.target_key = target_key
+        self.condition_key = condition_key
+        self.output_channels = output_channels
         self.caption_field = caption_field
         if caption_sampling not in ("fixed", "random"):
             raise ValueError("caption_sampling must be 'fixed' or 'random'")
@@ -119,23 +125,75 @@ class SentinelPatchDataset(Dataset):
     def __len__(self) -> int:
         return len(self.records)
 
-    def _augment(self, image: torch.Tensor) -> torch.Tensor:
+    @staticmethod
+    def _to_channel_first(array: np.ndarray, key: str) -> torch.Tensor:
+        tensor = torch.from_numpy(array).float()
+        if tensor.ndim != 3:
+            raise ValueError(f"Patch key {key!r} must be a 3D tensor")
+        if tensor.shape[0] <= 16 and tensor.shape[1] > 16 and tensor.shape[2] > 16:
+            return tensor
+        if tensor.shape[-1] <= 16 and tensor.shape[0] > 16 and tensor.shape[1] > 16:
+            return tensor.permute(2, 0, 1)
+        raise ValueError(
+            f"Patch key {key!r} has ambiguous shape {tuple(tensor.shape)}; "
+            "expected CHW or HWC with a small channel dimension"
+        )
+
+    def _augmentation_parameters(self) -> tuple[bool, bool, int]:
         if not self.augment:
-            return image
-        if torch.rand(()) < 0.5:
+            return False, False, 0
+        return (
+            bool(torch.rand(()) < 0.5),
+            bool(torch.rand(()) < 0.5),
+            int(torch.randint(0, 4, ()).item()),
+        )
+
+    @staticmethod
+    def _apply_augment(
+        image: torch.Tensor, flip_width: bool, flip_height: bool, rotations: int
+    ) -> torch.Tensor:
+        if flip_width:
             image = image.flip(-1)
-        if torch.rand(()) < 0.5:
+        if flip_height:
             image = image.flip(-2)
-        rotations = int(torch.randint(0, 4, ()).item())
         return torch.rot90(image, rotations, dims=(-2, -1))
+
+    def _augment(self, image: torch.Tensor) -> torch.Tensor:
+        return self._apply_augment(image, *self._augmentation_parameters())
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor | str]:
         record: ManifestRecord = self.records[index]
         with np.load(record.patch) as data:
-            hr = torch.from_numpy(data["hr"]).float()
-        if hr.ndim == 3 and hr.shape[-1] == 3:
-            hr = hr.permute(2, 0, 1)
-        hr = self._augment(hr.clamp(0, 1))
+            if self.target_key not in data.files:
+                raise KeyError(
+                    f"Patch {record.patch} does not contain target key "
+                    f"{self.target_key!r}"
+                )
+            target = self._to_channel_first(data[self.target_key], self.target_key)
+            condition_key = self.condition_key or self.target_key
+            if condition_key not in data.files:
+                raise KeyError(
+                    f"Patch {record.patch} does not contain condition key "
+                    f"{condition_key!r}. Re-run preprocessing with multispectral "
+                    "bands or switch data.condition_key back to null."
+                )
+            condition = self._to_channel_first(data[condition_key], condition_key)
+        if target.shape[-2:] != condition.shape[-2:]:
+            raise ValueError(
+                f"Target and condition spatial shapes differ for {record.patch}: "
+                f"{tuple(target.shape[-2:])} vs {tuple(condition.shape[-2:])}"
+            )
+        if target.shape[0] < self.output_channels:
+            raise ValueError(
+                f"Patch {record.patch} has {target.shape[0]} target channels, "
+                f"but {self.output_channels} output channels were requested"
+            )
+        flip_width, flip_height, rotations = self._augmentation_parameters()
+        target = self._apply_augment(target.clamp(0, 1), flip_width, flip_height, rotations)
+        condition = self._apply_augment(
+            condition.clamp(0, 1), flip_width, flip_height, rotations
+        )
+        hr = target[: self.output_channels]
         generator = None
         if not self.random_degradation:
             key = (
@@ -149,12 +207,14 @@ class SentinelPatchDataset(Dataset):
             )
             generator = torch.Generator().manual_seed(seed)
         lr, degradation, clean_lr = random_degradation(
-            hr.unsqueeze(0),
+            condition.unsqueeze(0),
             scale=self.scale,
             generator=generator,
             return_clean=True,
             severity=self.degradation_severity,
         )
+        lr_rgb = lr[:, : self.output_channels]
+        clean_lr_rgb = clean_lr[:, : self.output_channels]
         caption = record.caption
         variants: dict[str, str] | None = None
         for key in self._caption_keys(record.patch):
@@ -176,7 +236,8 @@ class SentinelPatchDataset(Dataset):
         return {
             "hr": hr,
             "lr": lr[0],
-            "clean_lr": clean_lr[0],
+            "lr_rgb": lr_rgb[0],
+            "clean_lr": clean_lr_rgb[0],
             "degradation": degradation[0],
             "caption": caption,
             "patch": record.patch,

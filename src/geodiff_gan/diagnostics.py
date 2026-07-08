@@ -498,6 +498,8 @@ class DiagnosticRecorder:
     ) -> None:
         with torch.no_grad():
             consistency_lr = lr if consistency_lr is None else consistency_lr
+            if lr.shape[1] != consistency_lr.shape[1]:
+                lr = lr[:, : consistency_lr.shape[1]]
             degraded_base = sensor_degrade(
                 base,
                 degradation,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import ExitStack
 import re
 from pathlib import Path
 
@@ -12,6 +13,24 @@ from .manifest import (
 )
 
 INVALID_SCL_CLASSES = {0, 1, 3, 8, 9, 10, 11}
+RGB_BANDS = ("B04", "B03", "B02")
+SENTINEL_BAND_PATTERNS = {
+    "B02": "*_B02_10m.jp2",
+    "B03": "*_B03_10m.jp2",
+    "B04": "*_B04_10m.jp2",
+    "B05": "*_B05_20m.jp2",
+    "B06": "*_B06_20m.jp2",
+    "B07": "*_B07_20m.jp2",
+    "B08": "*_B08_10m.jp2",
+    "B8A": "*_B8A_20m.jp2",
+    "B11": "*_B11_20m.jp2",
+    "B12": "*_B12_20m.jp2",
+}
+MULTISPECTRAL_PRESETS = {
+    "rgb": (),
+    "rgb-nir-swir": ("B08", "B11", "B12"),
+    "rgb-rededge-nir-swir": ("B05", "B06", "B07", "B8A", "B08", "B11", "B12"),
+}
 SENTINEL_PRODUCT_PATTERN = re.compile(
     r"(S2[A-Z]_MSIL2A_[A-Z0-9_]+\.SAFE)$",
     re.IGNORECASE,
@@ -80,6 +99,29 @@ def _find_band(product: Path, pattern: str) -> Path:
     if not matches:
         raise FileNotFoundError(f"Could not find {pattern} below {product}")
     return matches[0]
+
+
+def resolve_multispectral_bands(
+    preset: str = "rgb", extra_bands: list[str] | tuple[str, ...] | None = None
+) -> tuple[str, ...]:
+    if preset not in MULTISPECTRAL_PRESETS:
+        raise ValueError(
+            f"Unsupported multispectral preset {preset!r}; expected one of "
+            f"{sorted(MULTISPECTRAL_PRESETS)}"
+        )
+    selected: list[str] = []
+    for band in [*MULTISPECTRAL_PRESETS[preset], *(extra_bands or [])]:
+        normalized = band.upper()
+        if normalized not in SENTINEL_BAND_PATTERNS:
+            raise ValueError(
+                f"Unsupported Sentinel-2 band {band!r}; expected one of "
+                f"{sorted(SENTINEL_BAND_PATTERNS)}"
+            )
+        if normalized in RGB_BANDS:
+            continue
+        if normalized not in selected:
+            selected.append(normalized)
+    return tuple(selected)
 
 
 def tile_id_from_product(product: Path) -> str:
@@ -171,6 +213,7 @@ def extract_product_patches(
     test_prefixes: list[str] | None = None,
     unmatched_split: str = "hash",
     show_progress: bool = False,
+    extra_bands: list[str] | tuple[str, ...] | None = None,
 ) -> list[ManifestRecord]:
     try:
         import rasterio
@@ -192,20 +235,26 @@ def extract_product_patches(
     )
     destination = output_dir / tile_id / Path(source_product).stem
     destination.mkdir(parents=True, exist_ok=True)
+    resolved_extra_bands = resolve_multispectral_bands("rgb", extra_bands)
     band_paths = [
-        _find_band(product, "*_B04_10m.jp2"),
-        _find_band(product, "*_B03_10m.jp2"),
-        _find_band(product, "*_B02_10m.jp2"),
+        _find_band(product, SENTINEL_BAND_PATTERNS[band]) for band in RGB_BANDS
+    ]
+    extra_band_paths = [
+        (band, _find_band(product, SENTINEL_BAND_PATTERNS[band]))
+        for band in resolved_extra_bands
     ]
     scl_path = _find_band(product, "*_SCL_20m.jp2")
     records: list[ManifestRecord] = []
 
-    with (
-        rasterio.open(band_paths[0]) as red,
-        rasterio.open(band_paths[1]) as green,
-        rasterio.open(band_paths[2]) as blue,
-        rasterio.open(scl_path) as scl,
-    ):
+    with ExitStack() as stack:
+        red = stack.enter_context(rasterio.open(band_paths[0]))
+        green = stack.enter_context(rasterio.open(band_paths[1]))
+        blue = stack.enter_context(rasterio.open(band_paths[2]))
+        extra_datasets = [
+            (band, stack.enter_context(rasterio.open(path)))
+            for band, path in extra_band_paths
+        ]
+        scl = stack.enter_context(rasterio.open(scl_path))
         height, width = red.height, red.width
         rows = range(0, max(height - patch_size + 1, 1), stride)
         if show_progress:
@@ -224,6 +273,27 @@ def extract_product_patches(
                 rgb = np.stack(
                     [dataset.read(1, window=window) for dataset in (red, green, blue)]
                 ).astype(np.float32)
+                extras = []
+                for _, dataset in extra_datasets:
+                    band_window = from_bounds(
+                        *bounds(window, red.transform),
+                        transform=dataset.transform,
+                    )
+                    extras.append(
+                        dataset.read(
+                            1,
+                            window=band_window,
+                            out_shape=(patch_size, patch_size),
+                            resampling=Resampling.bilinear,
+                            boundless=True,
+                            fill_value=0,
+                        )
+                    )
+                extra_values = (
+                    np.stack(extras).astype(np.float32)
+                    if extras
+                    else np.empty((0, patch_size, patch_size), dtype=np.float32)
+                )
                 scl_window = from_bounds(
                     *bounds(window, red.transform),
                     transform=scl.transform,
@@ -240,18 +310,39 @@ def extract_product_patches(
                 valid &= np.isfinite(rgb).all(axis=0)
                 valid &= (rgb > 0).all(axis=0)
                 valid &= (rgb < reflectance_scale * saturation_value).all(axis=0)
+                if extra_values.shape[0]:
+                    valid &= np.isfinite(extra_values).all(axis=0)
+                    valid &= (extra_values > 0).all(axis=0)
+                    valid &= (
+                        extra_values < reflectance_scale * saturation_value
+                    ).all(axis=0)
                 valid_fraction = float(valid.mean())
                 if valid_fraction < minimum_valid_fraction:
                     continue
                 hr = np.clip(rgb / reflectance_scale, 0, 1).astype(np.float32)
+                ms_hr = None
+                if extra_values.shape[0]:
+                    ms_hr = np.clip(
+                        np.concatenate((rgb, extra_values), axis=0)
+                        / reflectance_scale,
+                        0,
+                        1,
+                    ).astype(np.float32)
                 patch_path = destination / f"{tile_id}_r{row:05d}_c{col:05d}.npz"
-                np.savez_compressed(
-                    patch_path,
-                    hr=hr,
-                    valid_mask=valid.astype(np.uint8),
-                    transform=np.asarray(red.window_transform(window))[:2].reshape(-1),
-                    crs=str(red.crs),
-                )
+                payload = {
+                    "hr": hr,
+                    "valid_mask": valid.astype(np.uint8),
+                    "transform": np.asarray(red.window_transform(window))[:2].reshape(-1),
+                    "crs": str(red.crs),
+                    "hr_band_names": np.asarray(RGB_BANDS, dtype="U8"),
+                }
+                if ms_hr is not None:
+                    payload["ms_hr"] = ms_hr
+                    payload["ms_band_names"] = np.asarray(
+                        (*RGB_BANDS, *resolved_extra_bands),
+                        dtype="U8",
+                    )
+                np.savez_compressed(patch_path, **payload)
                 records.append(
                     ManifestRecord(
                         patch=str(patch_path.resolve()),

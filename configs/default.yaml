@@ -2,6 +2,8 @@ seed: 42
 
 model:
   scale: 4
+  input_channels: 3
+  output_channels: 3
   base_embed_dim: 60
   base_depth: 6
   base_heads: 6
@@ -29,6 +31,8 @@ model:
 data:
   manifest: data/manifest.jsonl
   captions: data/captions.jsonl
+  target_key: hr
+  condition_key: null
   caption_field: caption
   caption_sampling: fixed
   random_caption_fields: [brief, descriptive, analytical]

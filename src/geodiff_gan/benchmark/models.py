@@ -99,6 +99,44 @@ MODEL_SPECS: dict[str, ModelSpec] = {
         True,
         "mamba_ssm",
     ),
+    "swin2mose": ModelSpec(
+        "Swin2-MoSE",
+        "Swin2-MoSE: A New Single Image Super-Resolution Model for Remote Sensing",
+        2024,
+        "arXiv",
+        "https://github.com/IMPLabUniPr/swin2-mose.git",
+        "Swin2-MoSE",
+        True,
+    ),
+    "atd": ModelSpec(
+        "ATD",
+        "Transcending the Limit of Local Window: Advanced Super-Resolution Transformer with Adaptive Token Dictionary",
+        2024,
+        "CVPR",
+        "https://github.com/CVL-UESTC/Adaptive-Token-Dictionary.git",
+        "ATD",
+        False,
+    ),
+    "mambair": ModelSpec(
+        "MambaIR",
+        "MambaIR: A Simple Baseline for Image Restoration with State-Space Model",
+        2024,
+        "ECCV",
+        "https://github.com/csguoh/MambaIR.git",
+        "MambaIR",
+        False,
+        "mamba_ssm",
+    ),
+    "mambairv2": ModelSpec(
+        "MambaIRv2",
+        "MambaIRv2: Attentive State Space Restoration",
+        2025,
+        "CVPR",
+        "https://github.com/csguoh/MambaIR.git",
+        "MambaIR",
+        False,
+        "mamba_ssm",
+    ),
 }
 
 
@@ -333,6 +371,20 @@ class MFGHMoEBackboneSR(nn.Module):
         )
         output = (anchor + residual).clamp(0, 1)
         return output[:, :, : height * 4, : width * 4]
+
+
+class FirstTensorOutput(nn.Module):
+    """Compatibility wrapper for official models that return auxiliary losses."""
+
+    def __init__(self, model: nn.Module) -> None:
+        super().__init__()
+        self.model = model
+
+    def forward(self, image: torch.Tensor) -> torch.Tensor:
+        output = self.model(image)
+        if isinstance(output, tuple):
+            return output[0]
+        return output
 
 
 def _build_swinir(root: Path) -> nn.Module:
@@ -717,6 +769,112 @@ def _build_official_fremamba(root: Path) -> nn.Module:
     )
 
 
+def _build_official_swin2mose(root: Path) -> nn.Module:
+    module = _load_file(
+        "official_swin2mose_faithful",
+        root / "swin2_mose_model" / "model.py",
+    )
+    return FirstTensorOutput(
+        module.Swin2MoSE(
+            img_size=64,
+            patch_size=1,
+            in_chans=3,
+            embed_dim=180,
+            depths=(6, 6, 6, 6, 6, 6),
+            num_heads=(6, 6, 6, 6, 6, 6),
+            window_size=8,
+            mlp_ratio=2,
+            upscale=4,
+            img_range=1.0,
+            upsampler="pixelshuffle",
+            resi_connection="1conv",
+            use_checkpoint=False,
+            MoE_config={
+                "num_experts": 4,
+                "k": 1,
+                "noisy_gating": True,
+                "input_size": 180,
+            },
+        )
+    )
+
+
+def _build_official_atd(root: Path) -> nn.Module:
+    _install_basicsr_stubs()
+    module = _load_file(
+        "official_atd_arch_faithful",
+        root / "basicsr" / "archs" / "atd_arch.py",
+    )
+    return module.ATD(
+        upscale=4,
+        img_size=64,
+        in_chans=3,
+        embed_dim=216,
+        depths=(6, 6, 6, 6, 6, 6),
+        num_heads=(4, 4, 4, 4, 4, 4),
+        window_size=16,
+        dim_ffn_td=16,
+        category_size=256,
+        num_tokens=512,
+        reducted_dim=16,
+        convffn_kernel_size=5,
+        img_range=1.0,
+        mlp_ratio=2,
+        upsampler="pixelshuffle",
+        resi_connection="1conv",
+        use_checkpoint=False,
+    )
+
+
+def _build_official_mambair(root: Path) -> nn.Module:
+    _install_basicsr_stubs()
+    module = _load_file(
+        "official_mambair_arch_faithful",
+        root / "basicsr" / "archs" / "mambair_arch.py",
+    )
+    return module.MambaIR(
+        upscale=4,
+        img_size=64,
+        patch_size=1,
+        in_chans=3,
+        embed_dim=180,
+        depths=(6, 6, 6, 6, 6, 6),
+        d_state=16,
+        mlp_ratio=2,
+        img_range=1.0,
+        upsampler="pixelshuffle",
+        resi_connection="1conv",
+        use_checkpoint=False,
+    )
+
+
+def _build_official_mambairv2(root: Path) -> nn.Module:
+    _install_basicsr_stubs()
+    module = _load_file(
+        "official_mambairv2_arch_faithful",
+        root / "basicsr" / "archs" / "mambairv2_arch.py",
+    )
+    return module.MambaIRv2(
+        upscale=4,
+        img_size=64,
+        patch_size=1,
+        in_chans=3,
+        embed_dim=180,
+        d_state=16,
+        depths=(6, 6, 6, 6, 6, 6),
+        num_heads=(6, 6, 6, 6, 6, 6),
+        window_size=16,
+        inner_rank=64,
+        num_tokens=128,
+        convffn_kernel_size=5,
+        img_range=1.0,
+        mlp_ratio=2,
+        upsampler="pixelshuffle",
+        resi_connection="1conv",
+        use_checkpoint=False,
+    )
+
+
 OFFICIAL_BUILDERS = {
     "swinir": _build_official_swinir,
     "hat": _build_official_hat,
@@ -726,6 +884,10 @@ OFFICIAL_BUILDERS = {
     "mfghmoe": _build_official_mfghmoe,
     "ttst": _build_official_ttst,
     "fremamba": _build_official_fremamba,
+    "swin2mose": _build_official_swin2mose,
+    "atd": _build_official_atd,
+    "mambair": _build_official_mambair,
+    "mambairv2": _build_official_mambairv2,
 }
 
 
@@ -754,6 +916,11 @@ def build_benchmark_model(
         )
     if architecture_mode == "official":
         return OFFICIAL_BUILDERS[key](root)
+    if key not in RESIZE_CONV_BUILDERS:
+        raise ValueError(
+            f"{MODEL_SPECS[key].name} does not define a resize-convolution ablation. "
+            "Use architecture_mode='official' for faithful published-model comparisons."
+        )
     model = RESIZE_CONV_BUILDERS[key](root)
     offenders = pixelshuffle_modules(model)
     if offenders:

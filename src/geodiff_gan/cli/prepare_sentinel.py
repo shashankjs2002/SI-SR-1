@@ -13,11 +13,13 @@ from ..data.manifest import (
     write_manifest,
 )
 from ..data.sentinel import (
+    MULTISPECTRAL_PRESETS,
     canonical_product_id,
     discover_safe_products,
     extract_product_patches,
     product_matches_prefix,
     reassign_product_splits,
+    resolve_multispectral_bands,
     source_product_name,
 )
 
@@ -25,13 +27,33 @@ STATE_VERSION = 1
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Extract cloud-filtered Sentinel-2 RGB patches")
+    parser = argparse.ArgumentParser(
+        description="Extract cloud-filtered Sentinel-2 RGB or multispectral patches"
+    )
     parser.add_argument("--input", required=True, help="Directory containing .SAFE products")
     parser.add_argument("--output", required=True, help="Patch output directory")
     parser.add_argument("--manifest", required=True, help="JSONL manifest path")
     parser.add_argument("--patch-size", type=int, default=512)
     parser.add_argument("--stride", type=int, default=384)
     parser.add_argument("--minimum-valid-fraction", type=float, default=0.95)
+    parser.add_argument(
+        "--multispectral-preset",
+        choices=tuple(sorted(MULTISPECTRAL_PRESETS)),
+        default="rgb",
+        help=(
+            "Band preset for the conditioning tensor. 'rgb-nir-swir' writes "
+            "ms_hr with B04/B03/B02/B08/B11/B12 while keeping hr as RGB."
+        ),
+    )
+    parser.add_argument(
+        "--extra-band",
+        action="append",
+        default=[],
+        help=(
+            "Additional Sentinel-2 band for ms_hr conditioning, e.g. B05 or B8A. "
+            "Repeat for multiple bands."
+        ),
+    )
     parser.add_argument(
         "--state",
         help=(
@@ -97,6 +119,12 @@ def _settings(args: argparse.Namespace) -> dict[str, Any]:
         "patch_size": int(args.patch_size),
         "stride": int(args.stride),
         "minimum_valid_fraction": float(args.minimum_valid_fraction),
+        "extra_bands": list(
+            resolve_multispectral_bands(
+                args.multispectral_preset,
+                tuple(args.extra_band),
+            )
+        ),
     }
 
 
@@ -280,6 +308,8 @@ def main() -> None:
     state = {} if args.rebuild or not manifest_path.exists() else _load_state(state_path)
     if state:
         state_settings = state.get("settings", {})
+        if "extra_bands" not in state_settings:
+            state_settings["extra_bands"] = []
         if state_settings != current_settings:
             raise SystemExit(
                 "Preparation settings changed since the previous run. Existing "
@@ -332,6 +362,7 @@ def main() -> None:
             test_prefixes=args.test_prefix,
             unmatched_split=args.unmatched_split,
             show_progress=True,
+            extra_bands=current_settings["extra_bands"],
         )
         records = _merge_records(records, additions)
         records = reassign_product_splits(

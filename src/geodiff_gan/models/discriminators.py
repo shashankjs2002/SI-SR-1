@@ -14,8 +14,17 @@ def _spectral_conv(in_channels: int, out_channels: int, stride: int = 1) -> nn.M
 
 
 class PatchDiscriminator(nn.Module):
-    def __init__(self, in_channels: int = 6, base_channels: int = 64) -> None:
+    def __init__(
+        self,
+        in_channels: int | None = None,
+        base_channels: int = 64,
+        output_channels: int = 3,
+        condition_channels: int = 3,
+    ) -> None:
         super().__init__()
+        self.condition_channels = condition_channels
+        if in_channels is None:
+            in_channels = output_channels + condition_channels
         self.net = nn.Sequential(
             _spectral_conv(in_channels, base_channels, 2),
             nn.LeakyReLU(0.2, inplace=True),
@@ -29,15 +38,36 @@ class PatchDiscriminator(nn.Module):
         )
 
     def forward(self, hr: torch.Tensor, lr: torch.Tensor) -> torch.Tensor:
-        condition = F.interpolate(lr, size=hr.shape[-2:], mode="bilinear", align_corners=False)
+        if lr.shape[1] < self.condition_channels:
+            raise ValueError(
+                f"Expected at least {self.condition_channels} LR condition channels, "
+                f"got {lr.shape[1]}"
+            )
+        condition = F.interpolate(
+            lr[:, : self.condition_channels],
+            size=hr.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )
         return self.net(torch.cat((hr, condition), dim=1))
 
 
 class MultiScaleDiscriminator(nn.Module):
-    def __init__(self, scales: int = 3, base_channels: int = 64) -> None:
+    def __init__(
+        self,
+        scales: int = 3,
+        base_channels: int = 64,
+        output_channels: int = 3,
+        condition_channels: int = 3,
+    ) -> None:
         super().__init__()
         self.discriminators = nn.ModuleList(
-            PatchDiscriminator(base_channels=base_channels) for _ in range(scales)
+            PatchDiscriminator(
+                base_channels=base_channels,
+                output_channels=output_channels,
+                condition_channels=condition_channels,
+            )
+            for _ in range(scales)
         )
 
     def forward(self, hr: torch.Tensor, lr: torch.Tensor) -> list[torch.Tensor]:
@@ -54,13 +84,31 @@ class MultiScaleDiscriminator(nn.Module):
 
 
 class WaveletDiscriminator(nn.Module):
-    def __init__(self, base_channels: int = 64) -> None:
+    def __init__(
+        self,
+        base_channels: int = 64,
+        output_channels: int = 3,
+        condition_channels: int = 3,
+    ) -> None:
         super().__init__()
-        self.net = PatchDiscriminator(in_channels=18, base_channels=base_channels)
+        self.condition_channels = condition_channels
+        self.net = PatchDiscriminator(
+            in_channels=output_channels * 3 + condition_channels * 3,
+            base_channels=base_channels,
+        )
 
     def forward(self, hr: torch.Tensor, lr: torch.Tensor) -> torch.Tensor:
+        if lr.shape[1] < self.condition_channels:
+            raise ValueError(
+                f"Expected at least {self.condition_channels} LR condition channels, "
+                f"got {lr.shape[1]}"
+            )
         _, lh, hl, hh = haar_wavelet(hr)
         high_frequency = torch.cat((lh, hl, hh), dim=1)
-        lr_condition = F.interpolate(lr, size=high_frequency.shape[-2:], mode="area")
+        lr_condition = F.interpolate(
+            lr[:, : self.condition_channels],
+            size=high_frequency.shape[-2:],
+            mode="area",
+        )
         lr_condition = lr_condition.repeat(1, 3, 1, 1)
         return self.net.net(torch.cat((high_frequency, lr_condition), dim=1))

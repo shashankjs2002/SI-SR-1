@@ -321,6 +321,45 @@ class CoreTests(unittest.TestCase):
             self.assertTrue(torch.equal(first["clean_lr"], second["clean_lr"]))
             self.assertTrue(torch.equal(first["degradation"], second["degradation"]))
 
+    def test_multispectral_conditioning_keeps_rgb_target_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            patch = root / "patch.npz"
+            rng = np.random.default_rng(7)
+            np.savez_compressed(
+                patch,
+                hr=rng.random((3, 64, 64)).astype(np.float32),
+                ms_hr=rng.random((6, 64, 64)).astype(np.float32),
+            )
+            manifest = root / "manifest.jsonl"
+            write_manifest(
+                manifest,
+                [
+                    ManifestRecord(
+                        patch=str(patch),
+                        tile_id="TEST_TILE",
+                        split="test",
+                        row=0,
+                        col=0,
+                        valid_fraction=1.0,
+                    )
+                ],
+            )
+            dataset = SentinelPatchDataset(
+                manifest,
+                split="test",
+                augment=False,
+                random_degradation=False,
+                degradation_seed=42,
+                condition_key="ms_hr",
+                output_channels=3,
+            )
+            sample = dataset[0]
+            self.assertEqual(tuple(sample["hr"].shape), (3, 64, 64))
+            self.assertEqual(tuple(sample["lr"].shape), (6, 16, 16))
+            self.assertEqual(tuple(sample["lr_rgb"].shape), (3, 16, 16))
+            self.assertEqual(tuple(sample["clean_lr"].shape), (3, 16, 16))
+
     def test_dataset_reads_multi_caption_jsonl_with_relative_patch(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

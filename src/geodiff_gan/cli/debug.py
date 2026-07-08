@@ -61,6 +61,9 @@ def main() -> None:
         random_degradation=False,
         degradation_seed=int(config["data"].get("degradation_seed", 0)),
         degradation_severity=config["data"].get("degradation_severity", "mild"),
+        target_key=config["data"].get("target_key", "hr"),
+        condition_key=config["data"].get("condition_key"),
+        output_channels=config["model"].get("output_channels", 3),
     )
     if not dataset:
         raise RuntimeError(f"No samples found in split {args.split!r}")

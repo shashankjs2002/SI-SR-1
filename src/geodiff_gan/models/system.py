@@ -44,6 +44,8 @@ class GeoDiffGAN(nn.Module):
     def __init__(
         self,
         scale: int = 4,
+        input_channels: int = 3,
+        output_channels: int = 3,
         base_embed_dim: int = 60,
         base_depth: int = 6,
         base_heads: int = 6,
@@ -71,6 +73,8 @@ class GeoDiffGAN(nn.Module):
     ) -> None:
         super().__init__()
         self.scale = scale
+        self.input_channels = input_channels
+        self.output_channels = output_channels
         self.latent_channels = latent_channels
         self.context_dim = context_dim
         self.use_text_conditioning = use_text_conditioning
@@ -81,14 +85,16 @@ class GeoDiffGAN(nn.Module):
         self.use_back_projection = use_back_projection
         self.degradation_severity = degradation_severity
         self.base = SwinIRBase(
+            in_channels=input_channels,
             embed_dim=base_embed_dim,
             depth=base_depth,
             heads=base_heads,
             window_size=window_size,
             scale=scale,
+            output_channels=output_channels,
         )
         self.vae = ResidualVAE(latent_channels=latent_channels, base_channels=vae_channels)
-        self.lr_encoder = LREncoder(channels=lr_channels)
+        self.lr_encoder = LREncoder(in_channels=input_channels, channels=lr_channels)
         self.diffusion = ConditionalDiffusionUNet(
             latent_channels=latent_channels,
             widths=diffusion_widths,
@@ -119,6 +125,8 @@ class GeoDiffGAN(nn.Module):
         model = config.get("model", config)
         return cls(
             scale=model.get("scale", 4),
+            input_channels=model.get("input_channels", 3),
+            output_channels=model.get("output_channels", 3),
             base_embed_dim=model.get("base_embed_dim", 60),
             base_depth=model.get("base_depth", 6),
             base_heads=model.get("base_heads", 6),
@@ -153,6 +161,13 @@ class GeoDiffGAN(nn.Module):
                 "degradation_severity", "mild"
             ),
         )
+
+    def output_lr(self, lr: torch.Tensor) -> torch.Tensor:
+        if lr.shape[1] < self.output_channels:
+            raise ValueError(
+                f"Expected at least {self.output_channels} LR channels, got {lr.shape[1]}"
+            )
+        return lr[:, : self.output_channels]
 
     def apply_ablation_inputs(
         self, context: torch.Tensor, degradation: torch.Tensor
@@ -257,7 +272,7 @@ class GeoDiffGAN(nn.Module):
         lr_features: list[torch.Tensor] | None = None,
     ) -> GeoDiffOutput:
         base = self.base(lr) if base is None else base
-        consistency_lr = lr if projection_lr is None else projection_lr
+        consistency_lr = self.output_lr(lr) if projection_lr is None else projection_lr
         if not conditioning_prepared:
             context, degradation = self.apply_ablation_inputs(context, degradation)
         lr_features = self.lr_encoder(lr) if lr_features is None else lr_features
@@ -268,7 +283,7 @@ class GeoDiffGAN(nn.Module):
             diagnostics.capture(
                 "base.bicubic",
                 torch.nn.functional.interpolate(
-                    lr,
+                    self.output_lr(lr),
                     scale_factor=self.scale,
                     mode="bicubic",
                     align_corners=False,
@@ -448,6 +463,8 @@ class GeoDiffGAN(nn.Module):
                     "mode": mode,
                     "synthetic_edit": mode == "edit",
                     "scale": self.scale,
+                    "input_channels": self.input_channels,
+                    "output_channels": self.output_channels,
                     "back_projection_steps": steps,
                     "dual_policy_gating": True,
                     "uncertainty_abstention": self.use_uncertainty_abstention,

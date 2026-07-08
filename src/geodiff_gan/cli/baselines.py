@@ -58,6 +58,9 @@ def main() -> None:
         random_degradation=False,
         degradation_seed=int(config["data"].get("degradation_seed", 0)),
         degradation_severity=config["data"].get("degradation_severity", "mild"),
+        target_key=config["data"].get("target_key", "hr"),
+        condition_key=config["data"].get("condition_key"),
+        output_channels=config["model"].get("output_channels", 3),
     )
     if len(dataset) == 0:
         raise SystemExit(
@@ -98,12 +101,14 @@ def main() -> None:
     with torch.no_grad():
         for batch in progress:
             lr = batch["lr"].to(device)
+            lr_rgb = batch.get("lr_rgb", batch["lr"]).to(device)
+            lr_rgb = lr_rgb[:, : int(config["model"].get("output_channels", 3))]
             clean_lr = batch["clean_lr"].to(device)
             hr = batch["hr"].to(device)
             degradation = batch["degradation"].to(device)
             predictions = {
                 "bicubic": F.interpolate(
-                    lr, size=hr.shape[-2:], mode="bicubic", align_corners=False
+                    lr_rgb, size=hr.shape[-2:], mode="bicubic", align_corners=False
                 ).clamp(0, 1)
             }
             if model is not None:
@@ -123,9 +128,10 @@ def main() -> None:
                     severity=config["data"].get("degradation_severity", "mild"),
                 )
                 values.update(optional_metrics(prediction, hr))
-                values["observed_lr_noise_l1"] = float((lr - clean_lr).abs().mean())
+                observed_noise = lr_rgb - clean_lr
+                values["observed_lr_noise_l1"] = float(observed_noise.abs().mean())
                 values["observed_lr_noise_to_signal"] = float(
-                    (lr - clean_lr).abs().mean()
+                    observed_noise.abs().mean()
                     / clean_lr.abs().mean().clamp_min(1e-8)
                 )
                 for metric, value in values.items():

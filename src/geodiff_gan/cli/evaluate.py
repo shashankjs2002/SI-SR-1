@@ -141,6 +141,9 @@ def main() -> None:
         random_degradation=False,
         degradation_seed=int(config["data"].get("degradation_seed", 0)),
         degradation_severity=config["data"].get("degradation_severity", "mild"),
+        target_key=config["data"].get("target_key", "hr"),
+        condition_key=config["data"].get("condition_key"),
+        output_channels=config["model"].get("output_channels", 3),
     )
     if len(dataset) == 0:
         raise SystemExit(
@@ -171,6 +174,8 @@ def main() -> None:
     for index, batch in enumerate(progress):
         patch_started = time.monotonic()
         lr = batch["lr"].to(device)
+        lr_rgb = batch.get("lr_rgb", batch["lr"]).to(device)
+        lr_rgb = lr_rgb[:, : int(config["model"].get("output_channels", 3))]
         clean_lr = batch["clean_lr"].to(device)
         hr = batch["hr"].to(device)
         degradation = batch["degradation"].to(device)
@@ -266,9 +271,10 @@ def main() -> None:
             scale=model.scale,
             severity=model.degradation_severity,
         )
-        values["observed_lr_noise_l1"] = float((lr - clean_lr).abs().mean())
+        observed_noise = lr_rgb - clean_lr
+        values["observed_lr_noise_l1"] = float(observed_noise.abs().mean())
         values["observed_lr_noise_to_signal"] = float(
-            (lr - clean_lr).abs().mean() / clean_lr.abs().mean().clamp_min(1e-8)
+            observed_noise.abs().mean() / clean_lr.abs().mean().clamp_min(1e-8)
         )
         values.update(optional_metrics(mean, hr))
         error_map = (mean - hr).abs().mean(dim=1, keepdim=True)

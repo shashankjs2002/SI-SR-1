@@ -105,10 +105,14 @@ class Trainer:
             config["training"].get("gradient_checkpointing", True)
         )
         self.patch_discriminator = MultiScaleDiscriminator(
-            base_channels=config["training"].get("discriminator_channels", 64)
+            base_channels=config["training"].get("discriminator_channels", 64),
+            output_channels=self.model.output_channels,
+            condition_channels=self.model.output_channels,
         ).to(self.device)
         self.wavelet_discriminator = WaveletDiscriminator(
-            base_channels=config["training"].get("discriminator_channels", 64)
+            base_channels=config["training"].get("discriminator_channels", 64),
+            output_channels=self.model.output_channels,
+            condition_channels=self.model.output_channels,
         ).to(self.device)
         if self.distributed:
             self.patch_discriminator = DistributedDataParallel(
@@ -243,6 +247,9 @@ class Trainer:
             ),
             degradation_seed=int(data.get("degradation_seed", 0)),
             degradation_severity=data.get("degradation_severity", "mild"),
+            target_key=data.get("target_key", "hr"),
+            condition_key=data.get("condition_key"),
+            output_channels=self.config["model"].get("output_channels", 3),
         )
         sampler = (
             DistributedSampler(dataset, shuffle=split == "train")
@@ -304,8 +311,17 @@ class Trainer:
         model: GeoDiffGAN = unwrap(self.model)  # type: ignore[assignment]
         hr = batch["hr"].to(self.device, non_blocking=True)
         lr = batch["lr"].to(self.device, non_blocking=True)
-        consistency_lr = batch.get("clean_lr", batch["lr"]).to(
-            self.device, non_blocking=True
+        lr_rgb_value = batch.get("lr_rgb")
+        lr_rgb = (
+            lr_rgb_value.to(self.device, non_blocking=True)
+            if lr_rgb_value is not None
+            else model.output_lr(lr)
+        )
+        consistency_lr_value = batch.get("clean_lr")
+        consistency_lr = (
+            consistency_lr_value.to(self.device, non_blocking=True)
+            if consistency_lr_value is not None
+            else lr_rgb
         )
         degradation = batch["degradation"].to(self.device, non_blocking=True)
         losses: dict[str, torch.Tensor] = {}
@@ -320,7 +336,7 @@ class Trainer:
                 diagnostics.capture(
                     "base.bicubic",
                     F.interpolate(
-                        lr,
+                        lr_rgb,
                         scale_factor=model.scale,
                         mode="bicubic",
                         align_corners=False,
@@ -630,13 +646,20 @@ class Trainer:
                 totals["loss_total"] += float(total_loss.detach())
                 if self.stage != "diffusion":
                     model: GeoDiffGAN = unwrap(self.model)  # type: ignore[assignment]
+                    metric_lr_value = batch.get("clean_lr")
+                    if metric_lr_value is None:
+                        metric_lr = model.output_lr(
+                            batch["lr"].to(self.device, non_blocking=True)
+                        )
+                    else:
+                        metric_lr = metric_lr_value.to(
+                            self.device,
+                            non_blocking=True,
+                        )
                     values = basic_metrics(
                         prediction,
                         batch["hr"].to(self.device, non_blocking=True),
-                        batch.get("clean_lr", batch["lr"]).to(
-                            self.device,
-                            non_blocking=True,
-                        ),
+                        metric_lr,
                         batch["degradation"].to(
                             self.device,
                             non_blocking=True,
@@ -960,7 +983,9 @@ class Trainer:
                         if self.stage == "base":
                             debug_base = prediction
                             debug_residual = prediction - torch.nn.functional.interpolate(
-                                lr,
+                                batch.get("lr_rgb", batch["lr"]).to(self.device)[
+                                    :, : unwrap(self.model).output_channels
+                                ],
                                 size=prediction.shape[-2:],
                                 mode="bicubic",
                                 align_corners=False,
@@ -968,8 +993,14 @@ class Trainer:
                         else:
                             debug_base = unwrap(self.model).base(lr)
                             debug_residual = prediction - debug_base
+                        debug_lr_value = batch.get("lr_rgb")
+                        debug_lr = (
+                            debug_lr_value.to(self.device)
+                            if debug_lr_value is not None
+                            else unwrap(self.model).output_lr(lr)
+                        )
                         diagnostics.add_spatial_metrics(
-                            lr,
+                            debug_lr,
                             debug_base,
                             debug_residual,
                             prediction,
@@ -977,7 +1008,7 @@ class Trainer:
                             scale=unwrap(self.model).scale,
                             target=hr,
                             consistency_lr=batch.get(
-                                "clean_lr", batch["lr"]
+                                "clean_lr", debug_lr
                             ).to(self.device),
                             degradation_severity=unwrap(
                                 self.model

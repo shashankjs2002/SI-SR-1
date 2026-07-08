@@ -97,11 +97,15 @@ class SwinIRBase(nn.Module):
         window_size: int = 8,
         heads: int = 6,
         scale: int = 4,
+        output_channels: int = 3,
     ) -> None:
         super().__init__()
         if scale not in (2, 4, 8):
             raise ValueError("Pixel-shuffle scale must be 2, 4, or 8")
+        if in_channels < output_channels:
+            raise ValueError("in_channels must be >= output_channels")
         self.scale = scale
+        self.output_channels = output_channels
         self.shallow = nn.Conv2d(in_channels, embed_dim, 3, padding=1)
         self.blocks = nn.ModuleList(
             WindowTransformerBlock(
@@ -125,7 +129,7 @@ class SwinIRBase(nn.Module):
             )
             remaining //= 2
         self.upsample = nn.Sequential(*upsamplers)
-        self.output = nn.Conv2d(embed_dim, 3, 3, padding=1)
+        self.output = nn.Conv2d(embed_dim, output_channels, 3, padding=1)
 
     def forward(self, lr: torch.Tensor) -> torch.Tensor:
         shallow = self.shallow(lr)
@@ -134,5 +138,10 @@ class SwinIRBase(nn.Module):
             features = block(features)
         features = shallow + self.body(features)
         residual = self.output(self.upsample(features))
-        bicubic = F.interpolate(lr, scale_factor=self.scale, mode="bicubic", align_corners=False)
+        bicubic = F.interpolate(
+            lr[:, : self.output_channels],
+            scale_factor=self.scale,
+            mode="bicubic",
+            align_corners=False,
+        )
         return (bicubic + residual).clamp(0, 1)

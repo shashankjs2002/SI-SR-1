@@ -49,10 +49,14 @@ def build_parameter_report(
         config.get("training", {}).get("discriminator_channels", 64)
     )
     patch_discriminator = MultiScaleDiscriminator(
-        base_channels=discriminator_channels
+        base_channels=discriminator_channels,
+        output_channels=model.output_channels,
+        condition_channels=model.output_channels,
     )
     wavelet_discriminator = WaveletDiscriminator(
-        base_channels=discriminator_channels
+        base_channels=discriminator_channels,
+        output_channels=model.output_channels,
+        condition_channels=model.output_channels,
     )
     discriminator_counts = {
         "conditional_multiscale_patchgan": count_parameters(patch_discriminator),
