@@ -201,6 +201,62 @@ if REPOSITORY_DIR.exists():
 else:
     run(["git", "clone", "--depth", "1", REPOSITORY_URL, REPOSITORY_DIR])
 
+def patch_geodiff_source_compatibility():
+    # Patch older cloned source trees inside the assigned DGX folder only.
+    system_path = REPOSITORY_DIR / "src" / "geodiff_gan" / "models" / "system.py"
+    parameters_path = REPOSITORY_DIR / "src" / "geodiff_gan" / "parameters.py"
+    for path in (system_path, parameters_path):
+        assert_inside(path)
+        if not path.exists():
+            raise FileNotFoundError(path)
+
+    system_text = system_path.read_text(encoding="utf-8")
+    changed = False
+    if "self.output_channels = output_channels" not in system_text:
+        if "self.input_channels = input_channels\\n" in system_text:
+            system_text = system_text.replace(
+                "        self.input_channels = input_channels\\n",
+                "        self.input_channels = input_channels\\n"
+                "        self.output_channels = output_channels\\n",
+                1,
+            )
+        else:
+            system_text = system_text.replace(
+                "        self.scale = scale\\n",
+                "        self.scale = scale\\n"
+                "        self.input_channels = input_channels\\n"
+                "        self.output_channels = output_channels\\n",
+                1,
+            )
+        changed = True
+    if changed:
+        system_path.write_text(system_text, encoding="utf-8")
+        print("Patched GeoDiffGAN input/output channel attributes:", system_path)
+
+    parameters_text = parameters_path.read_text(encoding="utf-8")
+    if 'model_channels = config.get("model", config)' not in parameters_text:
+        needle = '    model = GeoDiffGAN.from_config(config)\\n'
+        replacement = (
+            '    model = GeoDiffGAN.from_config(config)\\n'
+            '    model_channels = config.get("model", config)\\n'
+            '    output_channels = int(\\n'
+            '        getattr(model, "output_channels", model_channels.get("output_channels", 3))\\n'
+            '    )\\n'
+        )
+        parameters_text = parameters_text.replace(needle, replacement, 1)
+        parameters_text = parameters_text.replace(
+            '        output_channels=model.output_channels,\\n',
+            '        output_channels=output_channels,\\n',
+        )
+        parameters_text = parameters_text.replace(
+            '        condition_channels=model.output_channels,\\n',
+            '        condition_channels=output_channels,\\n',
+        )
+        parameters_path.write_text(parameters_text, encoding="utf-8")
+        print("Patched parameter-report output channel fallback:", parameters_path)
+
+patch_geodiff_source_compatibility()
+
 run([*PIP, "install", "--upgrade", "pip", "setuptools", "wheel"])
 run([*PIP, "install", "numpy>=1.26", "Pillow>=10", "PyYAML>=6", "tqdm>=4.66", "rasterio>=1.3", "pandas>=2", "matplotlib>=3.8", "kaggle", "kagglehub", "ipykernel"])
 run([*PIP, "install", "-e", ".", "--no-deps"], cwd=REPOSITORY_DIR)
@@ -560,7 +616,7 @@ def build_config(variant):
         "captions": str(CAPTION_JSONL) if USE_CAPTIONS_FOR_GEODIFF and CAPTION_JSONL.exists() else None,
         "caption_field": "caption",
         "caption_sampling": "random" if USE_CAPTIONS_FOR_GEODIFF and CAPTION_JSONL.exists() else "fixed",
-        "random_caption_fields": ["brief", "descriptive", "analytical"],
+        "random_caption_fields": ["brief", "descriptive", "analytical", "positional"],
         "target_key": "hr",
         "train_degradation_sampling": "random",
         "degradation_seed": 42,

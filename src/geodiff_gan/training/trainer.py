@@ -238,7 +238,7 @@ class Trainer:
             random_caption_fields=tuple(
                 data.get(
                     "random_caption_fields",
-                    ("brief", "descriptive", "analytical"),
+                    ("brief", "descriptive", "analytical", "positional"),
                 )
             ),
             augment=is_train,

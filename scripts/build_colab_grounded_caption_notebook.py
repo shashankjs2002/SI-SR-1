@@ -62,7 +62,8 @@ cells = [
         ```
 
         The JSONL remains backward-compatible with GeoDiff-GAN training: it has a top-level
-        `caption` field and nested `captions.brief`, `captions.descriptive`, `captions.analytical`.
+        `caption` field and nested `captions.brief`, `captions.descriptive`,
+        `captions.analytical`, and `captions.positional`.
         """
     ),
     markdown("## 1. Install dependencies and mount Drive"),
@@ -92,7 +93,7 @@ cells = [
         TEST_CAPTION_JSONL = CAPTION_ROOT / "test_captions_10.jsonl"
 
         MODEL_ID = "Qwen/Qwen3-VL-8B-Instruct"
-        PREFERRED_CAPTION = "descriptive"     # "brief", "descriptive", or "analytical"
+        PREFERRED_CAPTION = "descriptive"     # "brief", "descriptive", "analytical", or "positional"
         CAPTION_SPLIT = "all"                # "all", "train", "val", or "test"
         START_INDEX = 0
         END_INDEX = None
@@ -524,6 +525,7 @@ Return one strict JSON object only:
 {{
   "brief": "maximum 18 words",
   "descriptive": "one or two neutral evidence-grounded sentences",
+  "positional": "detailed position-aware scene description using top/bottom/left/right/center, visible shape, and scene type",
   "analytical": {{
     "land_cover": ["conservative visible classes"],
     "visible_objects": ["only structures visibly resolved in RGB"],
@@ -544,6 +546,7 @@ Rules:
 - NDBI is not proof of buildings; use RGB geometry before saying built-up area.
 - NDVI supports vegetation amount but does not prove forest or agriculture by itself.
 - Describe roads, blocks, fields, ridges, quarries, or settlements only when geometry is visible.
+- In positional, describe relative location and shape only from visible evidence, for example: top-left round water body, bottom vegetation, central grid-like settlement.
 - Prefer "possible" and "unclear" over invention.
 - Never mention the panel, indices, bands, masks, prompt, or numerical values in the caption.
 {correction_text}'''
@@ -590,6 +593,7 @@ Rules:
             normalized = {
                 "brief": clean_string(payload.get("brief"), ""),
                 "descriptive": clean_string(payload.get("descriptive"), ""),
+                "positional": clean_string(payload.get("positional"), ""),
                 "analytical": {
                     "land_cover": clean_list(analytical.get("land_cover")),
                     "visible_objects": clean_list(analytical.get("visible_objects")),
@@ -615,6 +619,8 @@ Rules:
                 issues.append("brief exceeds 18 words")
             if not normalized["descriptive"]:
                 issues.append("descriptive caption is empty")
+            if not normalized["positional"]:
+                issues.append("positional caption is empty")
             if not normalized["brief"]:
                 issues.append("brief caption is empty")
             return normalized, issues
@@ -660,6 +666,13 @@ Rules:
                 cover = ", ".join(analytical["land_cover"][:4]) or "mixed land surface"
                 layout = analytical.get("spatial_layout", "unclear spatial arrangement")
                 payload["descriptive"] = f"The patch shows {cover}, with {layout}."
+            if not allowed(payload.get("positional", "")):
+                cover = ", ".join(analytical["land_cover"][:4]) or "mixed land surface"
+                layout = analytical.get("spatial_layout", "unclear spatial arrangement")
+                payload["positional"] = (
+                    f"Position-aware layout is unclear; the visible scene contains "
+                    f"{cover}, with {layout}."
+                )
             return payload
 
         def top_level_caption(payload):
@@ -667,6 +680,8 @@ Rules:
                 return payload["brief"]
             if PREFERRED_CAPTION == "analytical":
                 return analytical_to_text(payload["analytical"])
+            if PREFERRED_CAPTION == "positional":
+                return payload["positional"]
             return payload["descriptive"]
         """
     ),
@@ -799,9 +814,10 @@ Rules:
         for row, panel in test_outputs:
             display(panel.resize((900, 600)))
             print("index:", row["manifest_index"], "patch:", row["patch"])
-            print("brief:", row["captions"]["brief"])
-            print("descriptive:", row["captions"]["descriptive"])
-            print("analytical:", json.dumps(row["captions"]["analytical"], ensure_ascii=True, indent=2))
+    print("brief:", row["captions"]["brief"])
+    print("descriptive:", row["captions"]["descriptive"])
+    print("positional:", row["captions"].get("positional", ""))
+    print("analytical:", json.dumps(row["captions"]["analytical"], ensure_ascii=True, indent=2))
             print("-" * 100)
         """
     ),
@@ -1001,10 +1017,12 @@ Rules:
                 payload = json.loads(payload_text)
                 print("\nBRIEF")
                 print(payload["brief"])
-                print("\nDESCRIPTIVE")
-                print(payload["descriptive"])
-                print("\nANALYTICAL")
-                print(json.dumps(payload["analytical"], indent=2))
+        print("\nDESCRIPTIVE")
+        print(payload["descriptive"])
+        print("\nPOSITIONAL")
+        print(payload.get("positional", ""))
+        print("\nANALYTICAL")
+        print(json.dumps(payload["analytical"], indent=2))
 
         audit_rows = []
         for patch, index, payload_text, evidence_text_value in connection.execute(
@@ -1022,7 +1040,8 @@ Rules:
                 "vegetation_fraction": evidence["vegetation_fraction"],
                 "cloud_fraction": evidence["cloud_fraction"],
                 "issues": "; ".join(issues),
-                "caption": payload["descriptive"],
+        "caption": payload["descriptive"],
+        "positional": payload.get("positional", ""),
             })
 
         audit = pd.DataFrame(audit_rows)
@@ -1123,10 +1142,13 @@ Rules:
                     "#### Brief",
                     payload["brief"],
                     "",
-                    "#### Descriptive",
-                    payload["descriptive"],
-                    "",
-                    "#### Analytical",
+            "#### Descriptive",
+            payload["descriptive"],
+            "",
+            "#### Positional",
+            payload.get("positional", ""),
+            "",
+            "#### Analytical",
                     "```json\n" + json.dumps(payload["analytical"], indent=2) + "\n```",
                 ])
             return panel, "\n".join(caption_md), evidence
@@ -1163,7 +1185,7 @@ Rules:
         print("runtime_config['data']['captions'] = CAPTION_JSONL")
         print("runtime_config['data']['caption_field'] = 'caption'")
         print("runtime_config['data']['caption_sampling'] = 'random'")
-        print("runtime_config['data']['random_caption_fields'] = ['brief', 'descriptive', 'analytical']")
+print("runtime_config['data']['random_caption_fields'] = ['brief', 'descriptive', 'analytical', 'positional']")
         print("Keep original SAFE zips if you plan to regenerate or audit captions later.")
         """
     ),

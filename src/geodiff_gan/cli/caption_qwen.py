@@ -19,6 +19,7 @@ Required JSON schema:
 {
   "brief": "one short evidence-only phrase, maximum 18 words",
   "descriptive": "one or two neutral sentences describing visible land cover, objects, density, terrain, and texture",
+  "positional": "detailed position-aware description using top/bottom/left/right/center, visible shapes, and scene type",
   "analytical": {
     "land_cover": ["visible land-cover classes only"],
     "visible_objects": ["visible object or structure categories only"],
@@ -35,6 +36,7 @@ Rules:
 - Do not infer coordinates, city names, country names, ownership, people, events, or time.
 - Do not mention exact sensor/product metadata.
 - If uncertain, use "unclear" or "possibly" rather than inventing details.
+- In positional, describe relative location and visible shape only, such as top-left round water body, bottom vegetation, or central grid-like settlement.
 - Prefer remote-sensing terms such as agricultural fields, built-up area, roads, river channel,
   scrubland, bare soil, water body, forest, settlement, ridge, quarry, cloud, or haze when visible."""
 
@@ -134,7 +136,7 @@ def _caption_text(payload: dict[str, Any], preferred: str) -> str:
         text = value if isinstance(value, str) else ""
     if text:
         return text.strip()
-    for fallback in ("descriptive", "brief", "analytical"):
+    for fallback in ("descriptive", "positional", "brief", "analytical"):
         if fallback == preferred:
             continue
         value = payload.get(fallback)
@@ -156,7 +158,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--preferred-caption",
-        choices=("brief", "descriptive", "analytical"),
+        choices=("brief", "descriptive", "analytical", "positional"),
         default="descriptive",
         help="Caption variant copied into the backward-compatible top-level caption field.",
     )

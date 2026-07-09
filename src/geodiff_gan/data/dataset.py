@@ -26,6 +26,7 @@ class SentinelPatchDataset(Dataset):
             "brief",
             "descriptive",
             "analytical",
+            "positional",
         ),
         augment: bool = True,
         random_degradation: bool | None = None,

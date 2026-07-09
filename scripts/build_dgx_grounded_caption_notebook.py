@@ -40,7 +40,8 @@ cells = [
         4. Show Qwen3-VL a labelled multispectral panel plus numerical evidence.
         5. Remove claims that contradict strong spectral/SCL evidence.
         6. Commit every completed caption to SQLite, allowing exact crash recovery.
-        7. Export a backward-compatible JSONL file with `brief`, `descriptive`, and `analytical`.
+        7. Export a backward-compatible JSONL file with `brief`, `descriptive`,
+           `analytical`, and `positional`.
 
         **Important limitation:** NDVI cannot be recovered from the RGB `.npz` alone. The original
         Sentinel-2 SAFE products must remain available because NDVI needs B08 and MNDWI/NDBI need
@@ -478,6 +479,10 @@ cells = [
             schema = {
                 "brief": "maximum 18 words",
                 "descriptive": "one or two neutral evidence-grounded sentences",
+                "positional": (
+                    "detailed position-aware scene description using top/bottom/"
+                    "left/right/center, visible shape, and scene type"
+                ),
                 "analytical": {
                     "land_cover": ["conservative visible classes"],
                     "visible_objects": ["only structures visibly resolved in RGB"],
@@ -497,6 +502,7 @@ cells = [
                 "NDBI is not proof of buildings; use RGB geometry before saying built-up area.",
                 "NDVI supports vegetation amount but does not prove forest or agriculture by itself.",
                 "Describe roads, blocks, fields, ridges, quarries, or settlements only when their geometry is visible.",
+                "In positional, describe relative location and shape only from visible evidence, for example: top-left round water body, bottom vegetation, central grid-like settlement.",
                 'Prefer "possible" and "unclear" over invention.',
                 "Never mention the panel, indices, bands, masks, prompt, or numerical values in the caption.",
             ]
@@ -558,6 +564,7 @@ cells = [
             normalized = {
                 "brief": clean_string(payload.get("brief"), ""),
                 "descriptive": clean_string(payload.get("descriptive"), ""),
+                "positional": clean_string(payload.get("positional"), ""),
                 "analytical": {
                     "land_cover": clean_list(analytical.get("land_cover")),
                     "visible_objects": clean_list(analytical.get("visible_objects")),
@@ -583,6 +590,8 @@ cells = [
                 issues.append("brief exceeds 18 words")
             if not normalized["descriptive"]:
                 issues.append("descriptive caption is empty")
+            if not normalized["positional"]:
+                issues.append("positional caption is empty")
             if not normalized["brief"]:
                 issues.append("brief caption is empty")
             return normalized, issues
@@ -629,6 +638,13 @@ cells = [
                 cover = ", ".join(analytical["land_cover"][:4]) or "mixed land surface"
                 layout = analytical.get("spatial_layout", "unclear spatial arrangement")
                 payload["descriptive"] = f"The patch shows {cover}, with {layout}."
+            if not allowed(payload.get("positional", "")):
+                cover = ", ".join(analytical["land_cover"][:4]) or "mixed land surface"
+                layout = analytical.get("spatial_layout", "unclear spatial arrangement")
+                payload["positional"] = (
+                    f"Position-aware layout is unclear; the visible scene contains "
+                    f"{cover}, with {layout}."
+                )
             return payload
 
         def top_level_caption(payload):
@@ -636,6 +652,8 @@ cells = [
                 return payload["brief"]
             if PREFERRED_CAPTION == "analytical":
                 return analytical_to_text(payload["analytical"])
+            if PREFERRED_CAPTION == "positional":
+                return payload["positional"]
             return payload["descriptive"]
         """
     ),
@@ -933,6 +951,8 @@ cells = [
                 print(payload["brief"])
                 print("\nDESCRIPTIVE")
                 print(payload["descriptive"])
+                print("\nPOSITIONAL")
+                print(payload.get("positional", ""))
                 print("\nANALYTICAL")
                 print(json.dumps(payload["analytical"], indent=2))
 
@@ -960,6 +980,7 @@ cells = [
                 "cloud_fraction": evidence["cloud_fraction"],
                 "issues": "; ".join(issues),
                 "caption": payload["descriptive"],
+                "positional": payload.get("positional", ""),
             })
 
         audit = pd.DataFrame(audit_rows)
@@ -992,7 +1013,7 @@ cells = [
         print(f"runtime_config['data']['captions'] = {str(CAPTION_JSONL)!r}")
         print("runtime_config['data']['caption_field'] = 'caption'")
         print("runtime_config['data']['caption_sampling'] = 'random'")
-        print("runtime_config['data']['random_caption_fields'] = ['brief', 'descriptive', 'analytical']")
+        print("runtime_config['data']['random_caption_fields'] = ['brief', 'descriptive', 'analytical', 'positional']")
 
         # Keep the old caption file until this audit is satisfactory.
         # CAPTION_JSONL is already backward-compatible with SentinelPatchDataset.
