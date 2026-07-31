@@ -6,8 +6,17 @@ from pathlib import Path
 import torch
 from torch import nn
 
-from geodiff_gan.benchmark.models import ResizeConvHead, pixelshuffle_modules
-from geodiff_gan.benchmark.runner import BenchmarkConfig, CroppedDataset
+from geodiff_gan.benchmark.models import (
+    MODEL_SPECS,
+    OFFICIAL_BUILDERS,
+    ResizeConvHead,
+    pixelshuffle_modules,
+)
+from geodiff_gan.benchmark.runner import (
+    BenchmarkConfig,
+    CroppedDataset,
+    resolved_lr_crop,
+)
 
 
 class _ToyDataset:
@@ -15,10 +24,12 @@ class _ToyDataset:
         return 1
 
     def __getitem__(self, index: int):
+        lr = torch.arange(3 * 128 * 128, dtype=torch.float32).reshape(3, 128, 128)
+        hr = torch.arange(3 * 512 * 512, dtype=torch.float32).reshape(3, 512, 512)
         return {
-            "lr": torch.rand(3, 128, 128),
-            "clean_lr": torch.rand(3, 128, 128),
-            "hr": torch.rand(3, 512, 512),
+            "lr": lr,
+            "clean_lr": lr.clone(),
+            "hr": hr,
         }
 
 
@@ -49,6 +60,48 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(sample["lr"].shape, (3, 64, 64))
         self.assertEqual(sample["clean_lr"].shape, (3, 64, 64))
         self.assertEqual(sample["hr"].shape, (3, 256, 256))
+
+    def test_evaluation_crop_is_deterministic_and_centered(self) -> None:
+        dataset = _ToyDataset()
+        first = CroppedDataset(dataset, lr_crop=64, random_crop=False)[0]
+        second = CroppedDataset(dataset, lr_crop=64, random_crop=False)[0]
+        self.assertTrue(torch.equal(first["lr"], second["lr"]))
+        self.assertTrue(torch.equal(first["hr"], second["hr"]))
+
+    def test_native_size_is_model_specific(self) -> None:
+        srformer = BenchmarkConfig(
+            model="srformer",
+            source_root=Path("sources"),
+            manifest=Path("manifest.jsonl"),
+            output=Path("output"),
+        )
+        swinir = BenchmarkConfig(
+            model="swinir",
+            source_root=Path("sources"),
+            manifest=Path("manifest.jsonl"),
+            output=Path("output"),
+        )
+        self.assertEqual(resolved_lr_crop(srformer), 48)
+        self.assertEqual(resolved_lr_crop(swinir), 64)
+
+    def test_conflicting_native_size_is_rejected(self) -> None:
+        config = BenchmarkConfig(
+            model="srformer",
+            source_root=Path("sources"),
+            manifest=Path("manifest.jsonl"),
+            output=Path("output"),
+            lr_crop=64,
+        )
+        with self.assertRaisesRegex(ValueError, "official 48x48"):
+            resolved_lr_crop(config)
+
+    def test_latest_official_models_are_registered(self) -> None:
+        self.assertEqual(MODEL_SPECS["pft"].year, 2025)
+        self.assertEqual(MODEL_SPECS["pft"].native_lr_size, 64)
+        self.assertEqual(MODEL_SPECS["sat"].year, 2026)
+        self.assertEqual(MODEL_SPECS["sat"].native_lr_size, 64)
+        self.assertIn("pft", OFFICIAL_BUILDERS)
+        self.assertIn("sat", OFFICIAL_BUILDERS)
 
 
 if __name__ == "__main__":

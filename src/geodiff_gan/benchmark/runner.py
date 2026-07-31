@@ -26,10 +26,17 @@ from .models import MODEL_SPECS, build_benchmark_model
 
 
 class CroppedDataset(Dataset):
-    def __init__(self, dataset: Dataset, lr_crop: int = 64, scale: int = 4) -> None:
+    def __init__(
+        self,
+        dataset: Dataset,
+        lr_crop: int,
+        scale: int = 4,
+        random_crop: bool = True,
+    ) -> None:
         self.dataset = dataset
         self.lr_crop = lr_crop
         self.scale = scale
+        self.random_crop = random_crop
 
     def __len__(self) -> int:
         return len(self.dataset)
@@ -39,9 +46,18 @@ class CroppedDataset(Dataset):
         lr = sample["lr"]
         clean_lr = sample["clean_lr"]
         hr = sample["hr"]
-        crop = min(self.lr_crop, lr.shape[-2], lr.shape[-1])
-        top = int(torch.randint(0, lr.shape[-2] - crop + 1, ()).item())
-        left = int(torch.randint(0, lr.shape[-1] - crop + 1, ()).item())
+        crop = self.lr_crop
+        if lr.shape[-2] < crop or lr.shape[-1] < crop:
+            raise ValueError(
+                f"LR patch {tuple(lr.shape[-2:])} is smaller than the required "
+                f"native crop {crop}x{crop}"
+            )
+        if self.random_crop:
+            top = int(torch.randint(0, lr.shape[-2] - crop + 1, ()).item())
+            left = int(torch.randint(0, lr.shape[-1] - crop + 1, ()).item())
+        else:
+            top = (lr.shape[-2] - crop) // 2
+            left = (lr.shape[-1] - crop) // 2
         hr_top, hr_left = top * self.scale, left * self.scale
         sample["lr"] = lr[:, top : top + crop, left : left + crop]
         sample["clean_lr"] = clean_lr[:, top : top + crop, left : left + crop]
@@ -65,7 +81,7 @@ class BenchmarkConfig:
     accumulation: int = 8
     learning_rate: float = 2e-4
     weight_decay: float = 1e-4
-    lr_crop: int = 64
+    lr_crop: int | None = None
     num_workers: int = 4
     validation_limit: int = 64
     test_limit: int | None = 40
@@ -136,6 +152,19 @@ def _dataset(config: BenchmarkConfig, split: str, augment: bool) -> SentinelPatc
     )
 
 
+def resolved_lr_crop(config: BenchmarkConfig) -> int:
+    spec = MODEL_SPECS[config.model]
+    if config.lr_crop is None:
+        return spec.native_lr_size
+    if config.lr_crop != spec.native_lr_size:
+        raise ValueError(
+            f"{spec.name} must be trained and evaluated at its official "
+            f"{spec.native_lr_size}x{spec.native_lr_size} LR patch size; "
+            f"received --lr-crop {config.lr_crop}."
+        )
+    return config.lr_crop
+
+
 def _loss(
     prediction: torch.Tensor,
     target: torch.Tensor,
@@ -164,7 +193,13 @@ def evaluate(
     save_images: int = 0,
 ) -> dict[str, float]:
     device = next(model.parameters()).device
-    dataset = _dataset(config, split, augment=False)
+    crop = resolved_lr_crop(config)
+    dataset = CroppedDataset(
+        _dataset(config, split, augment=False),
+        lr_crop=crop,
+        scale=MODEL_SPECS[config.model].scale,
+        random_crop=False,
+    )
     loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)
     total = min(len(dataset), limit) if limit is not None else len(dataset)
     if total == 0:
@@ -227,9 +262,12 @@ def train(config: BenchmarkConfig) -> dict[str, Any]:
     ).to(device)
     model_signature = _model_signature(model)
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
+    crop = resolved_lr_crop(config)
     train_dataset = CroppedDataset(
         _dataset(config, "train", augment=True),
-        lr_crop=config.lr_crop,
+        lr_crop=crop,
+        scale=MODEL_SPECS[config.model].scale,
+        random_crop=True,
     )
     loader = DataLoader(
         train_dataset,
@@ -289,6 +327,11 @@ def train(config: BenchmarkConfig) -> dict[str, Any]:
         "parameters": parameter_count,
         "architecture_mode": config.architecture_mode,
         "model_signature": model_signature,
+        "validated_lr_size": [crop, crop],
+        "validated_hr_size": [
+            crop * MODEL_SPECS[config.model].scale,
+            crop * MODEL_SPECS[config.model].scale,
+        ],
         "config": {
             key: str(value) if isinstance(value, Path) else value
             for key, value in config.__dict__.items()

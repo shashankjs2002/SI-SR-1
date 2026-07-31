@@ -23,6 +23,8 @@ class ModelSpec:
     directory: str
     remote_sensing_specific: bool
     optional_dependency: str | None = None
+    native_lr_size: int = 64
+    scale: int = 4
 
 
 MODEL_SPECS: dict[str, ModelSpec] = {
@@ -52,6 +54,7 @@ MODEL_SPECS: dict[str, ModelSpec] = {
         "https://github.com/HVision-NKU/SRFormer.git",
         "SRFormer",
         False,
+        native_lr_size=48,
     ),
     "dat": ModelSpec(
         "DAT",
@@ -136,6 +139,25 @@ MODEL_SPECS: dict[str, ModelSpec] = {
         "MambaIR",
         False,
         "mamba_ssm",
+    ),
+    "pft": ModelSpec(
+        "PFT-SR",
+        "Progressive Focused Transformer for Single Image Super-Resolution",
+        2025,
+        "CVPR",
+        "https://github.com/CVL-UESTC/PFT-SR.git",
+        "PFT-SR",
+        False,
+        "fairscale, smm_cuda",
+    ),
+    "sat": ModelSpec(
+        "SAT",
+        "SAT: Selective Aggregation Transformer for Image Super-Resolution",
+        2026,
+        "CVPR Findings",
+        "https://github.com/PhuTran1005/SAT.git",
+        "SAT",
+        False,
     ),
 }
 
@@ -875,6 +897,69 @@ def _build_official_mambairv2(root: Path) -> nn.Module:
     )
 
 
+def _build_official_pft(root: Path) -> nn.Module:
+    missing = [
+        dependency
+        for dependency in ("fairscale", "smm_cuda")
+        if importlib.util.find_spec(dependency) is None
+    ]
+    if missing:
+        raise ImportError(
+            "The official PFT-SR architecture requires its released dependencies: "
+            f"{', '.join(missing)}. Build the repository's custom CUDA extension "
+            "instead of substituting a different attention implementation."
+        )
+    _install_basicsr_stubs()
+    module = _load_file(
+        "official_pft_arch_faithful",
+        root / "basicsr" / "archs" / "pft_arch.py",
+    )
+    return module.PFT(
+        upscale=4,
+        in_chans=3,
+        img_size=64,
+        embed_dim=240,
+        depths=(4, 4, 4, 6, 6, 6),
+        num_heads=6,
+        num_topk=(
+            1024, 1024, 1024, 1024,
+            256, 256, 256, 256,
+            128, 128, 128, 128,
+            64, 64, 64, 64, 64, 64,
+            32, 32, 32, 32, 32, 32,
+            16, 16, 16, 16, 16, 16,
+        ),
+        window_size=32,
+        convffn_kernel_size=7,
+        img_range=1.0,
+        mlp_ratio=2,
+        upsampler="pixelshuffle",
+        resi_connection="1conv",
+        use_checkpoint=False,
+    )
+
+
+def _build_official_sat(root: Path) -> nn.Module:
+    _install_basicsr_stubs()
+    module = _load_file(
+        "official_sat_arch_faithful",
+        root / "basicsr" / "archs" / "sat_arch.py",
+    )
+    return module.SAT(
+        upscale=4,
+        in_chans=3,
+        img_size=64,
+        img_range=1.0,
+        depth=(6, 6, 6, 6, 6, 6, 6, 6),
+        embed_dim=228,
+        num_heads=(6, 6, 6, 6, 6, 6, 6, 6),
+        mlp_ratio=2,
+        resi_connection="1conv",
+        split_size=(8, 32),
+        c_ratio=0.5,
+    )
+
+
 OFFICIAL_BUILDERS = {
     "swinir": _build_official_swinir,
     "hat": _build_official_hat,
@@ -888,6 +973,8 @@ OFFICIAL_BUILDERS = {
     "atd": _build_official_atd,
     "mambair": _build_official_mambair,
     "mambairv2": _build_official_mambairv2,
+    "pft": _build_official_pft,
+    "sat": _build_official_sat,
 }
 
 

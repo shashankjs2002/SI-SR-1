@@ -29,7 +29,15 @@ def main() -> None:
     parser.add_argument("--accumulation", type=int, default=8)
     parser.add_argument("--learning-rate", type=float, default=2e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--lr-crop", type=int, default=64)
+    parser.add_argument(
+        "--lr-crop",
+        type=int,
+        default=None,
+        help=(
+            "Audit override only. It must equal the selected model's official "
+            "training patch size; omit it to use the registry value."
+        ),
+    )
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--validation-limit", type=int, default=64)
     parser.add_argument("--test-limit", type=int, default=40)
@@ -50,6 +58,12 @@ def main() -> None:
         help="Build the model, run an x4 forward pass, and print architecture metadata.",
     )
     args = parser.parse_args()
+    spec = MODEL_SPECS[args.model]
+    if args.lr_crop is not None and args.lr_crop != spec.native_lr_size:
+        parser.error(
+            f"{spec.name} uses {spec.native_lr_size}x{spec.native_lr_size} LR "
+            f"patches in this protocol; received --lr-crop {args.lr_crop}."
+        )
     if args.probe_only:
         model = build_benchmark_model(
             args.model,
@@ -57,8 +71,20 @@ def main() -> None:
             architecture_mode=args.architecture_mode,
         )
         model.eval()
+        probe_size = spec.native_lr_size
         with torch.no_grad():
-            output = model(torch.rand(1, 3, 32, 32))
+            output = model(torch.rand(1, 3, probe_size, probe_size))
+        expected_output = [
+            1,
+            3,
+            probe_size * spec.scale,
+            probe_size * spec.scale,
+        ]
+        if list(output.shape) != expected_output:
+            raise RuntimeError(
+                f"{spec.name} produced {list(output.shape)} for its native input; "
+                f"expected {expected_output}."
+            )
         print(
             json.dumps(
                 {
@@ -66,7 +92,7 @@ def main() -> None:
                     "architecture_mode": args.architecture_mode,
                     "parameters": sum(value.numel() for value in model.parameters()),
                     "pixelshuffle_modules": pixelshuffle_modules(model),
-                    "probe_input": [1, 3, 32, 32],
+                    "probe_input": [1, 3, probe_size, probe_size],
                     "probe_output": list(output.shape),
                 },
                 indent=2,

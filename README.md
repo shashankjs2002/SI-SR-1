@@ -43,6 +43,12 @@ Keep `MODEL_SIZE` fixed across base, VAE, diffusion, joint, and edit stages. Che
 transferred between XS, small, medium, and large because their parameter tensor shapes differ.
 The notebook stores runs below a model-specific directory to prevent incompatible auto-resume.
 
+For the model-agnostic SOTA experiment, use
+[GeoDiff_GAN_Kaggle_SN_HFR_Paired_Benchmark.ipynb](kaggle/GeoDiff_GAN_Kaggle_SN_HFR_Paired_Benchmark.ipynb).
+It trains each unchanged official x4 backbone at its released LR crop, freezes the selected base
+checkpoint, trains the shared 1.16M-parameter SN-HFR residual wrapper, and reports only paired
+base-versus-refined statistics.
+
 ## Model
 
 ```text

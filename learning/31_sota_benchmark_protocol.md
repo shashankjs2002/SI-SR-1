@@ -1,123 +1,171 @@
-# Recent SR Benchmark Protocol
+# Paired SOTA High-Frequency Refiner Protocol
 
-## Is the proposed comparison correct?
+## Research question
 
-The objective is correct: compare GeoDiff-GAN against recent open-source
-super-resolution models trained on the same Sentinel-2 patches.
+The defensible research question is not:
 
-The original wording needs correction. There is no single "satellite SR SOTA in
-2026" because papers use different:
+> Which super-resolution model is best?
 
-- sensors and ground sampling distances;
-- synthetic or real LR formation;
-- single-image, multi-image, or continuous-scale inputs;
-- train/test geography;
-- RGB, multispectral, or panchromatic bands;
-- PSNR color spaces and crop borders.
+The models use different official crop sizes, training recipes, parameter
+budgets, and sometimes different restoration assumptions. A single leaderboard
+would mix those differences.
 
-The defensible claim is:
+The paired question is:
 
-> We compare recent open-source SR architectures under a controlled Sentinel-2
-> RGB synthetic 40 m to native 10 m x4 protocol.
+> For each unchanged open-source x4 SR backbone, does attaching the same
+> evidence-constrained high-frequency refiner improve reconstruction on
+> Sentinel-2 without degrading LR consistency?
 
-## Included papers
-
-| Adapter | Paper | Year | Domain | Official repository |
-|---|---|---:|---|---|
-| SwinIR | Image Restoration Using Swin Transformer | 2021 | generic SR | `JingyunLiang/SwinIR` |
-| HAT-S | Activating More Pixels in Image SR Transformer | 2023 | generic SR | `XPixelGroup/HAT` |
-| SRFormer | Permuted Self-Attention for SISR | 2023 | generic SR | `HVision-NKU/SRFormer` |
-| DAT | Dual Aggregation Transformer for Image SR | 2023 | generic SR | `zhengchen1999/DAT` |
-| OmniSR | Omni Aggregation Networks for Lightweight SR | 2023 | generic SR | `Francis0625/Omni-SR` |
-| TTST | Top-k Token Selective Transformer for RSI-SR | 2024 | remote sensing | `XY-boy/TTST` |
-| MFG-HMoE | Heterogeneous MoE for Remote Sensing Image SR | 2025 | remote sensing | `Mr-Bamboo/MFG-HMoE` |
-| FreMamba/FMSR | Frequency-Assisted Mamba for RSI-SR | 2024 | remote sensing | `XY-boy/FreMamba` |
-
-The first seven are the default benchmark. FreMamba is optional because
-`mamba_ssm` and `causal_conv1d` compile against a specific CUDA/PyTorch stack.
-
-## Methods deliberately not presented as trained baselines
-
-- A repository with inference weights but no released training code cannot meet
-  the requirement to train on our data.
-- Continuous-scale diffusion is a different task and compute regime. It should
-  be a separately budgeted experiment rather than silently mixed with
-  deterministic x4 backbones.
-- A 2026 paper should not be called reproducible solely because a repository
-  exists. The required training path must also be public and executable.
-
-## Shared data contract
-
-All models use the existing manifest and `SentinelPatchDataset`.
-
-Training:
-
-- HR comes from the same accepted NPZ patches.
-- LR is regenerated with random mild MTF/noise/quantization degradation.
-- LR crop is 64 x 64 and target crop is 256 x 256.
-- Horizontal/vertical flips and rotations come from the shared dataset loader.
-
-Validation and test:
-
-- Degradation is deterministic with seed 42.
-- Full 128 x 128 LR and 512 x 512 HR patches are evaluated.
-- Identical records are used for every model.
-- Screening uses the first 40 test records to match the existing GeoDiff
-  three-variant notebook. Full-test reporting requires rerunning every method,
-  including GeoDiff, without a limit.
-
-## Shared optimization
-
-Comparisons use optimizer updates rather than epochs.
+Each paper is therefore its own experiment:
 
 ```text
-L = Charbonnier
-  + 0.20 * (1 - SSIM)
-  + 0.10 * gradient L1
-  + 0.05 * Haar-wavelet L1
+official backbone M  ───────────────> base result
+same frozen backbone M + HF refiner ─> improved result
+                                      └─ report improved - base
 ```
 
-The optimizer is AdamW with the same initial learning rate, weight decay,
-gradient clipping, cosine schedule, validation cadence, and early-stopping rule.
+Scores from different rows must not be used to rank the backbones. The
+cross-backbone conclusion is limited to whether the refiner produces consistent
+paired gains across diverse architectures.
 
-This tests architecture quality under one satellite-specific objective. It does
-not reproduce each paper's original training recipe.
+## Included official implementations
+
+The executable registry contains more than ten released x4 models. Their
+released generator classes and reconstruction heads remain unchanged.
+
+| Key | Paper/model | Year | Domain | Official LR training crop | x4 HR crop |
+|---|---|---:|---|---:|---:|
+| `swinir` | SwinIR | 2021 | generic SR | 64 x 64 | 256 x 256 |
+| `hat` | HAT-S | 2023 | generic SR | 64 x 64 | 256 x 256 |
+| `srformer` | SRFormer | 2023 | generic SR | 48 x 48 | 192 x 192 |
+| `dat` | DAT | 2023 | generic SR | 64 x 64 | 256 x 256 |
+| `omnisr` | OmniSR | 2023 | lightweight SR | 64 x 64 | 256 x 256 |
+| `ttst` | TTST | 2024 | remote sensing | 64 x 64 | 256 x 256 |
+| `fremamba` | FreMamba/FMSR | 2024 | remote sensing | 64 x 64 | 256 x 256 |
+| `swin2mose` | Swin2-MoSE | 2024 | remote sensing | 64 x 64 | 256 x 256 |
+| `atd` | ATD | 2024 | generic SR | 64 x 64 | 256 x 256 |
+| `mambair` | MambaIR | 2024 | generic restoration | 64 x 64 | 256 x 256 |
+| `mfghmoe` | MFG-HMoE | 2025 | remote sensing | 64 x 64 | 256 x 256 |
+| `mambairv2` | MambaIRv2 | 2025 | generic restoration | 64 x 64 | 256 x 256 |
+| `pft` | PFT-SR | 2025 | generic SR | 64 x 64 | 256 x 256 |
+| `sat` | SAT | 2026 | generic SR | 64 x 64 | 256 x 256 |
+
+PFT uses its released progressive focused attention and PixelShuffle head. Its
+official source requires `fairscale` and the repository's compiled `smm_cuda`
+extension. Replacing that kernel with dense attention would change the method,
+so the benchmark fails explicitly when the dependency is absent.
+
+SAT uses the released CVPR 2026 x4 configuration: eight groups, embedding
+dimension 228, six heads per group, split sizes 8 and 32, and its original
+PixelShuffle reconstruction head.
+
+## Latest methods not in the trainable registry
+
+TexADiff is highly relevant because it is a CVPR 2026 remote-sensing diffusion
+method. Its official repository currently marks training-code release as
+unfinished. It may be cited and evaluated with released weights, but it cannot
+support the required "train base and paired refiner on our data" experiment
+until the authors release the training path.
+
+Large foundation restorers such as DiT4SR and VOSR require pretrained diffusion
+models, external text/vision encoders, and precomputed latent features. They
+belong in a separately budgeted generative case study, not in the deterministic
+paired training loop.
+
+## Native-size enforcement
+
+`ModelSpec.native_lr_size` records the released training crop. The benchmark
+uses it for all three splits:
+
+- training uses random aligned LR/HR crops;
+- validation uses a deterministic aligned center crop;
+- test uses the same deterministic rule;
+- LR, clean LR, and HR always share the exact crop origin;
+- an explicit conflicting `--lr-crop` is rejected.
+
+This means SRFormer is evaluated at 48 x 48 to 192 x 192. Models whose released
+training crop is 64 x 64 remain 64 x 64 to 256 x 256. Full 128 x 128 patches are
+not silently fed to every architecture.
+
+Different crop sizes are another reason not to compare absolute scores between
+model families. Within a pair, the records, crop coordinates, LR degradation,
+and target are identical.
+
+## Primary paired experiment
+
+For each model `M`:
+
+1. Train the unchanged official x4 backbone and select its checkpoint using
+   validation L1.
+2. Freeze that exact checkpoint.
+3. Train only the common high-frequency refiner on `HR - M(LR)`.
+4. Evaluate `M` and `M + refiner` on identical deterministic samples.
+5. Report paired deltas and bootstrap confidence intervals.
+
+The primary experiment freezes the backbone so improvement cannot be explained
+by giving the improved branch extra backbone updates. A secondary joint
+fine-tuning result is allowed only when accompanied by an equal-compute
+continued-training control for the base.
+
+The same refiner architecture, loss weights, optimizer family, update budget,
+and early-stopping rule must be used for every compatible backbone. Per-model
+hyperparameter tuning would weaken the claim that the module generalizes.
+
+## Required metrics
+
+Report the base value, improved value, and paired delta for each backbone:
+
+| Metric | Desired direction | Interpretation |
+|---|---:|---|
+| PSNR | higher | pixel fidelity |
+| SSIM | higher | structural fidelity |
+| LPIPS | lower | perceptual distance |
+| DISTS | lower | texture/structure distance |
+| edge F1 | higher | edge recovery |
+| wavelet L1 | lower | high-frequency reconstruction error |
+| LR re-degradation L1 | no worse | evidence consistency |
+| inference time and memory | lower | cost of improvement |
+
+Also report the fraction of test patches improved and a paired bootstrap 95%
+confidence interval. Across backbones, report only the refiner's win rate and
+effect consistency. Do not sort models into a leaderboard.
+
+## Controls needed for publication
+
+- `M` versus frozen `M + refiner`.
+- `M` with equal additional training updates but no refiner.
+- Refiner without high-pass projection.
+- Refiner without LR evidence conditioning.
+- Refiner with 0, 1, and 3 consistency projection steps.
+- Identical-parameter generic residual head as a capacity control.
+- Unseen-tile test split and, if possible, a second sensor or dataset.
+- At least three seeds for the final subset of representative backbones.
+
+The useful claim is a reusable refinement principle, not that one more module
+beats every published model. It becomes publishable when gains are repeated
+across transformer, state-space, lightweight, and remote-sensing backbones while
+LR consistency and artifact tests remain controlled.
 
 ## Architecture fidelity
 
-The main benchmark uses `architecture_mode=official`. It retains each official
-repository's released x4 architecture, including the original PixelShuffle,
-sub-pixel, or MoE reconstruction head where applicable.
+`architecture_mode=official` is mandatory for the primary result. The original
+generator class and upsampling head are retained, including PixelShuffle where
+the paper uses it.
 
-The models are retrained with a shared Sentinel-2 data and optimization
-protocol. This is a controlled architecture comparison, not a reproduction of
-each paper's original dataset and schedule.
+`resize_conv_ablation` changes a backbone and is therefore outside this paired
+claim. It may be reported as a separate artifact ablation, never as the
+published competitor.
 
-`architecture_mode=resize_conv_ablation` is optional. It replaces the official
-heads and changes the architectures. Such results must be labelled as
-adaptations and cannot be used as faithful competitor baselines.
+## Execution sequence
 
-## Recommended experiment sequence
+1. Probe every source at `native_lr_size` and require an exact x4 output.
+2. Run a 20-update smoke test for each official backbone.
+3. Train each base independently and retain best/latest checkpoints.
+4. Train the frozen paired refiner from the selected base checkpoint.
+5. Evaluate base and improved branches in one process on the same batches.
+6. Save per-patch metrics, paired deltas, images, frequency plots, and timing.
+7. Run final seeds only after artifact and LR-consistency checks pass.
 
-1. Run `smoke` for 20 updates to verify every model and output path.
-2. Run `screening` for 5,000 updates on all seven models.
-3. Select the strongest three using validation PSNR, SSIM, edge F1, and
-   re-degradation error.
-4. Run `paper` for 50,000 updates only on the shortlisted models.
-5. Repeat the final comparison on geographically unseen tiles.
-6. Report parameter count, GPU memory, training time, and inference time.
-
-Official and adapted modes use separate output directories. The checkpoint
-loader rejects attempts to resume one mode from the other.
-
-## Interpretation
-
-PSNR alone is insufficient.
-
-- High PSNR with low edge F1 indicates over-smoothing.
-- Good texture with poor re-degradation error indicates weak evidence
-  consistency or hallucination.
-- A small gain on intra-tile test patches does not establish geographic
-  generalization.
-- GeoDiff-GAN has stochastic sampling and a multi-stage optimizer budget.
-  Report both the practical final comparison and a matched-compute ablation.
+The benchmark registry, native crop enforcement, and SN-HFR runner now cover
+steps 1-6. The high-frequency wrapper is evaluated as a paired extension and is
+not folded into a cross-model score table.
