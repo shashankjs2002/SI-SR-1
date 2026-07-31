@@ -151,6 +151,38 @@ You should finish the course able to answer:
 7. Why are tile-level splits essential?
 8. Which proposed contributions require ablation before they can be called novel?
 9. How are offline satellite captions generated, sanitized, and consumed by the text encoder?
+10. Why is the hard Bernoulli projection mathematically equivalent to a GLinSAT-class layer?
+11. What makes a sensor-calibrated covariance model a testable research hypothesis rather than
+    a renamed quadratic consistency loss?
+12. Which calibration, diversity, and efficiency results would justify continuing to a journal
+    study?
+
+## Proposed SensorCal Paper Track
+
+Chapters 33-48 form a second, explicitly experimental track. They do not claim that the proposed
+SensorCal-LogisticProx layer has already been implemented or validated. The track starts from a
+prior-art correction: the hard logistic-entropy projection is not a new mathematical layer because
+it is equivalent to GLinSAT under a direct variable substitution.
+
+The remaining research question is narrower:
+
+> Can a low-capacity, physically structured Poisson-Gaussian covariance model improve calibration
+> and useful posterior diversity in conditional satellite SR without materially reducing
+> reconstruction fidelity or making inference impractical?
+
+```mermaid
+flowchart LR
+    A["Existing GeoDiff-GAN<br/>and frozen SR backbones"] -->
+    B["Six distinct output-layer arms"] -->
+    C["Single held-out-region pilot<br/>three seeds"] -->
+    D{"Pre-registered thresholds met?"}
+    D -- "No" --> E["Document a negative result<br/>do not claim a journal method"]
+    D -- "Yes" --> F["Scale to multiple regions<br/>and full ablations"]
+```
+
+Start this track at
+[33 - SensorCal Paper-Track Overview](33_sensorcal_paper_track_overview.md) only after completing
+the core architecture and evaluation chapters.
 
 ## Exercise
 

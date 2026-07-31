@@ -55,6 +55,25 @@ and a visually sharp satellite image is not automatically a spatially faithful r
 | 27 | [Uncertainty and abstention](27_uncertainty_and_abstention.md) | Quantify stochastic disagreement and reliability-aware blending |
 | 28 | [Complete system integration](28_complete_system_integration.md) | Join all modules, equations, tensor shapes, and training stages |
 | 29 | [Twelve-tile improved small-model run](29_twelve_tile_small_improvement_run.md) | Apply artifact, confidence, detail, checkpoint, and early-stopping improvements |
+| 30 | [Caption generation pipeline](30_caption_generation_pipeline.md) | Build restartable, grounded remote-sensing captions and dataset review |
+| 31 | [Paired SOTA refiner protocol](31_sota_benchmark_protocol.md) | Evaluate each official backbone only against its own high-frequency-refined pair |
+| 32 | [Sensor-nullspace high-frequency refiner](32_sensor_nullspace_high_frequency_refiner.md) | Understand the shared frozen-backbone residual architecture, losses, and paired statistics |
+| 33 | [SensorCal paper-track overview](33_sensorcal_paper_track_overview.md) | Separate the proposed paper hypothesis from the implemented GeoDiff-GAN system |
+| 34 | [Satellite observation model](34_satellite_observation_model.md) | Define the synthetic 40 m sensor operator, noise process, and physical limitations |
+| 35 | [Prior art and novelty boundary](35_prior_art_and_novelty.md) | Distinguish SensorCal from GLinSAT-class layers and projection-based diffusion methods |
+| 36 | [Probabilistic foundations](36_probabilistic_foundations.md) | Derive Bernoulli logistic projection, Gaussian likelihood, and calibration assumptions |
+| 37 | [Six-arm pilot experiment](37_six_arm_pilot.md) | Compare genuinely distinct consistency and calibration mechanisms fairly |
+| 38 | [Sensor noise calibration](38_sensor_noise_calibration.md) | Design an identifiable Poisson-Gaussian variance model without residual absorption |
+| 39 | [SensorCal architecture](39_sensorcal_architecture.md) | Trace the proposed output layer, tensor sizes, and backbone integration |
+| 40 | [Convex solver and gradients](40_convex_solver_and_gradients.md) | Derive the dual problem, Newton-CG solve, adjoint, and implicit gradients |
+| 41 | [Implementation blueprint](41_implementation_blueprint.md) | Map the research design onto repository modules, interfaces, CLIs, and tests |
+| 42 | [Data and geographic splits](42_data_and_splits.md) | Build auditable, incremental, leak-free training and evaluation data |
+| 43 | [Training protocol](43_training_protocol.md) | Train the calibrator and comparison arms with reproducible checkpointing |
+| 44 | [Metrics and calibration](44_metrics_and_calibration.md) | Measure reconstruction, noise recovery, calibration, diversity, and efficiency |
+| 45 | [Statistics and go/no-go rules](45_statistics_and_go_no_go.md) | Pre-register hypotheses, tile-level statistics, and paper continuation criteria |
+| 46 | [Diagnostics and visualization](46_diagnostics_and_visualization.md) | Diagnose operators, solver convergence, variance collapse, and diversity |
+| 47 | [Paper writing guide](47_paper_writing_guide.md) | Present a narrow, defensible contribution without overstating novelty |
+| 48 | [Reproducibility and submission](48_reproducibility_and_submission.md) | Audit evidence, package artifacts, and decide whether the study is submission-ready |
 
 ## Recommended Pace
 
@@ -64,7 +83,9 @@ flowchart LR
     B["Week 2<br/>Ch. 04-07<br/>Generative SR"] -->
     C["Week 3<br/>Ch. 08-10<br/>GeoDiff-GAN"] -->
     D["Week 4<br/>Ch. 11-18<br/>Evaluation and research"] -->
-    E["Week 5<br/>Ch. 19-29<br/>Modules and improved experiment"]
+    E["Week 5<br/>Ch. 19-32<br/>Modules and paired experiments"] -->
+    F["Week 6<br/>Ch. 33-40<br/>SensorCal theory and pilot"] -->
+    G["Week 7<br/>Ch. 41-48<br/>Implementation and paper evidence"]
 ```
 
 For each chapter:
