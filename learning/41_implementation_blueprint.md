@@ -10,11 +10,19 @@
 
 ## 1. Implementation status
 
-Everything in this chapter is a **blueprint** until corresponding source files
-and tests are added.
+The isolated SensorCal core is now implemented additively in:
 
-The implementation should be additive. Existing training, inference, and
-benchmark commands must continue to work.
+- `src/geodiff_gan/constraints/` for linear operators, exact adjoints,
+  Euclidean and logistic proximal layers, noise calibration, and six study
+  arms;
+- `src/geodiff_gan/experiments/constraint_study.py` for paired application of
+  all arms to the same backbone prediction and LR observation;
+- `tests/test_constraints.py` for operator, convergence, gradient, covariance,
+  and six-arm smoke tests.
+
+The full checkpoint-driven pilot CLI and large-scale geographic experiment
+remain future work. Passing the isolated tests establishes implementation
+correctness only; it does not validate the SensorCal research hypothesis.
 
 ## 2. Proposed file layout
 
