@@ -24,6 +24,13 @@ notebook clones this repository, installs it without replacing Kaggle's CUDA PyT
 patches, optionally runs Qwen3-VL-8B captioning, trains all selected stages, and exports metrics and
 checkpoints.
 
+For the evidence-aware caption novelty experiment, use
+[GeoDiff_GAN_Kaggle_Evidence_Aware_Caption_Study.ipynb](kaggle/GeoDiff_GAN_Kaggle_Evidence_Aware_Caption_Study.ipynb).
+It starts from an existing joint checkpoint, trains only the opt-in prompt-support controller, and
+evaluates matched, null, paraphrased, and deliberately mismatched prompts with identical diffusion
+noise. The hypothesis, novelty boundary, failure criteria, and required ablations are specified in
+[learning chapter 49](learning/49_evidence_aware_caption_novelty.md).
+
 After creating your GitHub repository, replace `OWNER` in the notebook's `REPOSITORY_URL` cell with
 your GitHub username or organization.
 

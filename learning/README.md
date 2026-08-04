@@ -74,6 +74,7 @@ and a visually sharp satellite image is not automatically a spatially faithful r
 | 46 | [Diagnostics and visualization](46_diagnostics_and_visualization.md) | Diagnose operators, solver convergence, variance collapse, and diversity |
 | 47 | [Paper writing guide](47_paper_writing_guide.md) | Present a narrow, defensible contribution without overstating novelty |
 | 48 | [Reproducibility and submission](48_reproducibility_and_submission.md) | Audit evidence, package artifacts, and decide whether the study is submission-ready |
+| 49 | [Evidence-aware caption novelty](49_evidence_aware_caption_novelty.md) | Control prompt authority, reject contradictions, and run paired caption ablations |
 
 ## Recommended Pace
 
