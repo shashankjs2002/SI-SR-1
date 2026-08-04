@@ -27,6 +27,8 @@ class GeoDiffOutput:
     latent: torch.Tensor
     evidence_confidence: torch.Tensor
     edit_permission: torch.Tensor
+    prompt_support: torch.Tensor
+    prompt_permission: torch.Tensor
     abstention_map: torch.Tensor
     raw_detail_residual: torch.Tensor
     raw_edit_residual: torch.Tensor
@@ -65,6 +67,9 @@ class GeoDiffGAN(nn.Module):
         use_degradation_conditioning: bool = True,
         use_evidence_gate: bool = True,
         use_edit_gate: bool = True,
+        use_prompt_evidence_controller: bool = False,
+        sr_prompt_scale: float = 0.15,
+        prompt_ambiguity_floor: float = 0.05,
         use_uncertainty_abstention: bool = True,
         abstention_confidence_floor: float = 0.0,
         uncertainty_scale: float = 0.0025,
@@ -79,6 +84,7 @@ class GeoDiffGAN(nn.Module):
         self.context_dim = context_dim
         self.use_text_conditioning = use_text_conditioning
         self.use_degradation_conditioning = use_degradation_conditioning
+        self.use_prompt_evidence_controller = use_prompt_evidence_controller
         self.use_uncertainty_abstention = use_uncertainty_abstention
         self.abstention_confidence_floor = float(abstention_confidence_floor)
         self.uncertainty_scale = float(uncertainty_scale)
@@ -111,6 +117,9 @@ class GeoDiffGAN(nn.Module):
             style_dim=style_dim,
             use_evidence_gate=use_evidence_gate,
             use_edit_gate=use_edit_gate,
+            use_prompt_evidence_controller=use_prompt_evidence_controller,
+            sr_prompt_scale=sr_prompt_scale,
+            prompt_ambiguity_floor=prompt_ambiguity_floor,
         )
         self.decoder = ResidualSRDecoder(
             content_channels=mapper_channels,
@@ -149,6 +158,15 @@ class GeoDiffGAN(nn.Module):
             use_degradation_conditioning=model.get("use_degradation_conditioning", True),
             use_evidence_gate=model.get("use_evidence_gate", True),
             use_edit_gate=model.get("use_edit_gate", True),
+            use_prompt_evidence_controller=model.get(
+                "use_prompt_evidence_controller",
+                False,
+            ),
+            sr_prompt_scale=model.get("sr_prompt_scale", 0.15),
+            prompt_ambiguity_floor=model.get(
+                "prompt_ambiguity_floor",
+                0.05,
+            ),
             use_uncertainty_abstention=model.get(
                 "use_uncertainty_abstention", True
             ),
@@ -326,6 +344,16 @@ class GeoDiffGAN(nn.Module):
                 mapped.edit_permission,
                 visual="heatmap",
             )
+            diagnostics.capture(
+                "mapper.prompt_support",
+                mapped.prompt_support,
+                visual="heatmap",
+            )
+            diagnostics.capture(
+                "mapper.prompt_permission",
+                mapped.prompt_permission,
+                visual="heatmap",
+            )
             for index, style in enumerate(mapped.styles):
                 diagnostics.capture(f"mapper.style_{index}", style)
             diagnostics.capture(
@@ -369,6 +397,12 @@ class GeoDiffGAN(nn.Module):
             )
             diagnostics.scalar(
                 "mapper.edit_permission_mean", mapped.edit_permission.mean()
+            )
+            diagnostics.scalar(
+                "mapper.prompt_support_mean", mapped.prompt_support.mean()
+            )
+            diagnostics.scalar(
+                "mapper.prompt_permission_mean", mapped.prompt_permission.mean()
             )
             diagnostics.capture(
                 "output.abstention_map", 1 - evidence_hr, visual="heatmap"
@@ -457,6 +491,8 @@ class GeoDiffGAN(nn.Module):
         metadata = []
         evidence_means = mapped.evidence_confidence.flatten(1).mean(dim=1)
         permission_means = mapped.edit_permission.flatten(1).mean(dim=1)
+        prompt_support_means = mapped.prompt_support.flatten(1).mean(dim=1)
+        prompt_permission_means = mapped.prompt_permission.flatten(1).mean(dim=1)
         for index in range(lr.shape[0]):
             metadata.append(
                 {
@@ -474,6 +510,13 @@ class GeoDiffGAN(nn.Module):
                     "edit_permission_mean": float(
                         permission_means[index].detach()
                     ),
+                    "prompt_evidence_controller": self.use_prompt_evidence_controller,
+                    "prompt_support_mean": float(
+                        prompt_support_means[index].detach()
+                    ),
+                    "prompt_permission_mean": float(
+                        prompt_permission_means[index].detach()
+                    ),
                 }
             )
         return GeoDiffOutput(
@@ -483,6 +526,8 @@ class GeoDiffGAN(nn.Module):
             latent=latent,
             evidence_confidence=mapped.evidence_confidence,
             edit_permission=mapped.edit_permission,
+            prompt_support=mapped.prompt_support,
+            prompt_permission=mapped.prompt_permission,
             abstention_map=1 - evidence_hr,
             raw_detail_residual=raw_detail,
             raw_edit_residual=raw_edit,

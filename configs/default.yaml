@@ -23,6 +23,9 @@ model:
   use_degradation_conditioning: true
   use_evidence_gate: true
   use_edit_gate: true
+  use_prompt_evidence_controller: false
+  sr_prompt_scale: 0.15
+  prompt_ambiguity_floor: 0.05
   use_uncertainty_abstention: true
   abstention_confidence_floor: 0.0
   uncertainty_scale: 0.0025
@@ -49,6 +52,9 @@ prompts:
   null_probability: 0.4
   paraphrase_probability: 0.2
   mismatch_probability: 0.1
+  evidence_aware:
+    pair_training: false
+    suppression_weight: 1.0
 
 debug:
   enabled: false
@@ -108,4 +114,7 @@ training:
     edit_localization: 0.05
     edit_permission: 0.05
     prompt_alignment: 0.05
+    prompt_policy: 0.0
+    prompt_contradiction: 0.0
+    prompt_utility: 0.0
     adversarial: 0.01

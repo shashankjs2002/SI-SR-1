@@ -44,6 +44,7 @@ geodiff-debug = "geodiff_gan.cli.debug:main"
 geodiff-parameters = "geodiff_gan.cli.parameters:main"
 geodiff-benchmark-sota = "geodiff_gan.cli.benchmark_sota:main"
 geodiff-benchmark-refiner = "geodiff_gan.cli.benchmark_refiner:main"
+geodiff-prompt-ablation = "geodiff_gan.cli.prompt_ablation:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -383,6 +383,36 @@ class TrainingSmokeTest(unittest.TestCase):
             self.assertIn("edit_permission", losses)
             self.assertIn("edit_localization", losses)
 
+    def test_evidence_aware_joint_adds_paired_prompt_losses(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, config = self._fixture(root)
+            config["model"]["use_prompt_evidence_controller"] = True
+            config["training"].update(
+                {
+                    "stage": "joint",
+                    "output_dir": str(root / "prompt_policy"),
+                    "train_back_projection_steps": 0,
+                }
+            )
+            config["prompts"] = {
+                "null_probability": 0.0,
+                "paraphrase_probability": 0.0,
+                "mismatch_probability": 1.0,
+                "evidence_aware": {
+                    "pair_training": True,
+                    "suppression_weight": 1.0,
+                },
+            }
+            trainer = Trainer(config)
+            batch = next(iter(trainer._loader("train")))
+            _, losses = trainer._forward_stage(batch)
+            self.assertIn("prompt_policy", losses)
+            self.assertIn("prompt_contradiction", losses)
+            self.assertIn("prompt_utility", losses)
+            self.assertTrue(torch.isfinite(losses["prompt_policy"]))
+            self.assertTrue(torch.isfinite(losses["prompt_contradiction"]))
+
 
 if __name__ == "__main__":
     unittest.main()

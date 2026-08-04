@@ -43,6 +43,8 @@ class MapperOutput:
     styles: list[torch.Tensor]
     evidence_confidence: torch.Tensor
     edit_permission: torch.Tensor
+    prompt_support: torch.Tensor
+    prompt_permission: torch.Tensor
 
     @property
     def evidence_gate(self) -> torch.Tensor:
@@ -85,6 +87,9 @@ class GeoMapper(nn.Module):
         stages: int = 4,
         use_evidence_gate: bool = True,
         use_edit_gate: bool = True,
+        use_prompt_evidence_controller: bool = False,
+        sr_prompt_scale: float = 0.15,
+        prompt_ambiguity_floor: float = 0.05,
     ) -> None:
         super().__init__()
         self.input = nn.Conv2d(latent_channels + lr_channels, content_channels, 3, padding=1)
@@ -104,6 +109,24 @@ class GeoMapper(nn.Module):
             nn.Conv2d(content_channels, 1, 1),
             nn.Sigmoid(),
         )
+        if use_prompt_evidence_controller:
+            self.prompt_lr_projection = nn.Conv2d(
+                lr_channels,
+                content_channels,
+                1,
+            )
+            self.prompt_context_projection = nn.Linear(
+                context_dim,
+                content_channels,
+            )
+            self.prompt_logit_scale = nn.Parameter(torch.tensor(0.0))
+            self.prompt_logit_bias = nn.Parameter(torch.tensor(0.0))
+        else:
+            # Keep legacy variants and checkpoints structurally unchanged.
+            self.prompt_lr_projection = None
+            self.prompt_context_projection = None
+            self.prompt_logit_scale = None
+            self.prompt_logit_bias = None
         self.style_heads = nn.ModuleList(
             nn.Sequential(
                 nn.Linear(content_channels + context_dim, style_dim),
@@ -114,6 +137,9 @@ class GeoMapper(nn.Module):
         )
         self.use_evidence_gate = use_evidence_gate
         self.use_edit_gate = use_edit_gate
+        self.use_prompt_evidence_controller = use_prompt_evidence_controller
+        self.sr_prompt_scale = float(sr_prompt_scale)
+        self.prompt_ambiguity_floor = float(prompt_ambiguity_floor)
 
     def forward(
         self,
@@ -140,10 +166,45 @@ class GeoMapper(nn.Module):
             edit_permission = torch.ones_like(edit_permission)
         edit_permission = edit_permission * mode_strength
 
+        if self.use_prompt_evidence_controller:
+            assert self.prompt_lr_projection is not None
+            assert self.prompt_context_projection is not None
+            assert self.prompt_logit_scale is not None
+            assert self.prompt_logit_bias is not None
+            prompt_key = F.normalize(
+                self.prompt_lr_projection(lr_feature),
+                dim=1,
+                eps=1e-6,
+            )
+            prompt_query = F.normalize(
+                self.prompt_context_projection(pooled_context),
+                dim=1,
+                eps=1e-6,
+            )[:, :, None, None]
+            prompt_logits = (prompt_key * prompt_query).sum(
+                dim=1,
+                keepdim=True,
+            )
+            prompt_logits = (
+                prompt_logits * self.prompt_logit_scale.exp().clamp(max=100.0)
+                + self.prompt_logit_bias
+            )
+            prompt_support = torch.sigmoid(prompt_logits)
+            ambiguity_floor = min(max(self.prompt_ambiguity_floor, 0.0), 1.0)
+            ambiguity = (
+                ambiguity_floor
+                + (1.0 - ambiguity_floor) * (1.0 - evidence_confidence)
+            )
+            prompt_permission = prompt_support * ambiguity
+        else:
+            # This exactly recovers the earlier SR prompt policy.
+            prompt_support = torch.ones_like(evidence_confidence)
+            prompt_permission = evidence_confidence
+
         # SR receives weak, evidence-constrained semantics. Edit mode receives
         # spatial prompt injection only where the edit policy grants permission.
         prompt_strength = (
-            0.15 * evidence_confidence * (1 - mode_strength)
+            self.sr_prompt_scale * prompt_permission * (1 - mode_strength)
             + edit_permission * mode_strength
         )
         gated_content = content + context_map * prompt_strength
@@ -158,6 +219,8 @@ class GeoMapper(nn.Module):
             styles,
             evidence_confidence,
             edit_permission,
+            prompt_support,
+            prompt_permission,
         )
 
 

@@ -1,0 +1,38 @@
+model:
+  use_text_conditioning: true
+  use_prompt_evidence_controller: true
+  sr_prompt_scale: 0.15
+  prompt_ambiguity_floor: 0.05
+
+data:
+  caption_sampling: random
+  random_caption_fields: [brief, descriptive, analytical]
+
+prompts:
+  null_probability: 0.25
+  paraphrase_probability: 0.25
+  mismatch_probability: 0.25
+  evidence_aware:
+    pair_training: true
+    suppression_weight: 1.0
+
+training:
+  stage: prompt_policy
+  epochs: 12
+  learning_rate: 0.00002
+  early_stopping_patience: 4
+  early_stopping_min_epochs: 4
+  keep_best_and_latest: true
+  loss_weights:
+    charbonnier: 1.0
+    consistency: 1.0
+    ssim: 0.2
+    gradient: 0.1
+    perceptual: 0.1
+    wavelet: 0.05
+    diffusion: 1.0
+    evidence_calibration: 0.1
+    prompt_policy: 0.05
+    prompt_contradiction: 0.1
+    prompt_utility: 0.05
+    adversarial: 0.003

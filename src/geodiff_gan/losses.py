@@ -10,7 +10,11 @@ from .models.blocks import haar_wavelet
 from .models.degradation import sensor_degrade
 
 
-def charbonnier(prediction: torch.Tensor, target: torch.Tensor, epsilon: float = 1e-3) -> torch.Tensor:
+def charbonnier(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    epsilon: float = 1e-3,
+) -> torch.Tensor:
     return torch.sqrt((prediction - target).square() + epsilon**2).mean()
 
 
@@ -136,6 +140,74 @@ def edit_localization_loss(
         align_corners=False,
     )
     return ((1 - permission) * raw_edit_residual.abs()).mean()
+
+
+def prompt_evidence_policy_loss(
+    prompt_support: torch.Tensor,
+    prompt_permission: torch.Tensor,
+    prompt_kinds: list[str],
+    suppression_weight: float = 1.0,
+) -> torch.Tensor:
+    """Supervise prompt support and suppress unsupported SR permissions."""
+
+    if prompt_support.shape[0] != len(prompt_kinds):
+        raise ValueError("prompt_kinds must contain one label per batch member")
+    positive = {"original", "paraphrase"}
+    negative = {"null", "mismatch"}
+    unknown = sorted(set(prompt_kinds) - positive - negative)
+    if unknown:
+        raise ValueError(f"unknown prompt kinds: {unknown}")
+    targets = prompt_support.new_tensor(
+        [1.0 if kind in positive else 0.0 for kind in prompt_kinds]
+    )
+    support_mean = prompt_support.flatten(1).mean(dim=1)
+    support_loss = F.binary_cross_entropy(
+        support_mean.clamp(1e-6, 1 - 1e-6),
+        targets,
+    )
+    negative_mask = targets == 0
+    if negative_mask.any():
+        suppression = prompt_permission[negative_mask].mean()
+    else:
+        suppression = prompt_permission.new_zeros(())
+    return support_loss + float(suppression_weight) * suppression
+
+
+def prompt_contradiction_loss(
+    prompted: torch.Tensor,
+    null_prompt: torch.Tensor,
+    prompt_kinds: list[str],
+) -> torch.Tensor:
+    """Make mismatched SR prompts behave like the paired null prompt."""
+
+    mismatch = torch.tensor(
+        [kind == "mismatch" for kind in prompt_kinds],
+        device=prompted.device,
+        dtype=torch.bool,
+    )
+    if not mismatch.any():
+        return prompted.new_zeros(())
+    return F.l1_loss(prompted[mismatch], null_prompt[mismatch])
+
+
+def prompt_utility_loss(
+    prompted: torch.Tensor,
+    null_prompt: torch.Tensor,
+    target: torch.Tensor,
+    prompt_kinds: list[str],
+) -> torch.Tensor:
+    """One-sided loss preventing grounded prompts from underperforming null."""
+
+    matched = torch.tensor(
+        [kind in {"original", "paraphrase"} for kind in prompt_kinds],
+        device=prompted.device,
+        dtype=torch.bool,
+    )
+    if not matched.any():
+        return prompted.new_zeros(())
+    prompted_error = (prompted - target).abs().flatten(1).mean(dim=1)
+    null_error = (null_prompt - target).abs().flatten(1).mean(dim=1)
+    return F.relu(prompted_error[matched] - null_error[matched]).mean()
 
 
 def snr_weighted_velocity_loss(

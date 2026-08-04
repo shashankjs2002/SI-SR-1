@@ -18,6 +18,33 @@ COUNTERFACTUAL_PROMPTS = (
 )
 
 
+def paraphrase_prompt(prompt: str) -> str:
+    prompt = prompt.strip()
+    return f"Overhead satellite view containing: {prompt}" if prompt else ""
+
+
+def mismatched_prompt(prompt: str) -> str:
+    """Choose the counterfactual template with least token overlap."""
+
+    source_tokens = set(re.findall(r"[a-z0-9]+", prompt.lower()))
+    scored: list[tuple[float, str]] = []
+    for candidate in COUNTERFACTUAL_PROMPTS:
+        candidate_tokens = set(re.findall(r"[a-z0-9]+", candidate.lower()))
+        union = source_tokens | candidate_tokens
+        overlap = len(source_tokens & candidate_tokens) / max(len(union), 1)
+        scored.append((overlap, candidate))
+    return min(scored, key=lambda item: (item[0], item[1]))[1]
+
+
+def controlled_prompt_variants(prompt: str) -> dict[str, str]:
+    return {
+        "matched": prompt.strip(),
+        "null": "",
+        "paraphrase": paraphrase_prompt(prompt),
+        "mismatch": mismatched_prompt(prompt),
+    }
+
+
 class TextEncoder(nn.Module, ABC):
     context_dim: int
 
@@ -167,7 +194,7 @@ def augment_prompts(
             values[index] = ""
             kinds[index] = "null"
         elif random_values[index] < null_probability + paraphrase_probability:
-            values[index] = f"Overhead satellite view containing: {values[index]}"
+            values[index] = paraphrase_prompt(values[index])
             kinds[index] = "paraphrase"
         elif (
             random_values[index]

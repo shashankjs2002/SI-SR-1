@@ -31,6 +31,9 @@ from ..losses import (
     generator_hinge,
     gradient_loss,
     kl_loss,
+    prompt_contradiction_loss,
+    prompt_evidence_policy_loss,
+    prompt_utility_loss,
     snr_weighted_velocity_loss,
     ssim,
     wavelet_loss,
@@ -123,6 +126,12 @@ class Trainer:
             )
         self.perceptual = OptionalPerceptualLoss().to(self.device)
         parameters = [parameter for parameter in self.model.parameters() if parameter.requires_grad]
+        if not parameters:
+            raise ValueError(
+                f"Training stage {self.stage!r} has no trainable parameters. "
+                "Enable model.mapper.use_prompt_evidence_controller for "
+                "the prompt_policy stage."
+            )
         self.optimizer = torch.optim.AdamW(
             parameters,
             lr=float(config["training"]["learning_rate"]),
@@ -357,7 +366,7 @@ class Trainer:
             )
             return prediction, losses
 
-        context, _, used_prompts, prompt_kinds = self._contexts(
+        context, null_context, used_prompts, prompt_kinds = self._contexts(
             list(batch["caption"]),
             training=training,
         )
@@ -563,6 +572,66 @@ class Trainer:
                 )
             ),
         )
+        if mode == "sr" and model.use_prompt_evidence_controller:
+            evidence_aware = self.config.get("prompts", {}).get(
+                "evidence_aware",
+                {},
+            )
+            losses["prompt_policy"] = prompt_evidence_policy_loss(
+                output.prompt_support,
+                output.prompt_permission,
+                prompt_kinds,
+                suppression_weight=float(
+                    evidence_aware.get("suppression_weight", 1.0)
+                ),
+            )
+            if bool(evidence_aware.get("pair_training", False)):
+                null_velocity = model.predict_velocity(
+                    diffusion_batch.noisy,
+                    diffusion_batch.timesteps,
+                    null_context,
+                    degradation,
+                    mode,
+                    lr_features,
+                )
+                null_clean = model.scheduler.predict_clean(
+                    diffusion_batch.noisy,
+                    null_velocity,
+                    diffusion_batch.timesteps,
+                )
+                null_output = model.decode_latent(
+                    null_clean,
+                    lr,
+                    null_context,
+                    degradation,
+                    mode=mode,
+                    base=base,
+                    projection_lr=consistency_lr,
+                    back_projection_steps=0,
+                    lr_features=lr_features,
+                )
+                losses["prompt_contradiction"] = prompt_contradiction_loss(
+                    output.sr_anchor,
+                    null_output.sr_anchor,
+                    prompt_kinds,
+                )
+                losses["prompt_utility"] = prompt_utility_loss(
+                    output.sr_anchor,
+                    null_output.sr_anchor,
+                    hr,
+                    prompt_kinds,
+                )
+                if diagnostics is not None:
+                    diagnostics.capture(
+                        "prompt.null_sr_anchor",
+                        null_output.sr_anchor,
+                        visual="rgb",
+                    )
+                    diagnostics.capture(
+                        "prompt.paired_absolute_change",
+                        (output.sr_anchor - null_output.sr_anchor).abs(),
+                        visual="heatmap",
+                    )
         if self.stage == "edit":
             losses["edit_localization"] = edit_localization_loss(
                 output.raw_edit_residual,
@@ -701,6 +770,9 @@ class Trainer:
             "edit_localization": 0.05,
             "edit_permission": 0.05,
             "prompt_alignment": 0.05,
+            "prompt_policy": 0.05,
+            "prompt_contradiction": 0.1,
+            "prompt_utility": 0.05,
             "adversarial": 0.01,
         }
         return sum(
