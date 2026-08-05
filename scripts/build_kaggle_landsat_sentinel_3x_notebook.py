@@ -799,7 +799,20 @@ cells = [
             print("No numeric metrics available for plotting.")
         """
     ),
-    markdown("## 15. Side-by-side output for an evaluated patch"),
+    markdown(
+        """
+        ## 15. Side-by-side output for an evaluated patch
+
+        The first panel is the original `128 x 128` Landsat patch rendered with
+        nearest-neighbor display so its native 30 m pixels remain visible. Bicubic is
+        shown separately and is used only to place Landsat on the `384 x 384` Sentinel
+        grid for visual and numerical comparison; it does not create new 10 m evidence.
+        The native panel is displayed at one-third the width and height of each `384 x 384`
+        panel so the figure also communicates the `1:3` linear pixel-count ratio. This
+        pixel-count-scaled layout is useful for inspecting array size, but the panels no
+        longer use the same visual map scale even though they cover the same ground extent.
+        """
+    ),
     code(
         r"""
         evaluation_records = [record for record in records if record["split"] == EVALUATION_SPLIT]
@@ -829,26 +842,160 @@ cells = [
         side_bicubic = F.interpolate(
             side_lr[None], size=side_hr.shape[-2:], mode="bicubic", align_corners=False
         )[0].clamp(0, 1)
-        side_images = [side_bicubic, side_output, side_hr]
+        side_images = [side_lr, side_bicubic, side_output, side_hr]
         side_displays = shared_stretch(side_images, side_valid)
 
-        fig, axes = plt.subplots(2, 3, figsize=(15, 10))
-        titles = ("Landsat bicubic", "GeoDiff-GAN 3x", "Sentinel target")
-        for column, (image, title) in enumerate(zip(side_displays, titles)):
-            axes[0, column].imshow(image.permute(1, 2, 0))
-            axes[0, column].set_title(title)
-            axes[0, column].axis("off")
-            error = (side_images[column] - side_hr).abs().mean(0) * side_valid
-            axes[1, column].imshow(error, cmap="turbo", vmin=0, vmax=max(0.05, float(error.quantile(0.99))))
-            axes[1, column].set_title(f"Masked L1={float(error[side_valid].mean()):.4f}")
-            axes[1, column].axis("off")
-        fig.suptitle(f"{side_record['tile_id']} | gap={side_record['day_gap']} day(s)")
-        fig.tight_layout()
+        titles = (
+            "Landsat original 30 m\n128 x 128 native pixels",
+            "Landsat bicubic display\n384 x 384 (no new information)",
+            "GeoDiff-GAN 3x\n384 x 384",
+            "Sentinel-2 target 10 m\n384 x 384",
+        )
+        fig = plt.figure(figsize=(22, 6.2), constrained_layout=True)
+        grid = fig.add_gridspec(1, 4, width_ratios=(1, 3, 3, 3))
+        axes = [fig.add_subplot(grid[0, index]) for index in range(4)]
+        for index, (image, title) in enumerate(zip(side_displays, titles)):
+            axis = axes[index]
+            axis.imshow(
+                image.permute(1, 2, 0),
+                interpolation="nearest" if index == 0 else "antialiased",
+            )
+            axis.set_title(title)
+            axis.axis("off")
+        fig.suptitle(
+            f"{side_record['tile_id']} | gap={side_record['day_gap']} day(s) | "
+            "panel dimensions scaled by pixel count (1:3)"
+        )
         plt.show()
+
+        comparison_errors = {
+            "Landsat bicubic vs Sentinel": (side_bicubic - side_hr).abs().mean(0) * side_valid,
+            "GeoDiff-GAN vs Sentinel": (side_output - side_hr).abs().mean(0) * side_valid,
+        }
+        valid_errors = torch.cat([error[side_valid] for error in comparison_errors.values()])
+        error_vmax = max(0.05, float(torch.quantile(valid_errors, 0.99)))
+        fig = plt.figure(figsize=(12, 5.2), constrained_layout=True)
+        error_grid = fig.add_gridspec(1, 3, width_ratios=(1, 1, 0.045))
+        error_axes = [fig.add_subplot(error_grid[0, index]) for index in range(2)]
+        color_axis = fig.add_subplot(error_grid[0, 2])
+        for axis, (title, error) in zip(error_axes, comparison_errors.items()):
+            plot = axis.imshow(error, cmap="turbo", vmin=0, vmax=error_vmax)
+            axis.set_title(f"{title}\nMasked L1={float(error[side_valid].mean()):.4f}")
+            axis.axis("off")
+        fig.colorbar(plot, cax=color_axis, label="Absolute reflectance error")
+        fig.suptitle("Error maps use the same color scale")
+        plt.show()
+        print("Native Landsat shape:", tuple(side_lr.shape))
+        print("Sentinel/output shape:", tuple(side_hr.shape))
         print("Evaluation cache:", result_path)
         """
     ),
-    markdown("## 16. Full intermediate diagnostic export"),
+    markdown(
+        """
+        ## 16. Deterministic base and generated high-frequency contribution
+
+        In SR mode, the decoder residual is high-pass filtered and evidence-gated before
+        being added to the deterministic base. The signed residual uses gray for zero,
+        brighter values for positive reflectance corrections, and darker values for
+        negative corrections. It is amplified only for visualization. The magnitude map
+        shows where the model adds the strongest detail regardless of sign.
+        """
+    ),
+    code(
+        r"""
+        from geodiff_gan.models.blocks import high_pass
+
+        with np.load(result_path) as data:
+            cached_names = set(data.files)
+            cached_base = chw(data["base"]) if "base" in cached_names else None
+            cached_residual = (
+                chw(data["decoder_residual"])
+                if "decoder_residual" in cached_names
+                else None
+            )
+            cached_net_addition = (
+                chw(data["net_addition"])
+                if "net_addition" in cached_names
+                else side_output - cached_base
+                if cached_base is not None
+                else None
+            )
+
+        if cached_base is None:
+            from geodiff_gan.models.system import GeoDiffGAN
+            from geodiff_gan.training.checkpoint import load_checkpoint
+
+            detail_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            detail_model = GeoDiffGAN.from_config(runtime_config).to(detail_device).eval()
+            load_checkpoint(evaluation_checkpoint, detail_model, strict=False)
+            with torch.inference_mode():
+                cached_base = detail_model.base(side_lr[None].to(detail_device))[0].float().cpu()
+            del detail_model
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        if cached_net_addition is None:
+            cached_net_addition = side_output - cached_base
+        if cached_residual is None:
+            # Older evaluation caches did not store the exact decoder residual. This
+            # fallback isolates the high-frequency part of the final net correction.
+            cached_residual = high_pass(cached_net_addition[None])[0]
+            residual_source = "estimated from final output - base (rerun Cell 13 for exact decoder residual)"
+        else:
+            residual_source = "exact stochastic-mean evidence-gated decoder residual"
+
+        base_plus_detail = (cached_base + cached_residual).clamp(0, 1)
+        base_display, base_plus_display = shared_stretch(
+            [cached_base, base_plus_detail, side_hr], side_valid
+        )[:2]
+        valid_residual_values = cached_residual[:, side_valid].abs()
+        display_limit = float(torch.quantile(valid_residual_values, 0.99).clamp_min(1e-6))
+        display_gain = 0.48 / display_limit
+        signed_display = (0.5 + cached_residual * display_gain).clamp(0, 1)
+        residual_magnitude = cached_residual.abs().mean(0) * side_valid
+        magnitude_vmax = max(
+            1e-5,
+            float(torch.quantile(residual_magnitude[side_valid], 0.99)),
+        )
+
+        fig = plt.figure(figsize=(20, 5.4), constrained_layout=True)
+        detail_grid = fig.add_gridspec(1, 5, width_ratios=(1, 1, 1, 1, 0.04))
+        detail_axes = [fig.add_subplot(detail_grid[0, index]) for index in range(4)]
+        detail_color_axis = fig.add_subplot(detail_grid[0, 4])
+        detail_axes[0].imshow(base_display.permute(1, 2, 0))
+        detail_axes[0].set_title("Deterministic base\n384 x 384")
+        detail_axes[1].imshow(signed_display.permute(1, 2, 0))
+        detail_axes[1].set_title(f"Signed generated high frequency\nvisual gain x{display_gain:.1f}")
+        magnitude_plot = detail_axes[2].imshow(
+            residual_magnitude,
+            cmap="turbo",
+            vmin=0,
+            vmax=magnitude_vmax,
+        )
+        detail_axes[2].set_title(
+            "High-frequency magnitude\n"
+            f"mean={float(residual_magnitude[side_valid].mean()):.5f}"
+        )
+        detail_axes[3].imshow(base_plus_display.permute(1, 2, 0))
+        detail_axes[3].set_title("Base + decoder high frequency\nbefore projection/abstention")
+        for axis in detail_axes:
+            axis.axis("off")
+        fig.colorbar(
+            magnitude_plot,
+            cax=detail_color_axis,
+            label="Absolute reflectance contribution",
+        )
+        fig.suptitle("Base branch and decoder detail contribution")
+        plt.show()
+
+        print("Residual source:", residual_source)
+        print("Base shape:", tuple(cached_base.shape))
+        print("Decoder residual shape:", tuple(cached_residual.shape))
+        print("Decoder residual absolute mean:", float(residual_magnitude[side_valid].mean()))
+        print("Final net addition absolute mean:", float(cached_net_addition[:, side_valid].abs().mean()))
+        """
+    ),
+    markdown("## 17. Full intermediate diagnostic export"),
     code(
         r"""
         diagnostic_output = DEBUG_ROOT / f"{EVALUATION_SPLIT}_index_{DEBUG_INDEX}"
@@ -889,7 +1036,7 @@ cells = [
         print("Complete diagnostic directory:", diagnostic_output)
         """
     ),
-    markdown("## 17. Uncertainty, evidence, abstention, and validity maps"),
+    markdown("## 18. Uncertainty, evidence, abstention, and validity maps"),
     code(
         r"""
         with np.load(result_path) as data:
@@ -927,7 +1074,7 @@ cells = [
     ),
     markdown(
         """
-        ## 18. Export model artifacts without deleting data
+        ## 19. Export model artifacts without deleting data
 
         The archive contains configs, checkpoints, evaluation, debug reports, manifest, and pairing
         state. Patch binaries are intentionally excluded because they can be many gigabytes and

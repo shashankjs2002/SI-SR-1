@@ -280,6 +280,11 @@ def main() -> None:
                 evidence, mean.shape[-2:]
             )
             abstention = 1 - combined_confidence
+        base_image = outputs[0].base.float()
+        decoder_residual = torch.stack(
+            [output.residual for output in outputs]
+        ).float().mean(dim=0)
+        net_addition = mean - base_image
         values = basic_metrics(
             mean,
             hr,
@@ -354,6 +359,9 @@ def main() -> None:
             edit_permission=edit_permission[0].detach().cpu().numpy(),
             abstention_map=abstention[0].detach().cpu().numpy(),
             valid_mask=valid_mask[0].detach().cpu().numpy(),
+            base=base_image[0].detach().cpu().numpy(),
+            decoder_residual=decoder_residual[0].detach().cpu().numpy(),
+            net_addition=net_addition[0].detach().cpu().numpy(),
             source_patch=str(patch_path),
         )
         count += 1
