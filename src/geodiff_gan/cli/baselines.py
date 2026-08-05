@@ -61,6 +61,7 @@ def main() -> None:
         target_key=config["data"].get("target_key", "hr"),
         condition_key=config["data"].get("condition_key"),
         output_channels=config["model"].get("output_channels", 3),
+        input_mode=config["data"].get("input_mode", "synthetic"),
     )
     if len(dataset) == 0:
         raise SystemExit(
@@ -106,6 +107,16 @@ def main() -> None:
             clean_lr = batch["clean_lr"].to(device)
             hr = batch["hr"].to(device)
             degradation = batch["degradation"].to(device)
+            valid_mask = (
+                batch["valid_mask"].to(device).float()
+                if "valid_mask" in batch
+                else torch.ones_like(hr[:, :1])
+            )
+            valid_lr_mask = (
+                batch["valid_mask_lr"].to(device).float()
+                if "valid_mask_lr" in batch
+                else None
+            )
             predictions = {
                 "bicubic": F.interpolate(
                     lr_rgb, size=hr.shape[-2:], mode="bicubic", align_corners=False
@@ -126,8 +137,10 @@ def main() -> None:
                     degradation,
                     scale=config["model"].get("scale", 4),
                     severity=config["data"].get("degradation_severity", "mild"),
+                    mask=valid_mask,
+                    lr_mask=valid_lr_mask,
                 )
-                values.update(optional_metrics(prediction, hr))
+                values.update(optional_metrics(prediction, hr, mask=valid_mask))
                 observed_noise = lr_rgb - clean_lr
                 values["observed_lr_noise_l1"] = float(observed_noise.abs().mean())
                 values["observed_lr_noise_to_signal"] = float(

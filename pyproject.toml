@@ -35,6 +35,7 @@ dev = ["pytest>=8", "ruff>=0.5"]
 
 [project.scripts]
 geodiff-prepare = "geodiff_gan.cli.prepare_sentinel:main"
+geodiff-prepare-paired = "geodiff_gan.cli.prepare_landsat_sentinel:main"
 geodiff-caption = "geodiff_gan.cli.caption_qwen:main"
 geodiff-train = "geodiff_gan.cli.train:main"
 geodiff-infer = "geodiff_gan.cli.infer:main"

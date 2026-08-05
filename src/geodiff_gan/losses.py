@@ -10,8 +10,24 @@ from .models.blocks import haar_wavelet
 from .models.degradation import sensor_degrade
 
 
-def charbonnier(prediction: torch.Tensor, target: torch.Tensor, epsilon: float = 1e-3) -> torch.Tensor:
-    return torch.sqrt((prediction - target).square() + epsilon**2).mean()
+def _masked_mean(value: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
+    if mask is None:
+        return value.mean()
+    mask = F.interpolate(mask.float(), size=value.shape[-2:], mode="nearest")
+    if mask.shape[1] == 1 and value.shape[1] != 1:
+        mask = mask.expand(-1, value.shape[1], -1, -1)
+    denominator = mask.sum().clamp_min(1.0)
+    return (value * mask).sum() / denominator
+
+
+def charbonnier(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    epsilon: float = 1e-3,
+    mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    value = torch.sqrt((prediction - target).square() + epsilon**2)
+    return _masked_mean(value, mask)
 
 
 def _ssim_statistics(x: torch.Tensor, window: int = 11) -> tuple[torch.Tensor, ...]:
@@ -22,7 +38,12 @@ def _ssim_statistics(x: torch.Tensor, window: int = 11) -> tuple[torch.Tensor, .
     return mean, variance
 
 
-def ssim(prediction: torch.Tensor, target: torch.Tensor, window: int = 11) -> torch.Tensor:
+def ssim(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    window: int = 11,
+    mask: torch.Tensor | None = None,
+) -> torch.Tensor:
     mean_x, variance_x = _ssim_statistics(prediction, window)
     mean_y, variance_y = _ssim_statistics(target, window)
     padding = window // 2
@@ -35,21 +56,53 @@ def ssim(prediction: torch.Tensor, target: torch.Tensor, window: int = 11) -> to
     denominator = (mean_x.square() + mean_y.square() + c1) * (
         variance_x + variance_y + c2
     )
-    return (numerator / denominator.clamp_min(1e-8)).mean()
+    similarity = numerator / denominator.clamp_min(1e-8)
+    if mask is not None:
+        valid_window = F.avg_pool2d(
+            mask.float(),
+            window,
+            stride=1,
+            padding=window // 2,
+        )
+        valid_window = (valid_window >= 0.999).float()
+        if not bool(valid_window.any()):
+            valid_window = mask.float()
+        return _masked_mean(similarity, valid_window)
+    return similarity.mean()
 
 
-def gradient_loss(prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+def gradient_loss(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor | None = None,
+) -> torch.Tensor:
     pred_dx = prediction[:, :, :, 1:] - prediction[:, :, :, :-1]
     pred_dy = prediction[:, :, 1:, :] - prediction[:, :, :-1, :]
     target_dx = target[:, :, :, 1:] - target[:, :, :, :-1]
     target_dy = target[:, :, 1:, :] - target[:, :, :-1, :]
-    return F.l1_loss(pred_dx, target_dx) + F.l1_loss(pred_dy, target_dy)
+    if mask is None:
+        return F.l1_loss(pred_dx, target_dx) + F.l1_loss(pred_dy, target_dy)
+    mask_x = mask[:, :, :, 1:] * mask[:, :, :, :-1]
+    mask_y = mask[:, :, 1:, :] * mask[:, :, :-1, :]
+    return _masked_mean((pred_dx - target_dx).abs(), mask_x) + _masked_mean(
+        (pred_dy - target_dy).abs(), mask_y
+    )
 
 
-def wavelet_loss(prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+def wavelet_loss(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor | None = None,
+) -> torch.Tensor:
     pred_bands = haar_wavelet(prediction)[1:]
     target_bands = haar_wavelet(target)[1:]
-    return sum(F.l1_loss(pred, real) for pred, real in zip(pred_bands, target_bands)) / 3
+    wavelet_mask = None
+    if mask is not None:
+        wavelet_mask = (F.avg_pool2d(mask.float(), 2, stride=2) >= 0.999).float()
+    return sum(
+        _masked_mean((pred - real).abs(), wavelet_mask)
+        for pred, real in zip(pred_bands, target_bands)
+    ) / 3
 
 
 def kl_loss(mean: torch.Tensor, log_variance: torch.Tensor) -> torch.Tensor:
@@ -62,6 +115,7 @@ def degradation_consistency(
     parameters: torch.Tensor,
     scale: int = 4,
     severity: str = "mild",
+    mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return charbonnier(
         sensor_degrade(
@@ -71,6 +125,7 @@ def degradation_consistency(
             severity=severity,
         ),
         lr,
+        mask=mask,
     )
 
 
@@ -81,10 +136,15 @@ def evidence_calibration_loss(
     temperature: float = 0.05,
     smoothing_window: int = 9,
     selectivity_weight: float = 0.0,
+    mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Calibrate confidence magnitude and spatial ranking against local accuracy."""
     with torch.no_grad():
-        error = (ungated_prediction - target).abs().mean(dim=1, keepdim=True)
+        if mask is not None:
+            error_prediction = ungated_prediction * mask + target * (1 - mask)
+        else:
+            error_prediction = ungated_prediction
+        error = (error_prediction - target).abs().mean(dim=1, keepdim=True)
         error = F.avg_pool2d(
             error,
             smoothing_window,
@@ -97,20 +157,32 @@ def evidence_calibration_loss(
             size=confidence.shape[-2:],
             mode="area",
         )
-    calibration = F.smooth_l1_loss(confidence, target_confidence)
+    confidence_mask = (
+        F.interpolate(mask.float(), size=confidence.shape[-2:], mode="nearest")
+        if mask is not None
+        else None
+    )
+    calibration = _masked_mean(
+        F.smooth_l1_loss(confidence, target_confidence, reduction="none"),
+        confidence_mask,
+    )
     if selectivity_weight <= 0:
         return calibration
 
+    if confidence_mask is None:
+        confidence_mask = torch.ones_like(confidence)
+    flat_mask = confidence_mask.flatten(1)
+    normalizer = flat_mask.sum(dim=1, keepdim=True).clamp_min(1.0)
     confidence_centered = confidence.flatten(1)
-    confidence_centered = confidence_centered - confidence_centered.mean(
-        dim=1,
-        keepdim=True,
-    )
+    confidence_centered = (
+        confidence_centered
+        - (confidence_centered * flat_mask).sum(dim=1, keepdim=True) / normalizer
+    ) * flat_mask
     target_centered = target_confidence.flatten(1)
-    target_centered = target_centered - target_centered.mean(
-        dim=1,
-        keepdim=True,
-    )
+    target_centered = (
+        target_centered
+        - (target_centered * flat_mask).sum(dim=1, keepdim=True) / normalizer
+    ) * flat_mask
     target_norm = target_centered.norm(dim=1)
     valid = target_norm > 1e-6
     if not valid.any():

@@ -18,6 +18,14 @@ class ManifestRecord:
     license_id: str = "copernicus-free-full-open"
     caption: str = ""
     source_product: str = ""
+    sentinel_product: str = ""
+    landsat_product: str = ""
+    sentinel_acquisition: str = ""
+    landsat_acquisition: str = ""
+    day_gap: int = 0
+    scale: int = 4
+    target_crs: str = ""
+    target_transform: list[float] | None = None
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=True)

@@ -64,6 +64,7 @@ def main() -> None:
         target_key=config["data"].get("target_key", "hr"),
         condition_key=config["data"].get("condition_key"),
         output_channels=config["model"].get("output_channels", 3),
+        input_mode=config["data"].get("input_mode", "synthetic"),
     )
     if not dataset:
         raise RuntimeError(f"No samples found in split {args.split!r}")
@@ -71,6 +72,8 @@ def main() -> None:
     lr = sample["lr"].unsqueeze(0).to(device)
     clean_lr = sample["clean_lr"].unsqueeze(0).to(device)
     target = sample["hr"].unsqueeze(0).to(device)
+    valid_mask = sample["valid_mask"].unsqueeze(0).to(device)
+    valid_lr_mask = sample["valid_mask_lr"].unsqueeze(0).to(device)
     degradation = sample["degradation"].unsqueeze(0).to(device)
     prompt = args.prompt if args.prompt is not None else str(sample["caption"])
     context = text_encoder([prompt])
@@ -127,6 +130,8 @@ def main() -> None:
         target=target,
         consistency_lr=clean_lr,
         degradation_severity=model.degradation_severity,
+        valid_mask=valid_mask,
+        valid_lr_mask=valid_lr_mask,
     )
     report = recorder.export(
         {

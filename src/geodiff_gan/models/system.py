@@ -50,6 +50,7 @@ class GeoDiffGAN(nn.Module):
         base_depth: int = 6,
         base_heads: int = 6,
         window_size: int = 8,
+        base_upsample_mode: str = "pixelshuffle",
         latent_channels: int = 4,
         vae_channels: int = 64,
         lr_channels: int = 64,
@@ -92,6 +93,7 @@ class GeoDiffGAN(nn.Module):
             window_size=window_size,
             scale=scale,
             output_channels=output_channels,
+            upsample_mode=base_upsample_mode,
         )
         self.vae = ResidualVAE(latent_channels=latent_channels, base_channels=vae_channels)
         self.lr_encoder = LREncoder(in_channels=input_channels, channels=lr_channels)
@@ -131,6 +133,7 @@ class GeoDiffGAN(nn.Module):
             base_depth=model.get("base_depth", 6),
             base_heads=model.get("base_heads", 6),
             window_size=model.get("window_size", 8),
+            base_upsample_mode=model.get("base_upsample_mode", "pixelshuffle"),
             latent_channels=model.get("latent_channels", 4),
             vae_channels=model.get("vae_channels", 64),
             lr_channels=model.get("lr_channels", 64),

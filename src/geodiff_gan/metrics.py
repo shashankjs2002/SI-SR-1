@@ -5,12 +5,25 @@ import math
 import torch
 from torch.nn import functional as F
 
-from .losses import ssim
+from .losses import charbonnier, ssim
 from .models.degradation import sensor_degrade
 
 
-def psnr(prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    mse = F.mse_loss(prediction, target)
+def _masked_mean(value: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
+    if mask is None:
+        return value.mean()
+    mask = F.interpolate(mask.float(), size=value.shape[-2:], mode="nearest")
+    if mask.shape[1] == 1 and value.shape[1] != 1:
+        mask = mask.expand(-1, value.shape[1], -1, -1)
+    return (value * mask).sum() / mask.sum().clamp_min(1.0)
+
+
+def psnr(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    mse = _masked_mean((prediction - target).square(), mask)
     return -10 * torch.log10(mse.clamp_min(1e-12))
 
 
@@ -20,6 +33,7 @@ def edge_f1(
     threshold: float | None = None,
     quantile: float = 0.9,
     tolerance: int = 1,
+    mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     def gradient_magnitude(x: torch.Tensor) -> torch.Tensor:
         gray = x.mean(dim=1, keepdim=True)
@@ -29,21 +43,29 @@ def edge_f1(
 
     predicted_gradient = gradient_magnitude(prediction)
     target_gradient = gradient_magnitude(target)
+    valid = (
+        F.interpolate(mask.float(), size=target_gradient.shape[-2:], mode="nearest")
+        if mask is not None
+        else torch.ones_like(target_gradient)
+    ).bool()
     if threshold is None:
-        threshold_tensor = torch.quantile(
-            target_gradient.flatten(1),
-            quantile,
-            dim=1,
-            keepdim=True,
-        ).view(-1, 1, 1, 1)
+        thresholds = []
+        for sample_gradient, sample_valid in zip(target_gradient, valid):
+            values = sample_gradient[sample_valid]
+            thresholds.append(
+                torch.quantile(values, quantile)
+                if values.numel()
+                else target_gradient.new_tensor(0.005)
+            )
+        threshold_tensor = torch.stack(thresholds).view(-1, 1, 1, 1)
         threshold_tensor = threshold_tensor.clamp_min(0.005)
     else:
         threshold_tensor = target_gradient.new_full(
             (target_gradient.shape[0], 1, 1, 1),
             threshold,
         )
-    predicted = predicted_gradient > threshold_tensor
-    actual = target_gradient > threshold_tensor
+    predicted = (predicted_gradient > threshold_tensor) & valid
+    actual = (target_gradient > threshold_tensor) & valid
     kernel_size = tolerance * 2 + 1
     predicted_near = F.max_pool2d(
         predicted.float(),
@@ -68,15 +90,19 @@ def redegradation_error(
     degradation: torch.Tensor,
     scale: int = 4,
     severity: str = "mild",
+    mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    return F.l1_loss(
-        sensor_degrade(
-            prediction,
-            degradation,
-            scale=scale,
-            severity=severity,
-        ),
-        lr,
+    return _masked_mean(
+        (
+            sensor_degrade(
+                prediction,
+                degradation,
+                scale=scale,
+                severity=severity,
+            )
+            - lr
+        ).abs(),
+        mask,
     )
 
 
@@ -87,12 +113,14 @@ def basic_metrics(
     degradation: torch.Tensor,
     scale: int = 4,
     severity: str = "mild",
+    mask: torch.Tensor | None = None,
+    lr_mask: torch.Tensor | None = None,
 ) -> dict[str, float]:
     return {
-        "l1": float(F.l1_loss(prediction, target)),
-        "psnr": float(psnr(prediction, target)),
-        "ssim": float(ssim(prediction, target)),
-        "edge_f1": float(edge_f1(prediction, target)),
+        "l1": float(charbonnier(prediction, target, epsilon=0.0, mask=mask)),
+        "psnr": float(psnr(prediction, target, mask=mask)),
+        "ssim": float(ssim(prediction, target, mask=mask)),
+        "edge_f1": float(edge_f1(prediction, target, mask=mask)),
         "redegradation_l1": float(
             redegradation_error(
                 prediction,
@@ -100,6 +128,7 @@ def basic_metrics(
                 degradation,
                 scale,
                 severity=severity,
+                mask=lr_mask,
             )
         ),
     }
@@ -125,8 +154,15 @@ class OptionalMetricSuite:
             pass
 
     @torch.no_grad()
-    def __call__(self, prediction: torch.Tensor, target: torch.Tensor) -> dict[str, float]:
+    def __call__(
+        self,
+        prediction: torch.Tensor,
+        target: torch.Tensor,
+        mask: torch.Tensor | None = None,
+    ) -> dict[str, float]:
         values: dict[str, float] = {}
+        if mask is not None:
+            prediction = prediction * mask + target * (1 - mask)
         normalized_prediction = prediction * 2 - 1
         normalized_target = target * 2 - 1
         if self.lpips_model is not None:

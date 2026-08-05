@@ -35,6 +35,7 @@ class SentinelPatchDataset(Dataset):
         target_key: str = "hr",
         condition_key: str | None = None,
         output_channels: int = 3,
+        input_mode: str = "synthetic",
     ) -> None:
         self.records = load_manifest(manifest, split=split)
         self.scale = scale
@@ -45,6 +46,9 @@ class SentinelPatchDataset(Dataset):
         self.target_key = target_key
         self.condition_key = condition_key
         self.output_channels = output_channels
+        if input_mode not in ("synthetic", "paired"):
+            raise ValueError("input_mode must be 'synthetic' or 'paired'")
+        self.input_mode = input_mode
         self.caption_field = caption_field
         if caption_sampling not in ("fixed", "random"):
             raise ValueError("caption_sampling must be 'fixed' or 'random'")
@@ -171,15 +175,44 @@ class SentinelPatchDataset(Dataset):
                     f"{self.target_key!r}"
                 )
             target = self._to_channel_first(data[self.target_key], self.target_key)
-            condition_key = self.condition_key or self.target_key
-            if condition_key not in data.files:
-                raise KeyError(
-                    f"Patch {record.patch} does not contain condition key "
-                    f"{condition_key!r}. Re-run preprocessing with multispectral "
-                    "bands or switch data.condition_key back to null."
+            if self.input_mode == "paired":
+                if "lr" not in data.files:
+                    raise KeyError(
+                        f"Paired patch {record.patch} does not contain an 'lr' array"
+                    )
+                stored_lr = self._to_channel_first(data["lr"], "lr")
+                stored_clean_lr = self._to_channel_first(
+                    data["clean_lr"] if "clean_lr" in data.files else data["lr"],
+                    "clean_lr",
                 )
-            condition = self._to_channel_first(data[condition_key], condition_key)
-        if target.shape[-2:] != condition.shape[-2:]:
+                stored_degradation = torch.from_numpy(
+                    data["degradation"]
+                    if "degradation" in data.files
+                    else np.array([0.5, 0.0, 0.0, 0.0], dtype=np.float32)
+                ).float()
+                valid_mask = self._to_channel_first(
+                    data["valid_mask_hr"]
+                    if "valid_mask_hr" in data.files
+                    else np.ones((1, *target.shape[-2:]), dtype=np.float32),
+                    "valid_mask_hr",
+                )
+                stored_valid_mask_lr = self._to_channel_first(
+                    data["valid_mask_lr"]
+                    if "valid_mask_lr" in data.files
+                    else np.ones((1, *stored_lr.shape[-2:]), dtype=np.float32),
+                    "valid_mask_lr",
+                )
+                condition = target
+            else:
+                condition_key = self.condition_key or self.target_key
+                if condition_key not in data.files:
+                    raise KeyError(
+                        f"Patch {record.patch} does not contain condition key "
+                        f"{condition_key!r}. Re-run preprocessing with multispectral "
+                        "bands or switch data.condition_key back to null."
+                    )
+                condition = self._to_channel_first(data[condition_key], condition_key)
+        if self.input_mode == "synthetic" and target.shape[-2:] != condition.shape[-2:]:
             raise ValueError(
                 f"Target and condition spatial shapes differ for {record.patch}: "
                 f"{tuple(target.shape[-2:])} vs {tuple(condition.shape[-2:])}"
@@ -195,25 +228,64 @@ class SentinelPatchDataset(Dataset):
             condition.clamp(0, 1), flip_width, flip_height, rotations
         )
         hr = target[: self.output_channels]
-        generator = None
-        if not self.random_degradation:
-            key = (
-                f"{self.degradation_seed}:{record.tile_id}:"
-                f"{record.row}:{record.col}:{record.patch}"
+        if self.input_mode == "paired":
+            lr_value = self._apply_augment(
+                stored_lr.clamp(0, 1), flip_width, flip_height, rotations
             )
-            seed = int.from_bytes(
-                hashlib.sha256(key.encode("utf-8")).digest()[:8],
-                byteorder="little",
-                signed=False,
+            clean_lr_value = self._apply_augment(
+                stored_clean_lr.clamp(0, 1), flip_width, flip_height, rotations
             )
-            generator = torch.Generator().manual_seed(seed)
-        lr, degradation, clean_lr = random_degradation(
-            condition.unsqueeze(0),
-            scale=self.scale,
-            generator=generator,
-            return_clean=True,
-            severity=self.degradation_severity,
-        )
+            valid_mask = self._apply_augment(
+                valid_mask.float(), flip_width, flip_height, rotations
+            )
+            valid_mask_lr = self._apply_augment(
+                stored_valid_mask_lr.float(), flip_width, flip_height, rotations
+            )
+            expected_hr = (lr_value.shape[-2] * self.scale, lr_value.shape[-1] * self.scale)
+            if tuple(hr.shape[-2:]) != expected_hr:
+                raise ValueError(
+                    f"Paired patch {record.patch} violates {self.scale}x geometry: "
+                    f"LR={tuple(lr_value.shape[-2:])}, HR={tuple(hr.shape[-2:])}"
+                )
+            if tuple(valid_mask.shape[-2:]) != tuple(hr.shape[-2:]):
+                raise ValueError(
+                    f"Paired patch {record.patch} has an HR validity mask with "
+                    f"shape {tuple(valid_mask.shape[-2:])}, expected "
+                    f"{tuple(hr.shape[-2:])}"
+                )
+            if tuple(valid_mask_lr.shape[-2:]) != tuple(lr_value.shape[-2:]):
+                raise ValueError(
+                    f"Paired patch {record.patch} has an LR validity mask with "
+                    f"shape {tuple(valid_mask_lr.shape[-2:])}, expected "
+                    f"{tuple(lr_value.shape[-2:])}"
+                )
+            lr = lr_value.unsqueeze(0)
+            clean_lr = clean_lr_value.unsqueeze(0)
+            degradation = stored_degradation.reshape(1, -1)
+        else:
+            generator = None
+            if not self.random_degradation:
+                key = (
+                    f"{self.degradation_seed}:{record.tile_id}:"
+                    f"{record.row}:{record.col}:{record.patch}"
+                )
+                seed = int.from_bytes(
+                    hashlib.sha256(key.encode("utf-8")).digest()[:8],
+                    byteorder="little",
+                    signed=False,
+                )
+                generator = torch.Generator().manual_seed(seed)
+            lr, degradation, clean_lr = random_degradation(
+                condition.unsqueeze(0),
+                scale=self.scale,
+                generator=generator,
+                return_clean=True,
+                severity=self.degradation_severity,
+            )
+            valid_mask = torch.ones((1, *hr.shape[-2:]), dtype=hr.dtype)
+            valid_mask_lr = torch.ones(
+                (1, *lr.shape[-2:]), dtype=hr.dtype
+            )
         lr_rgb = lr[:, : self.output_channels]
         clean_lr_rgb = clean_lr[:, : self.output_channels]
         caption = record.caption
@@ -240,6 +312,8 @@ class SentinelPatchDataset(Dataset):
             "lr_rgb": lr_rgb[0],
             "clean_lr": clean_lr_rgb[0],
             "degradation": degradation[0],
+            "valid_mask": valid_mask,
+            "valid_mask_lr": valid_mask_lr,
             "caption": caption,
             "patch": record.patch,
             "tile_id": record.tile_id,

@@ -495,8 +495,25 @@ class DiagnosticRecorder:
         target: torch.Tensor | None = None,
         consistency_lr: torch.Tensor | None = None,
         degradation_severity: str = "mild",
+        valid_mask: torch.Tensor | None = None,
+        valid_lr_mask: torch.Tensor | None = None,
     ) -> None:
         with torch.no_grad():
+            def masked_mean(
+                value: torch.Tensor,
+                mask: torch.Tensor | None,
+            ) -> torch.Tensor:
+                if mask is None:
+                    return value.mean()
+                resized = F.interpolate(
+                    mask.float(),
+                    size=value.shape[-2:],
+                    mode="nearest",
+                )
+                if resized.shape[1] == 1 and value.shape[1] != 1:
+                    resized = resized.expand(-1, value.shape[1], -1, -1)
+                return (value * resized).sum() / resized.sum().clamp_min(1.0)
+
             consistency_lr = lr if consistency_lr is None else consistency_lr
             if lr.shape[1] != consistency_lr.shape[1]:
                 lr = lr[:, : consistency_lr.shape[1]]
@@ -516,33 +533,60 @@ class DiagnosticRecorder:
             self.capture("consistency.degraded_output", degraded_output, visual="rgb")
             self.capture("consistency.clean_lr", consistency_lr, visual="rgb")
             self.capture("consistency.observed_noise", lr - consistency_lr, visual="residual")
+            if valid_mask is not None:
+                self.capture("target.valid_mask", valid_mask, visual="heatmap")
             self.capture(
                 "consistency.lr_error",
-                (degraded_output - consistency_lr).abs(),
+                (degraded_output - consistency_lr).abs()
+                * (valid_lr_mask if valid_lr_mask is not None else 1),
                 visual="heatmap",
             )
-            self.scalar("spatial.lr_base_l1", F.l1_loss(degraded_base, consistency_lr))
-            self.scalar("spatial.lr_output_l1", F.l1_loss(degraded_output, consistency_lr))
-            self.scalar("degradation.observed_noise_l1", F.l1_loss(lr, consistency_lr))
+            self.scalar(
+                "spatial.lr_base_l1",
+                masked_mean((degraded_base - consistency_lr).abs(), valid_lr_mask),
+            )
+            self.scalar(
+                "spatial.lr_output_l1",
+                masked_mean((degraded_output - consistency_lr).abs(), valid_lr_mask),
+            )
+            self.scalar(
+                "degradation.observed_noise_l1",
+                masked_mean((lr - consistency_lr).abs(), valid_lr_mask),
+            )
             self.scalar(
                 "degradation.noise_to_signal_ratio",
-                (lr - consistency_lr).abs().mean()
-                / consistency_lr.abs().mean().clamp_min(1e-8),
+                masked_mean((lr - consistency_lr).abs(), valid_lr_mask)
+                / masked_mean(consistency_lr.abs(), valid_lr_mask).clamp_min(1e-8),
             )
-            self.scalar("spatial.residual_abs_mean", residual.abs().mean())
+            self.scalar(
+                "spatial.residual_abs_mean",
+                masked_mean(residual.abs(), valid_mask),
+            )
             self.scalar(
                 "spatial.residual_to_base_ratio",
-                residual.abs().mean() / base.abs().mean().clamp_min(1e-8),
+                masked_mean(residual.abs(), valid_mask)
+                / masked_mean(base.abs(), valid_mask).clamp_min(1e-8),
             )
             self.scalar(
                 "spatial.output_clipped_fraction",
-                ((output <= 0) | (output >= 1)).float().mean(),
+                masked_mean(
+                    ((output <= 0) | (output >= 1)).float(),
+                    valid_mask,
+                ),
             )
             if target is not None:
                 self.capture("target.hr", target, visual="rgb")
-                self.capture("target.absolute_error", (output - target).abs(), visual="heatmap")
-                self.capture("target.edges", _edge_map(target), visual="heatmap")
-                self.capture("output.edges", _edge_map(output), visual="heatmap")
+                masked_error = (output - target).abs()
+                if valid_mask is not None:
+                    masked_error = masked_error * valid_mask
+                self.capture("target.absolute_error", masked_error, visual="heatmap")
+                target_edges = _edge_map(target)
+                output_edges = _edge_map(output)
+                if valid_mask is not None:
+                    target_edges = target_edges * valid_mask
+                    output_edges = output_edges * valid_mask
+                self.capture("target.edges", target_edges, visual="heatmap")
+                self.capture("output.edges", output_edges, visual="heatmap")
                 target_bands = haar_wavelet(target)[1:]
                 output_bands = haar_wavelet(output)[1:]
                 for name, target_band, output_band in zip(
@@ -560,8 +604,14 @@ class DiagnosticRecorder:
                         output_band,
                         visual="residual",
                     )
-                self.scalar("spatial.output_target_l1", F.l1_loss(output, target))
-                self.scalar("spatial.base_target_l1", F.l1_loss(base, target))
+                self.scalar(
+                    "spatial.output_target_l1",
+                    masked_mean((output - target).abs(), valid_mask),
+                )
+                self.scalar(
+                    "spatial.base_target_l1",
+                    masked_mean((base - target).abs(), valid_mask),
+                )
 
     def export(self, extra: dict[str, Any] | None = None) -> Path:
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -579,6 +629,7 @@ class DiagnosticRecorder:
             "decoder.residual",
             "output.hr",
             "target.hr",
+            "target.valid_mask",
             "consistency.clean_lr",
             "consistency.degraded_output",
             "consistency.lr_error",

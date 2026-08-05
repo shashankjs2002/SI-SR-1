@@ -9,6 +9,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from torch.nn import functional as F
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
@@ -144,6 +145,7 @@ def main() -> None:
         target_key=config["data"].get("target_key", "hr"),
         condition_key=config["data"].get("condition_key"),
         output_channels=config["model"].get("output_channels", 3),
+        input_mode=config["data"].get("input_mode", "synthetic"),
     )
     if len(dataset) == 0:
         raise SystemExit(
@@ -179,6 +181,16 @@ def main() -> None:
         clean_lr = batch["clean_lr"].to(device)
         hr = batch["hr"].to(device)
         degradation = batch["degradation"].to(device)
+        valid_mask = (
+            batch["valid_mask"].to(device).float()
+            if "valid_mask" in batch
+            else torch.ones_like(hr[:, :1])
+        )
+        valid_lr_mask = (
+            batch["valid_mask_lr"].to(device).float()
+            if "valid_mask_lr" in batch
+            else None
+        )
         with torch.autocast(
             device_type=device.type,
             dtype=torch.float16,
@@ -270,17 +282,34 @@ def main() -> None:
             degradation,
             scale=model.scale,
             severity=model.degradation_severity,
+            mask=valid_mask,
+            lr_mask=valid_lr_mask,
         )
         observed_noise = lr_rgb - clean_lr
         values["observed_lr_noise_l1"] = float(observed_noise.abs().mean())
         values["observed_lr_noise_to_signal"] = float(
             observed_noise.abs().mean() / clean_lr.abs().mean().clamp_min(1e-8)
         )
-        values.update(optional_metrics(mean, hr))
+        values.update(optional_metrics(mean, hr, mask=valid_mask))
         error_map = (mean - hr).abs().mean(dim=1, keepdim=True)
-        confidence_flat = combined_confidence.flatten()
-        uncertainty_flat = uncertainty[:, None].flatten()
-        error_flat = error_map.flatten()
+        metric_mask = F.interpolate(
+            valid_mask,
+            size=error_map.shape[-2:],
+            mode="nearest",
+        ).bool()
+        confidence_map = F.interpolate(
+            combined_confidence,
+            size=error_map.shape[-2:],
+            mode="nearest",
+        )
+        uncertainty_map = F.interpolate(
+            uncertainty[:, None],
+            size=error_map.shape[-2:],
+            mode="nearest",
+        )
+        confidence_flat = confidence_map[metric_mask]
+        uncertainty_flat = uncertainty_map[metric_mask]
+        error_flat = error_map[metric_mask]
         if confidence_flat.numel() > 1:
             values["confidence_error_correlation"] = _safe_correlation(
                 confidence_flat, error_flat
@@ -303,7 +332,14 @@ def main() -> None:
             psnr=f"{totals['psnr'] / (count + 1):.2f}",
             ssim=f"{totals['ssim'] / (count + 1):.4f}",
         )
-        patch_name = Path(batch["patch"][0]).stem
+        patch_path = Path(batch["patch"][0])
+        patch_name = "__".join(
+            (
+                str(batch["tile_id"][0]),
+                patch_path.parent.name,
+                patch_path.stem,
+            )
+        )
         np.savez_compressed(
             output_dir / f"{patch_name}_uncertainty.npz",
             mean=mean[0].detach().cpu().numpy(),
@@ -312,6 +348,8 @@ def main() -> None:
             evidence_confidence=evidence[0].detach().cpu().numpy(),
             edit_permission=edit_permission[0].detach().cpu().numpy(),
             abstention_map=abstention[0].detach().cpu().numpy(),
+            valid_mask=valid_mask[0].detach().cpu().numpy(),
+            source_patch=str(patch_path),
         )
         count += 1
         if args.progress == "compact":

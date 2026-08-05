@@ -250,6 +250,7 @@ class Trainer:
             target_key=data.get("target_key", "hr"),
             condition_key=data.get("condition_key"),
             output_channels=self.config["model"].get("output_channels", 3),
+            input_mode=data.get("input_mode", "synthetic"),
         )
         sampler = (
             DistributedSampler(dataset, shuffle=split == "train")
@@ -324,10 +325,29 @@ class Trainer:
             else lr_rgb
         )
         degradation = batch["degradation"].to(self.device, non_blocking=True)
+        valid_mask_value = batch.get("valid_mask")
+        valid_mask = (
+            valid_mask_value.to(self.device, non_blocking=True).float()
+            if valid_mask_value is not None
+            else torch.ones_like(hr[:, :1])
+        )
+        valid_lr_mask_value = batch.get("valid_mask_lr")
+        if valid_lr_mask_value is not None:
+            valid_lr_mask = valid_lr_mask_value.to(
+                self.device,
+                non_blocking=True,
+            ).float()
+        else:
+            valid_lr_mask = 1 - F.max_pool2d(
+                1 - valid_mask,
+                kernel_size=model.scale,
+                stride=model.scale,
+            )
         losses: dict[str, torch.Tensor] = {}
         if diagnostics is not None:
             diagnostics.capture("input.lr", lr, visual="rgb")
             diagnostics.capture("target.hr", hr, visual="rgb")
+            diagnostics.capture("target.valid_mask", valid_mask, visual="heatmap")
             diagnostics.capture("conditioning.degradation", degradation)
 
         if self.stage == "base":
@@ -345,15 +365,16 @@ class Trainer:
                 )
                 diagnostics.capture("base.hr", prediction, visual="rgb")
                 diagnostics.capture("output.hr", prediction, visual="rgb")
-            losses["charbonnier"] = charbonnier(prediction, hr)
-            losses["ssim"] = 1 - ssim(prediction, hr)
-            losses["gradient"] = gradient_loss(prediction, hr)
+            losses["charbonnier"] = charbonnier(prediction, hr, mask=valid_mask)
+            losses["ssim"] = 1 - ssim(prediction, hr, mask=valid_mask)
+            losses["gradient"] = gradient_loss(prediction, hr, mask=valid_mask)
             losses["consistency"] = degradation_consistency(
                 prediction,
                 consistency_lr,
                 degradation,
                 scale=model.scale,
                 severity=model.degradation_severity,
+                mask=valid_lr_mask,
             )
             return prediction, losses
 
@@ -363,7 +384,7 @@ class Trainer:
         )
         with torch.no_grad():
             base = model.base(lr)
-            target_residual = hr - base
+            target_residual = (hr - base) * valid_mask
         lr_features = model.lr_encoder(lr)
         if diagnostics is not None:
             diagnostics.capture("conditioning.text", context)
@@ -416,11 +437,15 @@ class Trainer:
                 )
                 diagnostics.capture("decoder.residual", detail, visual="residual")
                 diagnostics.capture("output.hr", prediction, visual="rgb")
-            losses["vae_reconstruction"] = charbonnier(reconstruction, target_residual)
+            losses["vae_reconstruction"] = charbonnier(
+                reconstruction,
+                target_residual,
+                mask=valid_mask,
+            )
             losses["kl"] = kl_loss(mean, log_variance)
-            losses["charbonnier"] = charbonnier(prediction, hr)
-            losses["gradient"] = gradient_loss(prediction, hr)
-            losses["wavelet"] = wavelet_loss(prediction, hr)
+            losses["charbonnier"] = charbonnier(prediction, hr, mask=valid_mask)
+            losses["gradient"] = gradient_loss(prediction, hr, mask=valid_mask)
+            losses["wavelet"] = wavelet_loss(prediction, hr, mask=valid_mask)
             losses["evidence_calibration"] = evidence_calibration_loss(
                 mapped.evidence_confidence,
                 ungated_prediction,
@@ -436,6 +461,7 @@ class Trainer:
                         0.0,
                     )
                 ),
+                mask=valid_mask,
             )
             return prediction, losses
 
@@ -511,27 +537,42 @@ class Trainer:
             device=prediction.device,
             dtype=torch.bool,
         )
-        reconstruction_mask = (
+        reconstruction_samples = (
             ~counterfactual
             if self.stage == "edit"
             else torch.ones_like(counterfactual)
         )
-        if reconstruction_mask.any():
-            reconstruction = prediction[reconstruction_mask]
-            reconstruction_target = hr[reconstruction_mask]
+        if reconstruction_samples.any():
+            reconstruction = prediction[reconstruction_samples]
+            reconstruction_target = hr[reconstruction_samples]
+            reconstruction_valid = valid_mask[reconstruction_samples]
             losses["charbonnier"] = charbonnier(
-                reconstruction, reconstruction_target
+                reconstruction,
+                reconstruction_target,
+                mask=reconstruction_valid,
             )
-            losses["ssim"] = 1 - ssim(reconstruction, reconstruction_target)
+            losses["ssim"] = 1 - ssim(
+                reconstruction,
+                reconstruction_target,
+                mask=reconstruction_valid,
+            )
+            perceptual_reconstruction = (
+                reconstruction * reconstruction_valid
+                + reconstruction_target * (1 - reconstruction_valid)
+            )
             losses["perceptual"] = self.perceptual(
-                reconstruction, reconstruction_target
+                perceptual_reconstruction,
+                reconstruction_target,
             )
             losses["gradient"] = gradient_loss(
                 reconstruction,
                 reconstruction_target,
+                mask=reconstruction_valid,
             )
             losses["wavelet"] = wavelet_loss(
-                reconstruction, reconstruction_target
+                reconstruction,
+                reconstruction_target,
+                mask=reconstruction_valid,
             )
         else:
             zero = prediction.new_zeros(())
@@ -546,6 +587,7 @@ class Trainer:
             degradation,
             scale=model.scale,
             severity=model.degradation_severity,
+            mask=valid_lr_mask,
         )
         losses["evidence_calibration"] = evidence_calibration_loss(
             output.evidence_confidence,
@@ -562,6 +604,7 @@ class Trainer:
                     0.0,
                 )
             ),
+            mask=valid_mask,
         )
         if self.stage == "edit":
             losses["edit_localization"] = edit_localization_loss(
@@ -666,6 +709,22 @@ class Trainer:
                         ),
                         scale=model.scale,
                         severity=model.degradation_severity,
+                        mask=(
+                            batch["valid_mask"].to(
+                                self.device,
+                                non_blocking=True,
+                            )
+                            if "valid_mask" in batch
+                            else None
+                        ),
+                        lr_mask=(
+                            batch["valid_mask_lr"].to(
+                                self.device,
+                                non_blocking=True,
+                            )
+                            if "valid_mask_lr" in batch
+                            else None
+                        ),
                     )
                     for name, value in values.items():
                         totals[name] += value
@@ -935,6 +994,11 @@ class Trainer:
                     debug_exports += 1
                 hr = batch["hr"].to(self.device, non_blocking=True)
                 lr = batch["lr"].to(self.device, non_blocking=True)
+                valid_mask = (
+                    batch["valid_mask"].to(self.device, non_blocking=True).float()
+                    if "valid_mask" in batch
+                    else torch.ones_like(hr[:, :1])
+                )
                 with torch.autocast(
                     device_type=self.device.type,
                     dtype=torch.float16,
@@ -944,12 +1008,22 @@ class Trainer:
                     generator_loss = self._weighted_loss(losses)
                     discriminator_loss = None
                     if self.stage in ("joint", "edit"):
-                        adversarial = self._generator_adversarial_loss(prediction, lr)
+                        adversarial_prediction = (
+                            prediction * valid_mask + hr * (1 - valid_mask)
+                        )
+                        adversarial = self._generator_adversarial_loss(
+                            adversarial_prediction,
+                            lr,
+                        )
                         losses["adversarial"] = adversarial
                         generator_loss = generator_loss + adversarial * float(
                             training.get("loss_weights", {}).get("adversarial", 0.01)
                         )
-                        discriminator_loss = self._discriminator_loss(prediction, hr, lr)
+                        discriminator_loss = self._discriminator_loss(
+                            adversarial_prediction,
+                            hr,
+                            lr,
+                        )
                     scaled_loss = generator_loss / group_size
                     if diagnostics is not None:
                         for name, value in losses.items():
@@ -1013,6 +1087,12 @@ class Trainer:
                             degradation_severity=unwrap(
                                 self.model
                             ).degradation_severity,
+                            valid_mask=valid_mask,
+                            valid_lr_mask=(
+                                batch["valid_mask_lr"].to(self.device)
+                                if "valid_mask_lr" in batch
+                                else None
+                            ),
                         )
                     diagnostics.export(
                         {
