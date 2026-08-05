@@ -1,5 +1,16 @@
 # Kaggle Usage
 
+For real cross-sensor 3x super-resolution, import
+`GeoDiff_GAN_Kaggle_Landsat30m_Sentinel10m_3x.ipynb`. It pairs Landsat 8/9
+Collection 2 Level-2 30 m RGB with overlapping Sentinel-2 L2A 10 m RGB,
+creates `128x128 -> 384x384` samples, and includes registration, mask, split,
+training, evaluation, uncertainty, and intermediate-feature diagnostics. Set
+`SENTINEL_INPUT` and `LANDSAT_INPUT` in its first code cell. Use
+`FAST_DEV_RUN=True` and `MAX_PAIRS=1` before preparing the complete dataset.
+
+The instructions below describe the original synthetic 40 m to 10 m 4x
+Sentinel-only notebook.
+
 Import `GeoDiff_GAN_Kaggle.ipynb` into Kaggle, enable Internet, select a GPU
 accelerator, and attach a dataset containing extracted Sentinel-2 L2A `.SAFE`
 directories.
