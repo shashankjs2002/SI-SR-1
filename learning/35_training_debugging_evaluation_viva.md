@@ -494,3 +494,5 @@ Use the same geographic test set and evaluation protocol for every row.
 - [ ] I can state valid claims and reject overclaims.
 
 Previous: [34 - Pair Quality Metrics and Diagnostic Interpretation](34_pair_quality_metrics_and_diagnostics.md).
+
+Next: [36 - Spatial, Spectral, Radiometric, and Temporal Resolution](36_spatial_spectral_radiometric_temporal_resolution.md).

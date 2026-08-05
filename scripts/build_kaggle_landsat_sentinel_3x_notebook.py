@@ -503,7 +503,7 @@ cells = [
 
         fig, axes = plt.subplots(2, 3, figsize=(15, 10))
         detailed_panels = (
-            (overlay, "Edge registration: red=S2, cyan=Landsat", "rgb_hwc"),
+            (overlay, "Edge registration: yellow=S2-only, cyan=Landsat-only", "rgb_hwc"),
             (difference, "Absolute difference", "heat"),
             (mask_display, f"Joint valid mask: {float(mask_display.mean()):.2%}", "mask"),
             (spectrum_lr, "Landsat frequency spectrum", "spectrum"),
@@ -542,7 +542,297 @@ cells = [
         plt.show()
         """
     ),
-    markdown("## 9. Build runtime configs for all training stages"),
+    markdown(
+        """
+        ## 9. Spatial, spectral, radiometric, and temporal resolution diagnostics
+
+        These are four different sensor properties:
+
+        - **Spatial:** ground size represented by a pixel.
+        - **Spectral:** wavelength ranges measured by each band.
+        - **Radiometric:** ability to distinguish intensity/reflectance differences.
+        - **Temporal:** observation frequency and the date gap of this specific pair.
+
+        The cross-sensor difference contains all four effects plus registration and noise.
+        It must not be interpreted as pure missing spatial detail.
+        """
+    ),
+    code(
+        r"""
+        import pandas as pd
+        from matplotlib.patches import Patch
+
+        resolution_summary = pd.DataFrame([
+            {
+                "dimension": "Spatial",
+                "Landsat 8/9 OLI": "30 m RGB",
+                "Sentinel-2 MSI": "10 m RGB",
+                "experiment implication": "3x linear SR; 9x output samples",
+            },
+            {
+                "dimension": "Spectral",
+                "Landsat 8/9 OLI": "B4/B3/B2 RGB filters",
+                "Sentinel-2 MSI": "B04/B03/B02 RGB filters",
+                "experiment implication": "similar names, non-identical bandpasses",
+            },
+            {
+                "dimension": "Radiometric",
+                "Landsat 8/9 OLI": "12-bit acquisition; uint16 C2 L2",
+                "Sentinel-2 MSI": "12-bit acquisition; uint16 reflectance product",
+                "experiment implication": "different calibration, SNR, scaling and processors",
+            },
+            {
+                "dimension": "Temporal",
+                "Landsat 8/9 OLI": "16 days each; 8-day combined offset",
+                "Sentinel-2 MSI": "nominal 5-day two-satellite revisit",
+                "experiment implication": "use actual pair day gap, not mission revisit",
+            },
+        ])
+        display(resolution_summary)
+
+        fig, axes = plt.subplots(1, 2, figsize=(15, 5.5), constrained_layout=True)
+
+        spatial_axis = axes[0]
+        spatial_axis.set_xlim(0, 30)
+        spatial_axis.set_ylim(0, 30)
+        spatial_axis.set_aspect("equal")
+        spatial_axis.add_patch(
+            plt.Rectangle((0, 0), 30, 30, fill=False, linewidth=4, edgecolor="#8c510a")
+        )
+        for coordinate in (10, 20):
+            spatial_axis.axvline(coordinate, color="#2166ac", linewidth=2)
+            spatial_axis.axhline(coordinate, color="#2166ac", linewidth=2)
+        for row in range(3):
+            for column in range(3):
+                spatial_axis.text(
+                    column * 10 + 5,
+                    row * 10 + 5,
+                    "10 m",
+                    ha="center",
+                    va="center",
+                    fontsize=9,
+                    color="#2166ac",
+                )
+        spatial_axis.set_title("Spatial sampling\n1 Landsat 30 m pixel = 3 x 3 Sentinel 10 m samples")
+        spatial_axis.set_xlabel("ground distance (m)")
+        spatial_axis.set_ylabel("ground distance (m)")
+
+        bandpasses = [
+            ("Landsat blue B2", 450.0, 510.0, "#8c510a"),
+            ("Sentinel blue B02", 490.0 - 65.0 / 2, 490.0 + 65.0 / 2, "#2166ac"),
+            ("Landsat green B3", 530.0, 590.0, "#8c510a"),
+            ("Sentinel green B03", 560.0 - 35.0 / 2, 560.0 + 35.0 / 2, "#2166ac"),
+            ("Landsat red B4", 640.0, 670.0, "#8c510a"),
+            ("Sentinel red B04", 665.0 - 30.0 / 2, 665.0 + 30.0 / 2, "#2166ac"),
+        ]
+        spectral_axis = axes[1]
+        for index, (label, start, end, color) in enumerate(bandpasses):
+            spectral_axis.barh(index, end - start, left=start, height=0.65, color=color, alpha=0.82)
+        spectral_axis.set_yticks(range(len(bandpasses)), [value[0] for value in bandpasses])
+        spectral_axis.invert_yaxis()
+        spectral_axis.set_xlim(430, 700)
+        spectral_axis.set_xlabel("wavelength (nm)")
+        spectral_axis.set_title("Nominal RGB bandpass comparison\nrectangles are not full response functions")
+        spectral_axis.grid(axis="x", alpha=0.25)
+        spectral_axis.legend(
+            handles=[
+                Patch(color="#8c510a", label="Landsat 8/9 OLI"),
+                Patch(color="#2166ac", label="Sentinel-2 MSI"),
+            ],
+            loc="lower right",
+        )
+        plt.show()
+
+        print("Patch ground width: 128 x 30 m = 384 x 10 m = 3.84 km")
+        print("Bandpass adjustment used for prepared targets:", BANDPASS_ADJUSTMENT)
+        """
+    ),
+    code(
+        r"""
+        # Per-band agreement combines spectral, radiometric, spatial, temporal,
+        # atmospheric, and registration effects. It is not a pure spectral test.
+        valid_indices = torch.nonzero(inspection_valid.flatten(), as_tuple=False).flatten()
+        maximum_scatter_points = 12000
+        if len(valid_indices) > maximum_scatter_points:
+            selected_positions = torch.linspace(
+                0, len(valid_indices) - 1, maximum_scatter_points
+            ).long()
+            valid_indices = valid_indices[selected_positions]
+
+        band_names = ("Red", "Green", "Blue")
+        band_colors = ("#b2182b", "#1b7837", "#2166ac")
+        spectral_rows = []
+        fig, axes = plt.subplots(1, 3, figsize=(16, 5), constrained_layout=True)
+        for channel, (band_name, color, axis) in enumerate(zip(band_names, band_colors, axes)):
+            landsat_values = inspection_lr_up[channel].flatten()[valid_indices]
+            sentinel_values = inspection_hr[channel].flatten()[valid_indices]
+            difference_values = sentinel_values - landsat_values
+            if landsat_values.std(unbiased=False) > 0 and sentinel_values.std(unbiased=False) > 0:
+                correlation = float(torch.corrcoef(torch.stack((landsat_values, sentinel_values)))[0, 1])
+            else:
+                correlation = float("nan")
+            spectral_rows.append({
+                "band": band_name,
+                "landsat_mean": float(landsat_values.mean()),
+                "sentinel_mean": float(sentinel_values.mean()),
+                "bias_sentinel_minus_landsat": float(difference_values.mean()),
+                "mae": float(difference_values.abs().mean()),
+                "pearson_r": correlation,
+            })
+            combined = torch.cat((landsat_values, sentinel_values))
+            lower = max(0.0, float(torch.quantile(combined, 0.01)))
+            upper = min(1.0, float(torch.quantile(combined, 0.99)))
+            upper = max(upper, lower + 0.02)
+            axis.hexbin(
+                landsat_values.numpy(),
+                sentinel_values.numpy(),
+                gridsize=48,
+                mincnt=1,
+                cmap="magma",
+            )
+            axis.plot((lower, upper), (lower, upper), linestyle="--", color="white", linewidth=1.5)
+            axis.set_xlim(lower, upper)
+            axis.set_ylim(lower, upper)
+            axis.set_aspect("equal")
+            axis.set_title(
+                f"{band_name}: r={correlation:.3f}\n"
+                f"bias={float(difference_values.mean()):+.4f}, MAE={float(difference_values.abs().mean()):.4f}",
+                color=color,
+            )
+            axis.set_xlabel("Landsat reflectance (bicubic grid)")
+            axis.set_ylabel("Sentinel reflectance")
+        fig.suptitle("Per-band cross-sensor agreement; dashed line is y = x")
+        plt.show()
+        display(pd.DataFrame(spectral_rows).round(6))
+        """
+    ),
+    code(
+        r"""
+        from collections import Counter
+        import random
+        from tqdm.auto import tqdm
+
+        radiometric_summary = pd.DataFrame([
+            {
+                "sensor": "Landsat 8/9 OLI",
+                "instrument_bits": 12,
+                "potential_acquisition_levels": 4096,
+                "product_storage": "uint16",
+                "reflectance_encoding": "DN x metadata multiplier + offset",
+                "nominal_fallback_step": 0.0000275,
+            },
+            {
+                "sensor": "Sentinel-2 MSI",
+                "instrument_bits": 12,
+                "potential_acquisition_levels": 4096,
+                "product_storage": "uint16",
+                "reflectance_encoding": "(DN + BOA offset) / quantification value",
+                "nominal_fallback_step": 0.0001,
+            },
+        ])
+        display(radiometric_summary)
+
+        diagnostic_limit = min(200, len(records))
+        temporal_rng = random.Random(RANDOM_SEED + 109)
+        temporal_records = (
+            records
+            if len(records) <= diagnostic_limit
+            else temporal_rng.sample(records, diagnostic_limit)
+        )
+        temporal_rows = []
+        for record in tqdm(temporal_records, desc="resolution diagnostics", unit="patch"):
+            with np.load(record["patch"]) as data:
+                lr_value = chw(data["lr"])
+                hr_value = chw(data["hr"])
+                valid_value = torch.from_numpy(data["valid_mask_hr"][0]).bool()
+            lr_up_value = F.interpolate(
+                lr_value[None],
+                size=hr_value.shape[-2:],
+                mode="bicubic",
+                align_corners=False,
+            )[0].clamp(0, 1)
+            patch_difference = (lr_up_value - hr_value).abs().mean(0)
+            temporal_rows.append({
+                "day_gap": int(record.get("day_gap", 0)),
+                "pair_mae": float(patch_difference[valid_value].mean()),
+                "tile_id": record["tile_id"],
+            })
+        temporal_frame = pd.DataFrame(temporal_rows)
+        temporal_grouped = temporal_frame.groupby("day_gap")["pair_mae"].agg(
+            ["count", "mean", "median", "std"]
+        ).reset_index()
+        display(temporal_grouped.round(6))
+
+        signed_differences = inspection_hr - inspection_lr_up
+        fig, axes = plt.subplots(2, 2, figsize=(15, 10), constrained_layout=True)
+        for channel, (band_name, color) in enumerate(zip(band_names, band_colors)):
+            values = signed_differences[channel][inspection_valid]
+            axes[0, 0].hist(
+                values.numpy(),
+                bins=100,
+                density=True,
+                histtype="step",
+                linewidth=1.5,
+                color=color,
+                label=f"{band_name}: mean={float(values.mean()):+.4f}",
+            )
+        axes[0, 0].axvline(0, color="black", linestyle="--", linewidth=1)
+        axes[0, 0].set_title("Radiometric cross-sensor difference\nSentinel - Landsat")
+        axes[0, 0].set_xlabel("reflectance difference")
+        axes[0, 0].set_ylabel("density")
+        axes[0, 0].legend(fontsize=8)
+
+        sensor_labels = ("Landsat OLI", "Sentinel MSI")
+        x_positions = np.arange(2)
+        axes[0, 1].bar(x_positions - 0.18, (12, 12), width=0.36, label="instrument acquisition bits")
+        axes[0, 1].bar(x_positions + 0.18, (16, 16), width=0.36, label="product storage bits")
+        axes[0, 1].set_xticks(x_positions, sensor_labels)
+        axes[0, 1].set_ylim(0, 18)
+        axes[0, 1].set_ylabel("bits")
+        axes[0, 1].set_title("Radiometric acquisition is not product storage")
+        axes[0, 1].legend(fontsize=8)
+        for position in x_positions:
+            axes[0, 1].text(position - 0.18, 12.25, "4096 levels", ha="center", fontsize=8)
+
+        all_gap_counts = Counter(int(record.get("day_gap", 0)) for record in records)
+        gap_values = sorted(all_gap_counts)
+        axes[1, 0].bar(gap_values, [all_gap_counts[value] for value in gap_values], color="#4d9221")
+        axes[1, 0].set_xticks(gap_values)
+        axes[1, 0].set_xlabel("absolute acquisition gap (days)")
+        axes[1, 0].set_ylabel("prepared patches")
+        axes[1, 0].set_title("Temporal balance of the complete manifest")
+
+        sampled_gaps = sorted(temporal_frame["day_gap"].unique())
+        jitter_rng = np.random.default_rng(RANDOM_SEED + 109)
+        for position, gap in enumerate(sampled_gaps):
+            group = temporal_frame.loc[temporal_frame["day_gap"] == gap, "pair_mae"].to_numpy()
+            jitter = jitter_rng.normal(0, 0.045, size=len(group))
+            axes[1, 1].scatter(
+                np.full(len(group), position) + jitter,
+                group,
+                s=12,
+                alpha=0.35,
+                color="#2166ac",
+            )
+            axes[1, 1].hlines(np.median(group), position - 0.24, position + 0.24, color="#b2182b", linewidth=3)
+        axes[1, 1].set_xticks(range(len(sampled_gaps)), sampled_gaps)
+        axes[1, 1].set_xlabel("absolute acquisition gap (days)")
+        axes[1, 1].set_ylabel("Landsat-Sentinel pair MAE")
+        axes[1, 1].set_title(f"Pair discrepancy by day gap\n{len(temporal_frame)} sampled patches; red=median")
+        plt.show()
+
+        if (
+            temporal_frame["day_gap"].nunique() > 1
+            and temporal_frame["pair_mae"].std(ddof=0) > 0
+        ):
+            temporal_correlation = temporal_frame[["day_gap", "pair_mae"]].corr().iloc[0, 1]
+            print("Day-gap / pair-MAE correlation:", float(temporal_correlation))
+        else:
+            print("Day-gap / pair-MAE correlation is undefined (insufficient variation).")
+        print("Pair MAE is cross-sensor discrepancy, not model error and not pure temporal change.")
+        """
+    ),
+    markdown("## 10. Build runtime configs for all training stages"),
     code(
         r"""
         import copy
@@ -600,7 +890,7 @@ cells = [
         print(yaml.safe_dump(runtime_config, sort_keys=False))
         """
     ),
-    markdown("## 10. Parameter report and complete 3x tensor-shape smoke test"),
+    markdown("## 11. Parameter report and complete 3x tensor-shape smoke test"),
     code(
         r"""
         from geodiff_gan.parameters import build_parameter_report
@@ -640,7 +930,7 @@ cells = [
             torch.cuda.empty_cache()
         """
     ),
-    markdown("## 11. Train base, VAE, diffusion, and joint stages with automatic resume"),
+    markdown("## 12. Train base, VAE, diffusion, and joint stages with automatic resume"),
     code(
         r"""
         def select_checkpoint(output_dir, stage):
@@ -686,7 +976,7 @@ cells = [
         CHECKPOINTS
         """
     ),
-    markdown("## 12. Training curves and checkpoint inventory"),
+    markdown("## 13. Training curves and checkpoint inventory"),
     code(
         r"""
         from IPython.display import Image as DisplayImage, display
@@ -709,7 +999,7 @@ cells = [
         display(pd.DataFrame(checkpoint_rows))
         """
     ),
-    markdown("## 13. Masked evaluation and bicubic/base baselines"),
+    markdown("## 14. Masked evaluation and bicubic/base baselines"),
     code(
         r"""
         evaluation_settings = EVALUATION_PROFILES[EVALUATION_PROFILE]
@@ -773,7 +1063,7 @@ cells = [
         display(metric_table[[column for column in preferred if column in metric_table.columns]].round(6))
         """
     ),
-    markdown("## 14. Metric comparison plots"),
+    markdown("## 15. Metric comparison plots"),
     code(
         r"""
         available_metrics = [
@@ -801,7 +1091,7 @@ cells = [
     ),
     markdown(
         """
-        ## 15. Side-by-side output for an evaluated patch
+        ## 16. Side-by-side output for an evaluated patch
 
         The first panel is the original `128 x 128` Landsat patch rendered with
         nearest-neighbor display so its native 30 m pixels remain visible. Bicubic is
@@ -892,7 +1182,7 @@ cells = [
     ),
     markdown(
         """
-        ## 16. Deterministic base and generated high-frequency contribution
+        ## 17. Deterministic base and generated high-frequency contribution
 
         In SR mode, the decoder residual is high-pass filtered and evidence-gated before
         being added to the deterministic base. The signed residual uses gray for zero,
@@ -995,7 +1285,7 @@ cells = [
         print("Final net addition absolute mean:", float(cached_net_addition[:, side_valid].abs().mean()))
         """
     ),
-    markdown("## 17. Full intermediate diagnostic export"),
+    markdown("## 18. Full intermediate diagnostic export"),
     code(
         r"""
         diagnostic_output = DEBUG_ROOT / f"{EVALUATION_SPLIT}_index_{DEBUG_INDEX}"
@@ -1036,7 +1326,7 @@ cells = [
         print("Complete diagnostic directory:", diagnostic_output)
         """
     ),
-    markdown("## 18. Uncertainty, evidence, abstention, and validity maps"),
+    markdown("## 19. Uncertainty, evidence, abstention, and validity maps"),
     code(
         r"""
         with np.load(result_path) as data:
@@ -1074,7 +1364,7 @@ cells = [
     ),
     markdown(
         """
-        ## 19. Export model artifacts without deleting data
+        ## 20. Export model artifacts without deleting data
 
         The archive contains configs, checkpoints, evaluation, debug reports, manifest, and pairing
         state. Patch binaries are intentionally excluded because they can be many gigabytes and

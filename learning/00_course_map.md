@@ -182,3 +182,4 @@ Real cross-sensor 3x track:
 2. [33 - Real Cross-Sensor SR Foundations](33_real_cross_sensor_sr_foundations.md)
 3. [34 - Pair Quality Metrics and Diagnostic Interpretation](34_pair_quality_metrics_and_diagnostics.md)
 4. [35 - Training, Debugging, Evaluation, and Supervisor Questions](35_training_debugging_evaluation_viva.md)
+5. [36 - Spatial, Spectral, Radiometric, and Temporal Resolution](36_spatial_spectral_radiometric_temporal_resolution.md)

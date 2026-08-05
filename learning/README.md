@@ -61,6 +61,7 @@ and a visually sharp satellite image is not automatically a spatially faithful r
 | 33 | [Real cross-sensor SR foundations](33_real_cross_sensor_sr_foundations.md) | Explain pairing, reflectance, grids, masks, tensor shapes, and limitations |
 | 34 | [Pair quality metrics and diagnostics](34_pair_quality_metrics_and_diagnostics.md) | Interpret MAE, bias, PSNR, edges, heatmaps, registration, spectra, and masks |
 | 35 | [Training, debugging, evaluation, and viva](35_training_debugging_evaluation_viva.md) | Defend modules, losses, diagnostics, results, ablations, and scientific claims |
+| 36 | [Spatial, spectral, radiometric, and temporal resolution](36_spatial_spectral_radiometric_temporal_resolution.md) | Separate the four sensor-resolution dimensions and diagnose their effects on real 3x SR |
 
 ## Recommended Pace
 
@@ -71,7 +72,7 @@ flowchart LR
     C["Week 3<br/>Ch. 08-10<br/>GeoDiff-GAN"] -->
     D["Week 4<br/>Ch. 11-18<br/>Evaluation and research"] -->
     E["Week 5<br/>Ch. 19-29<br/>Modules and improved experiment"] -->
-    F["Week 6<br/>Ch. 30-35<br/>Captions, benchmarks,<br/>and real cross-sensor SR"]
+    F["Week 6<br/>Ch. 30-36<br/>Captions, benchmarks,<br/>and real cross-sensor SR"]
 ```
 
 For each chapter:
