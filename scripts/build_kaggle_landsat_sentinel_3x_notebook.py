@@ -468,8 +468,8 @@ cells = [
         """
         ## 8. Detailed registration and radiometry inspection
 
-        In the edge overlay, red is Sentinel and cyan is Landsat. Matching features should
-        appear nearly white. Consistent red/cyan double edges indicate spatial misregistration;
+        In the edge overlay, Sentinel-only edges are yellow and Landsat-only edges are cyan.
+        Matching features should appear nearly white. Consistent yellow/cyan double edges indicate spatial misregistration;
         do not treat such a scene pair as supervised ground truth.
         """
     ),

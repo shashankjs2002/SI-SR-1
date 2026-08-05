@@ -175,3 +175,10 @@ plausible detail; it does not observe missing sub-pixel information.
 Next: [01 - Mathematical Foundations](01_mathematical_foundations.md).
 
 Captioning appendix: [30 - Caption Generation Pipeline](30_caption_generation_pipeline.md).
+
+Real cross-sensor 3x track:
+
+1. [32 - Landsat-Sentinel Real Pair Dataset](32_landsat_sentinel_real_pair_dataset.md)
+2. [33 - Real Cross-Sensor SR Foundations](33_real_cross_sensor_sr_foundations.md)
+3. [34 - Pair Quality Metrics and Diagnostic Interpretation](34_pair_quality_metrics_and_diagnostics.md)
+4. [35 - Training, Debugging, Evaluation, and Supervisor Questions](35_training_debugging_evaluation_viva.md)

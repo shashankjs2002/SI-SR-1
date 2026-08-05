@@ -55,6 +55,12 @@ and a visually sharp satellite image is not automatically a spatially faithful r
 | 27 | [Uncertainty and abstention](27_uncertainty_and_abstention.md) | Quantify stochastic disagreement and reliability-aware blending |
 | 28 | [Complete system integration](28_complete_system_integration.md) | Join all modules, equations, tensor shapes, and training stages |
 | 29 | [Twelve-tile improved small-model run](29_twelve_tile_small_improvement_run.md) | Apply artifact, confidence, detail, checkpoint, and early-stopping improvements |
+| 30 | [Caption generation pipeline](30_caption_generation_pipeline.md) | Generate grounded brief, descriptive, analytical, and positional captions |
+| 31 | [SOTA benchmark protocol](31_sota_benchmark_protocol.md) | Compare external models without silently changing their architectures |
+| 32 | [Landsat-Sentinel paired dataset](32_landsat_sentinel_real_pair_dataset.md) | Prepare real Landsat 30 m and Sentinel-2 10 m 3x pairs |
+| 33 | [Real cross-sensor SR foundations](33_real_cross_sensor_sr_foundations.md) | Explain pairing, reflectance, grids, masks, tensor shapes, and limitations |
+| 34 | [Pair quality metrics and diagnostics](34_pair_quality_metrics_and_diagnostics.md) | Interpret MAE, bias, PSNR, edges, heatmaps, registration, spectra, and masks |
+| 35 | [Training, debugging, evaluation, and viva](35_training_debugging_evaluation_viva.md) | Defend modules, losses, diagnostics, results, ablations, and scientific claims |
 
 ## Recommended Pace
 
@@ -64,7 +70,8 @@ flowchart LR
     B["Week 2<br/>Ch. 04-07<br/>Generative SR"] -->
     C["Week 3<br/>Ch. 08-10<br/>GeoDiff-GAN"] -->
     D["Week 4<br/>Ch. 11-18<br/>Evaluation and research"] -->
-    E["Week 5<br/>Ch. 19-29<br/>Modules and improved experiment"]
+    E["Week 5<br/>Ch. 19-29<br/>Modules and improved experiment"] -->
+    F["Week 6<br/>Ch. 30-35<br/>Captions, benchmarks,<br/>and real cross-sensor SR"]
 ```
 
 For each chapter:
