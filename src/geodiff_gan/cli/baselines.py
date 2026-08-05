@@ -82,6 +82,11 @@ def main() -> None:
     else:
         print("[baselines] LPIPS/DISTS disabled", flush=True)
     optional_metrics = OptionalMetricSuite(device, enabled=args.optional_metrics)
+    if args.optional_metrics:
+        loaded = ", ".join(optional_metrics.available_metrics) or "none"
+        print(f"[baselines] optional metrics ready: {loaded}", flush=True)
+        for name, error in optional_metrics.load_errors.items():
+            print(f"[baselines] optional metric unavailable: {name}: {error}", flush=True)
     totals: dict[str, defaultdict[str, float]] = {
         "bicubic": defaultdict(float),
         "base": defaultdict(float),

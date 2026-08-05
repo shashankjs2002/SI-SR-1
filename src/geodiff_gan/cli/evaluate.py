@@ -130,6 +130,11 @@ def main() -> None:
     else:
         print("[evaluate] LPIPS/DISTS disabled", flush=True)
     optional_metrics = OptionalMetricSuite(device, enabled=args.optional_metrics)
+    if args.optional_metrics:
+        loaded = ", ".join(optional_metrics.available_metrics) or "none"
+        print(f"[evaluate] optional metrics ready: {loaded}", flush=True)
+        for name, error in optional_metrics.load_errors.items():
+            print(f"[evaluate] optional metric unavailable: {name}: {error}", flush=True)
     print(f"[evaluate] loading {args.split} dataset", flush=True)
     dataset = SentinelPatchDataset(
         config["data"]["manifest"],

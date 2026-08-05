@@ -1,6 +1,11 @@
 from __future__ import annotations
 
 import math
+import sys
+import sysconfig
+import warnings
+from importlib import metadata
+from pathlib import Path
 
 import torch
 from torch.nn import functional as F
@@ -138,20 +143,40 @@ class OptionalMetricSuite:
     def __init__(self, device: torch.device, enabled: bool = True) -> None:
         self.lpips_model = None
         self.dists_model = None
+        self.load_errors: dict[str, str] = {}
         if not enabled:
             return
         try:
             import lpips
 
             self.lpips_model = lpips.LPIPS(net="alex").to(device).eval()
-        except ImportError:
-            pass
+        except Exception as error:
+            self._record_load_error("lpips", error)
         try:
-            from DISTS_pytorch import DISTS
+            self.dists_model = _load_dists_model(device)
+        except Exception as error:
+            self._record_load_error("dists", error)
 
-            self.dists_model = DISTS().to(device).eval()
-        except ImportError:
-            pass
+    @property
+    def available_metrics(self) -> tuple[str, ...]:
+        return tuple(
+            name
+            for name, model in (
+                ("lpips", self.lpips_model),
+                ("dists", self.dists_model),
+            )
+            if model is not None
+        )
+
+    def _record_load_error(self, name: str, error: Exception) -> None:
+        message = f"{type(error).__name__}: {error}"
+        self.load_errors[name] = message
+        warnings.warn(
+            f"Optional metric {name.upper()} is unavailable ({message}). "
+            "Evaluation will continue with the remaining metrics.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
 
     @torch.no_grad()
     def __call__(
@@ -163,14 +188,55 @@ class OptionalMetricSuite:
         values: dict[str, float] = {}
         if mask is not None:
             prediction = prediction * mask + target * (1 - mask)
-        normalized_prediction = prediction * 2 - 1
-        normalized_target = target * 2 - 1
         if self.lpips_model is not None:
+            normalized_prediction = prediction * 2 - 1
+            normalized_target = target * 2 - 1
             values["lpips"] = float(
                 self.lpips_model(normalized_prediction, normalized_target).mean()
             )
         if self.dists_model is not None:
             values["dists"] = float(
-                self.dists_model(normalized_prediction, normalized_target).mean()
+                self.dists_model(prediction, target).mean()
             )
         return values
+
+
+def _load_dists_model(device: torch.device) -> torch.nn.Module:
+    """Load DISTS despite the package's hard-coded ``sys.prefix`` weight path."""
+    import DISTS_pytorch
+
+    package_file = Path(DISTS_pytorch.__file__).resolve()
+    candidates = [
+        Path(sys.prefix) / "weights.pt",
+        Path(sysconfig.get_path("data")) / "weights.pt",
+        package_file.parent / "weights.pt",
+    ]
+    try:
+        distribution = metadata.distribution("DISTS-pytorch")
+    except metadata.PackageNotFoundError:
+        distribution = None
+    if distribution is not None:
+        candidates.extend(
+            Path(distribution.locate_file(file))
+            for file in distribution.files or ()
+            if Path(file).name == "weights.pt"
+        )
+    candidates = list(dict.fromkeys(candidates))
+    weights_path = next((path for path in candidates if path.is_file()), None)
+    if weights_path is None:
+        searched = ", ".join(str(path) for path in candidates)
+        raise FileNotFoundError(f"DISTS weights.pt was not found; searched: {searched}")
+
+    model = DISTS_pytorch.DISTS(load_weights=False)
+    weights = torch.load(
+        weights_path,
+        map_location="cpu",
+        weights_only=True,
+    )
+    missing = {"alpha", "beta"}.difference(weights)
+    if missing:
+        raise KeyError(f"DISTS weights are missing keys: {sorted(missing)}")
+    with torch.no_grad():
+        model.alpha.copy_(weights["alpha"])
+        model.beta.copy_(weights["beta"])
+    return model.to(device).eval()
