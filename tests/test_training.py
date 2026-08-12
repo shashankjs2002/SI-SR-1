@@ -360,6 +360,45 @@ class TrainingSmokeTest(unittest.TestCase):
                 trainer.train()
             self.assertEqual(discriminator_loss.call_count, 2)
 
+    def test_trainable_modules_override_can_unfreeze_base_for_joint(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, config = self._fixture(root)
+            config["training"].update(
+                {
+                    "stage": "joint",
+                    "output_dir": str(root / "joint_default"),
+                }
+            )
+            default_trainer = Trainer(config)
+            self.assertFalse(
+                any(parameter.requires_grad for parameter in default_trainer.model.base.parameters())
+            )
+            self.assertTrue(
+                any(parameter.requires_grad for parameter in default_trainer.model.decoder.parameters())
+            )
+
+            config["training"].update(
+                {
+                    "output_dir": str(root / "joint_unfrozen"),
+                    "trainable_modules": [
+                        "base",
+                        "vae",
+                        "lr_encoder",
+                        "diffusion",
+                        "mapper",
+                        "decoder",
+                    ],
+                }
+            )
+            unfrozen_trainer = Trainer(config)
+            self.assertTrue(
+                any(parameter.requires_grad for parameter in unfrozen_trainer.model.base.parameters())
+            )
+            self.assertTrue(
+                any(parameter.requires_grad for parameter in unfrozen_trainer.model.vae.parameters())
+            )
+
     def test_counterfactual_edit_does_not_use_paired_reconstruction(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

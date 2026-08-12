@@ -216,7 +216,24 @@ class Trainer:
         return reduced
 
     def _configure_stage(self) -> None:
-        configure_stage_trainability(self.model, self.stage)
+        trainable_modules = self.config["training"].get("trainable_modules")
+        if trainable_modules is None:
+            configure_stage_trainability(self.model, self.stage)
+            return
+        if not isinstance(trainable_modules, list) or not all(
+            isinstance(name, str) for name in trainable_modules
+        ):
+            raise ValueError("training.trainable_modules must be a list of module names")
+        self.model.requires_grad_(False)
+        available = dict(self.model.named_children())
+        unknown = sorted(set(trainable_modules) - set(available))
+        if unknown:
+            raise ValueError(
+                "training.trainable_modules contains unknown modules: "
+                + ", ".join(unknown)
+            )
+        for name in trainable_modules:
+            available[name].requires_grad_(True)
 
     def _loader(self, split: str) -> DataLoader:
         data = self.config["data"]

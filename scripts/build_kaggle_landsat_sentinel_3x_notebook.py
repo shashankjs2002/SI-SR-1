@@ -97,6 +97,8 @@ cells = [
         TRAINING_PROGRESS_MODE = "compact"  # compact, tqdm, or quiet
         TRAINING_DIAGNOSTICS = False  # Dedicated debug cells are more storage-efficient.
         VALIDATION_LIMIT = 4 if FAST_DEV_RUN else 64
+        RUN_FIDELITY_FINETUNE_ABLATIONS = False
+        FIDELITY_FINETUNE_EPOCHS = 1 if FAST_DEV_RUN else 5
 
         EPOCHS = (
             {"base": 1, "vae": 1, "diffusion": 1, "joint": 1}
@@ -1013,6 +1015,7 @@ cells = [
         evaluation_checkpoint = CHECKPOINTS[final_stage]
         evaluation_config = CONFIGS[final_stage]
         split_output = EVALUATION_ROOT / EVALUATION_SPLIT
+        base_checkpoint = CHECKPOINTS.get("base")
 
         evaluation_command = [
             sys.executable, "-m", "geodiff_gan.cli.evaluate",
@@ -1043,24 +1046,40 @@ cells = [
             "--device", "cuda" if torch.cuda.is_available() else "cpu",
             "--progress", "compact",
         ]
-        if "base" in CHECKPOINTS:
-            baseline_command.extend(["--base-checkpoint", CHECKPOINTS["base"]])
+        if base_checkpoint is not None:
+            baseline_command.extend(["--base-checkpoint", base_checkpoint])
         if EVALUATION_OPTIONAL_METRICS:
             baseline_command.append("--optional-metrics")
         run(baseline_command, cwd=REPOSITORY_DIR)
 
         model_metrics = json.loads((split_output / "metrics.json").read_text(encoding="utf-8"))
         baseline_metrics = json.loads(baseline_path.read_text(encoding="utf-8"))
-        metric_rows = [{"method": "GeoDiff-GAN", **model_metrics}]
+        method_labels = {
+            "bicubic": "Landsat bicubic",
+            "base": "SwinIR base",
+        }
+        metric_rows = [{"method": "GeoDiff-GAN final", **model_metrics}]
         for method, values in baseline_metrics.items():
             if isinstance(values, dict):
-                metric_rows.append({"method": method, **values})
+                metric_rows.append({"method": method_labels.get(method, method), **values})
         metric_table = pd.DataFrame(metric_rows)
+        method_order = ["Landsat bicubic", "SwinIR base", "GeoDiff-GAN final"]
+        metric_table["method"] = pd.Categorical(
+            metric_table["method"],
+            categories=method_order,
+            ordered=True,
+        )
+        metric_table = metric_table.sort_values("method").reset_index(drop=True)
         preferred = [
             "method", "count", "l1", "psnr", "ssim", "edge_f1",
             "redegradation_l1", "lpips", "dists",
         ]
         display(metric_table[[column for column in preferred if column in metric_table.columns]].round(6))
+        print(
+            "Read this table as three separate systems: bicubic is interpolation only, "
+            "SwinIR base is the deterministic radiometric SR branch, and GeoDiff-GAN final "
+            "is base plus diffusion/GAN residual, evidence gating, and back-projection."
+        )
         """
     ),
     markdown("## 15. Metric comparison plots"),
@@ -1074,9 +1093,19 @@ cells = [
             columns = 3
             rows_count = (len(available_metrics) + columns - 1) // columns
             fig, axes = plt.subplots(rows_count, columns, figsize=(15, 4 * rows_count), squeeze=False)
+            palette = {
+                "Landsat bicubic": "#9e9e9e",
+                "SwinIR base": "#4f81bd",
+                "GeoDiff-GAN final": "#70ad47",
+            }
             for axis, metric in zip(axes.flat, available_metrics):
                 values = metric_table[["method", metric]].dropna()
-                axis.bar(values["method"], values[metric], color=["#2f5597", "#a5a5a5", "#70ad47"][:len(values)])
+                labels = [str(value) for value in values["method"]]
+                axis.bar(
+                    labels,
+                    values[metric],
+                    color=[palette.get(label, "#8064a2") for label in labels],
+                )
                 direction = "higher is better" if metric in ("psnr", "ssim", "edge_f1") else "lower is better"
                 axis.set_title(f"{metric} ({direction})")
                 axis.tick_params(axis="x", rotation=20)
@@ -1129,21 +1158,35 @@ cells = [
             side_valid = torch.from_numpy(data["valid_mask_hr"][0]).bool()
         with np.load(result_path) as data:
             side_output = chw(data["mean"])
+            cached_base_for_side = chw(data["base"]) if "base" in set(data.files) else None
         side_bicubic = F.interpolate(
             side_lr[None], size=side_hr.shape[-2:], mode="bicubic", align_corners=False
         )[0].clamp(0, 1)
-        side_images = [side_lr, side_bicubic, side_output, side_hr]
+        if cached_base_for_side is None:
+            from geodiff_gan.models.system import GeoDiffGAN
+            from geodiff_gan.training.checkpoint import load_checkpoint
+
+            side_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            side_model = GeoDiffGAN.from_config(runtime_config).to(side_device).eval()
+            load_checkpoint(evaluation_checkpoint, side_model, strict=False)
+            with torch.inference_mode():
+                cached_base_for_side = side_model.base(side_lr[None].to(side_device))[0].float().cpu()
+            del side_model
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        side_images = [side_lr, side_bicubic, cached_base_for_side, side_output, side_hr]
         side_displays = shared_stretch(side_images, side_valid)
 
         titles = (
             "Landsat original 30 m\n128 x 128 native pixels",
             "Landsat bicubic display\n384 x 384 (no new information)",
+            "SwinIR base\n384 x 384 deterministic",
             "GeoDiff-GAN 3x\n384 x 384",
             "Sentinel-2 target 10 m\n384 x 384",
         )
-        fig = plt.figure(figsize=(22, 6.2), constrained_layout=True)
-        grid = fig.add_gridspec(1, 4, width_ratios=(1, 3, 3, 3))
-        axes = [fig.add_subplot(grid[0, index]) for index in range(4)]
+        fig = plt.figure(figsize=(24, 6.2), constrained_layout=True)
+        grid = fig.add_gridspec(1, 5, width_ratios=(1, 3, 3, 3, 3))
+        axes = [fig.add_subplot(grid[0, index]) for index in range(5)]
         for index, (image, title) in enumerate(zip(side_displays, titles)):
             axis = axes[index]
             axis.imshow(
@@ -1160,14 +1203,15 @@ cells = [
 
         comparison_errors = {
             "Landsat bicubic vs Sentinel": (side_bicubic - side_hr).abs().mean(0) * side_valid,
+            "SwinIR base vs Sentinel": (cached_base_for_side - side_hr).abs().mean(0) * side_valid,
             "GeoDiff-GAN vs Sentinel": (side_output - side_hr).abs().mean(0) * side_valid,
         }
         valid_errors = torch.cat([error[side_valid] for error in comparison_errors.values()])
         error_vmax = max(0.05, float(torch.quantile(valid_errors, 0.99)))
-        fig = plt.figure(figsize=(12, 5.2), constrained_layout=True)
-        error_grid = fig.add_gridspec(1, 3, width_ratios=(1, 1, 0.045))
-        error_axes = [fig.add_subplot(error_grid[0, index]) for index in range(2)]
-        color_axis = fig.add_subplot(error_grid[0, 2])
+        fig = plt.figure(figsize=(16, 5.2), constrained_layout=True)
+        error_grid = fig.add_gridspec(1, 4, width_ratios=(1, 1, 1, 0.045))
+        error_axes = [fig.add_subplot(error_grid[0, index]) for index in range(3)]
+        color_axis = fig.add_subplot(error_grid[0, 3])
         for axis, (title, error) in zip(error_axes, comparison_errors.items()):
             plot = axis.imshow(error, cmap="turbo", vmin=0, vmax=error_vmax)
             axis.set_title(f"{title}\nMasked L1={float(error[side_valid].mean()):.4f}")
@@ -1364,7 +1408,196 @@ cells = [
     ),
     markdown(
         """
-        ## 20. Export model artifacts without deleting data
+        ## 20. Optional fidelity-focused and full-unfreeze fine-tuning ablations
+
+        Your current numbers show that the deterministic SwinIR base can beat the final
+        diffusion/GAN output on PSNR, SSIM, LPIPS, and DISTS. That means the joint stage is
+        useful for LR consistency and some edges, but it may be pulling the image away from
+        the paired Sentinel target. Run this section only after the normal pipeline finishes.
+
+        Two controlled experiments are created:
+
+        - `joint_fidelity`: starts from the existing joint checkpoint, reduces synthesis losses,
+          and emphasizes Charbonnier, SSIM, and gradient losses.
+        - `joint_unfrozen_fidelity`: same objective, but also makes the base and VAE trainable
+          during joint fine-tuning.
+
+        The second experiment is not automatically better. It can improve target fidelity, but
+        it can also damage the conservative base branch if the data are misregistered or the
+        Landsat/Sentinel date gap creates real land-cover differences.
+        """
+    ),
+    code(
+        r"""
+        def build_ablation_config(name, trainable_modules=None):
+            config = copy.deepcopy(runtime_config)
+            output_dir = RUN_ROOT / name
+            output_dir.mkdir(parents=True, exist_ok=True)
+            config["training"].update({
+                "stage": "joint",
+                "epochs": FIDELITY_FINETUNE_EPOCHS,
+                "learning_rate": min(float(STAGE_LEARNING_RATES["joint"]), 1e-5),
+                "discriminator_learning_rate": 5e-6,
+                "output_dir": str(output_dir),
+                "init_checkpoint": str(evaluation_checkpoint),
+                "resume": None,
+                "auto_resume": AUTO_RESUME_TRAINING,
+                "checkpoint_metric": "val_ssim",
+                "checkpoint_mode": "max",
+                "early_stopping_patience": 3 if FAST_DEV_RUN else 5,
+            })
+            config["training"]["loss_weights"] = {
+                **config["training"].get("loss_weights", {}),
+                "charbonnier": 2.0,
+                "ssim": 1.0,
+                "gradient": 0.25,
+                "consistency": 0.5,
+                "wavelet": 0.02,
+                "perceptual": 0.02,
+                "diffusion": 0.25,
+                "evidence_calibration": 0.02,
+                "adversarial": 0.0,
+                "prompt_alignment": 0.0,
+            }
+            if trainable_modules is not None:
+                config["training"]["trainable_modules"] = trainable_modules
+            config_path = CONFIG_ROOT / f"{name}.yaml"
+            config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+            return config_path, output_dir
+
+        def train_and_evaluate_ablation(name, trainable_modules=None):
+            config_path, output_dir = build_ablation_config(name, trainable_modules)
+            print(f"\n===== {name}: fidelity fine-tune =====")
+            run([sys.executable, "-m", "geodiff_gan.cli.train", "--config", config_path], cwd=REPOSITORY_DIR)
+            checkpoint = select_checkpoint(output_dir, "joint")
+            if checkpoint is None:
+                raise RuntimeError(f"No checkpoint produced for {name}")
+            output = EVALUATION_ROOT / name / EVALUATION_SPLIT
+            command = [
+                sys.executable, "-m", "geodiff_gan.cli.evaluate",
+                "--config", config_path,
+                "--checkpoint", checkpoint,
+                "--output", output,
+                "--split", EVALUATION_SPLIT,
+                "--samples", EVALUATION_SAMPLES,
+                "--steps", EVALUATION_STEPS,
+                "--back-projection-steps", EVALUATION_BACK_PROJECTION_STEPS,
+                "--mode", "sr",
+                "--limit", EVALUATION_LIMIT,
+                "--device", "cuda" if torch.cuda.is_available() else "cpu",
+                "--progress", "compact",
+                "--no-text",
+            ]
+            if EVALUATION_OPTIONAL_METRICS:
+                command.append("--optional-metrics")
+            run(command, cwd=REPOSITORY_DIR)
+            return {
+                "name": name,
+                "config": config_path,
+                "checkpoint": checkpoint,
+                "output": output,
+                "metrics": json.loads((output / "metrics.json").read_text(encoding="utf-8")),
+            }
+
+        ABLATION_RESULTS = []
+        if RUN_FIDELITY_FINETUNE_ABLATIONS:
+            ABLATION_RESULTS.append(train_and_evaluate_ablation("joint_fidelity"))
+            ABLATION_RESULTS.append(
+                train_and_evaluate_ablation(
+                    "joint_unfrozen_fidelity",
+                    trainable_modules=[
+                        "base",
+                        "vae",
+                        "lr_encoder",
+                        "diffusion",
+                        "mapper",
+                        "decoder",
+                    ],
+                )
+            )
+        else:
+            print("Skipped. Set RUN_FIDELITY_FINETUNE_ABLATIONS=True in Cell 1 to run.")
+        ABLATION_RESULTS
+        """
+    ),
+    markdown("## 21. Recompare original, SwinIR base, and fine-tuned ablations"),
+    code(
+        r"""
+        comparison_rows = []
+        for row in metric_table.to_dict("records"):
+            comparison_rows.append({**row, "method": str(row["method"])})
+        for result in ABLATION_RESULTS:
+            comparison_rows.append({
+                "method": result["name"],
+                **result["metrics"],
+            })
+        comparison_table = pd.DataFrame(comparison_rows)
+        preferred = [
+            "method", "count", "l1", "psnr", "ssim", "edge_f1",
+            "redegradation_l1", "lpips", "dists",
+        ]
+        display(comparison_table[[column for column in preferred if column in comparison_table.columns]].round(6))
+
+        plot_metrics = [
+            metric for metric in ("psnr", "ssim", "edge_f1", "lpips", "dists", "l1", "redegradation_l1")
+            if metric in comparison_table.columns and comparison_table[metric].notna().any()
+        ]
+        if plot_metrics:
+            columns = 3
+            rows_count = (len(plot_metrics) + columns - 1) // columns
+            fig, axes = plt.subplots(rows_count, columns, figsize=(16, 4.2 * rows_count), squeeze=False)
+            for axis, metric in zip(axes.flat, plot_metrics):
+                values = comparison_table[["method", metric]].dropna()
+                axis.bar(values["method"], values[metric], color="#4f81bd")
+                direction = "higher is better" if metric in ("psnr", "ssim", "edge_f1") else "lower is better"
+                axis.set_title(f"{metric} ({direction})")
+                axis.tick_params(axis="x", rotation=30)
+                axis.grid(axis="y", alpha=0.25)
+            for axis in axes.flat[len(plot_metrics):]:
+                axis.axis("off")
+            fig.tight_layout()
+            plt.show()
+
+        if ABLATION_RESULTS:
+            visual_outputs = {
+                "GeoDiff-GAN final": split_output,
+                **{result["name"]: result["output"] for result in ABLATION_RESULTS},
+            }
+            panels = [
+                (side_lr, "Landsat original 30 m"),
+                (side_bicubic, "Landsat bicubic"),
+                (cached_base_for_side, "SwinIR base"),
+            ]
+            for name, output_dir in visual_outputs.items():
+                candidate = output_dir / result_path.name
+                if candidate.exists():
+                    with np.load(candidate) as data:
+                        panels.append((chw(data["mean"]), name))
+                else:
+                    print("Missing visual cache:", candidate)
+            panels.append((side_hr, "Sentinel target"))
+            displays = shared_stretch([image for image, _ in panels], side_valid)
+            columns = min(3, len(panels))
+            rows_count = (len(panels) + columns - 1) // columns
+            fig, axes = plt.subplots(rows_count, columns, figsize=(5 * columns, 5 * rows_count), squeeze=False)
+            for axis, display_image, (source_image, title) in zip(axes.flat, displays, panels):
+                axis.imshow(
+                    display_image.permute(1, 2, 0),
+                    interpolation="nearest" if title.startswith("Landsat original") else "antialiased",
+                )
+                error = float((source_image - side_hr).abs().mean(0)[side_valid].mean())
+                axis.set_title(f"{title}\nMasked L1={error:.4f}")
+                axis.axis("off")
+            for axis in axes.flat[len(panels):]:
+                axis.axis("off")
+            fig.suptitle("Visual comparison after fidelity ablations")
+            fig.tight_layout()
+            plt.show()
+        """
+    ),
+    markdown(
+        """
+        ## 22. Export model artifacts without deleting data
 
         The archive contains configs, checkpoints, evaluation, debug reports, manifest, and pairing
         state. Patch binaries are intentionally excluded because they can be many gigabytes and
