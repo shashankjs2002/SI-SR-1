@@ -23,14 +23,20 @@ from ..data import SentinelPatchDataset
 from ..diagnostics import DiagnosticRecorder, append_training_history
 from ..losses import (
     OptionalPerceptualLoss,
+    base_guard_loss,
     charbonnier,
     degradation_consistency,
     discriminator_hinge,
     edit_localization_loss,
     evidence_calibration_loss,
+    evidence_improvement_loss,
     generator_hinge,
     gradient_loss,
     kl_loss,
+    mse_loss,
+    multiscale_mse_loss,
+    radiometric_loss,
+    residual_supervision_loss,
     snr_weighted_velocity_loss,
     ssim,
     wavelet_loss,
@@ -121,13 +127,32 @@ class Trainer:
             self.wavelet_discriminator = DistributedDataParallel(
                 self.wavelet_discriminator, device_ids=[self.local_rank]
             )
-        self.perceptual = OptionalPerceptualLoss().to(self.device)
-        parameters = [parameter for parameter in self.model.parameters() if parameter.requires_grad]
+        self.perceptual = (
+            OptionalPerceptualLoss().to(self.device)
+            if float(training.get("loss_weights", {}).get("perceptual", 0.1)) > 0
+            else None
+        )
+        parameters = self._optimizer_parameter_groups()
         self.optimizer = torch.optim.AdamW(
             parameters,
             lr=float(config["training"]["learning_rate"]),
             betas=(0.9, 0.99),
             weight_decay=float(config["training"].get("weight_decay", 1e-4)),
+        )
+        scheduler_factor = float(training.get("lr_scheduler_factor", 1.0))
+        self.lr_scheduler = (
+            torch.optim.lr_scheduler.ReduceLROnPlateau(
+                self.optimizer,
+                mode=str(training.get("lr_scheduler_mode", "max")),
+                factor=scheduler_factor,
+                patience=max(0, int(training.get("lr_scheduler_patience", 2))),
+                threshold=max(
+                    0.0, float(training.get("lr_scheduler_threshold", 1e-4))
+                ),
+                min_lr=max(0.0, float(training.get("lr_scheduler_min_lr", 1e-7))),
+            )
+            if 0 < scheduler_factor < 1
+            else None
         )
         discriminator_parameters = list(self.patch_discriminator.parameters()) + list(
             self.wavelet_discriminator.parameters()
@@ -162,7 +187,11 @@ class Trainer:
             if "discriminator_optimizer" in extra:
                 self.discriminator_optimizer.load_state_dict(extra["discriminator_optimizer"])
             if "scaler" in extra:
-                self.scaler.load_state_dict(extra["scaler"])
+                scaler_state = extra["scaler"]
+                if scaler_state:
+                    self.scaler.load_state_dict(scaler_state)
+            if self.lr_scheduler is not None and extra.get("lr_scheduler"):
+                self.lr_scheduler.load_state_dict(extra["lr_scheduler"])
             if self.is_main:
                 print(
                     f"[{self.stage}] resuming from {resume} at epoch "
@@ -234,6 +263,61 @@ class Trainer:
             )
         for name in trainable_modules:
             available[name].requires_grad_(True)
+
+    def _optimizer_parameter_groups(self) -> list[dict[str, Any]]:
+        """Build optional per-module learning-rate groups for delicate joint tuning."""
+        training = self.config["training"]
+        base_learning_rate = float(training["learning_rate"])
+        multipliers = training.get("module_learning_rate_multipliers", {})
+        if not multipliers:
+            return [
+                {
+                    "params": [
+                        parameter
+                        for parameter in self.model.parameters()
+                        if parameter.requires_grad
+                    ],
+                    "lr": base_learning_rate,
+                }
+            ]
+        if not isinstance(multipliers, dict):
+            raise ValueError(
+                "training.module_learning_rate_multipliers must be a mapping"
+            )
+        named_children = dict(self.model.named_children())
+        unknown = sorted(set(multipliers) - set(named_children))
+        if unknown:
+            raise ValueError(
+                "Unknown module learning-rate multipliers: " + ", ".join(unknown)
+            )
+        groups: list[dict[str, Any]] = []
+        grouped_ids: set[int] = set()
+        for name, multiplier in multipliers.items():
+            module_parameters = [
+                parameter
+                for parameter in named_children[name].parameters()
+                if parameter.requires_grad
+            ]
+            if not module_parameters:
+                continue
+            groups.append(
+                {
+                    "params": module_parameters,
+                    "lr": base_learning_rate * float(multiplier),
+                    "name": name,
+                }
+            )
+            grouped_ids.update(id(parameter) for parameter in module_parameters)
+        remaining = [
+            parameter
+            for parameter in self.model.parameters()
+            if parameter.requires_grad and id(parameter) not in grouped_ids
+        ]
+        if remaining:
+            groups.append(
+                {"params": remaining, "lr": base_learning_rate, "name": "default"}
+            )
+        return groups
 
     def _loader(self, split: str) -> DataLoader:
         data = self.config["data"]
@@ -383,7 +467,14 @@ class Trainer:
                 diagnostics.capture("base.hr", prediction, visual="rgb")
                 diagnostics.capture("output.hr", prediction, visual="rgb")
             losses["charbonnier"] = charbonnier(prediction, hr, mask=valid_mask)
+            losses["mse"] = mse_loss(prediction, hr, mask=valid_mask)
+            losses["multiscale_mse"] = multiscale_mse_loss(
+                prediction, hr, mask=valid_mask
+            )
             losses["ssim"] = 1 - ssim(prediction, hr, mask=valid_mask)
+            losses["radiometric"] = radiometric_loss(
+                prediction, hr, mask=valid_mask
+            )
             losses["gradient"] = gradient_loss(prediction, hr, mask=valid_mask)
             losses["consistency"] = degradation_consistency(
                 prediction,
@@ -461,8 +552,28 @@ class Trainer:
             )
             losses["kl"] = kl_loss(mean, log_variance)
             losses["charbonnier"] = charbonnier(prediction, hr, mask=valid_mask)
+            losses["mse"] = mse_loss(prediction, hr, mask=valid_mask)
+            losses["multiscale_mse"] = multiscale_mse_loss(
+                prediction, hr, mask=valid_mask
+            )
             losses["gradient"] = gradient_loss(prediction, hr, mask=valid_mask)
             losses["wavelet"] = wavelet_loss(prediction, hr, mask=valid_mask)
+            losses["ssim"] = 1 - ssim(prediction, hr, mask=valid_mask)
+            losses["radiometric"] = radiometric_loss(
+                prediction, hr, mask=valid_mask
+            )
+            losses["residual_supervision"] = residual_supervision_loss(
+                detail, base, hr, mask=valid_mask
+            )
+            losses["base_guard"] = base_guard_loss(
+                prediction,
+                hr,
+                base,
+                margin=float(
+                    self.config["training"].get("base_guard_margin", 0.0)
+                ),
+                mask=valid_mask,
+            )
             losses["evidence_calibration"] = evidence_calibration_loss(
                 mapped.evidence_confidence,
                 ungated_prediction,
@@ -476,6 +587,18 @@ class Trainer:
                     self.config["training"].get(
                         "evidence_selectivity_weight",
                         0.0,
+                    )
+                ),
+                mask=valid_mask,
+            )
+            losses["evidence_improvement"] = evidence_improvement_loss(
+                mapped.evidence_confidence,
+                ungated_prediction,
+                base,
+                hr,
+                temperature=float(
+                    self.config["training"].get(
+                        "evidence_improvement_temperature", 0.01
                     )
                 ),
                 mask=valid_mask,
@@ -568,19 +691,32 @@ class Trainer:
                 reconstruction_target,
                 mask=reconstruction_valid,
             )
+            losses["mse"] = mse_loss(
+                reconstruction,
+                reconstruction_target,
+                mask=reconstruction_valid,
+            )
+            losses["multiscale_mse"] = multiscale_mse_loss(
+                reconstruction,
+                reconstruction_target,
+                mask=reconstruction_valid,
+            )
             losses["ssim"] = 1 - ssim(
                 reconstruction,
                 reconstruction_target,
                 mask=reconstruction_valid,
             )
-            perceptual_reconstruction = (
-                reconstruction * reconstruction_valid
-                + reconstruction_target * (1 - reconstruction_valid)
-            )
-            losses["perceptual"] = self.perceptual(
-                perceptual_reconstruction,
-                reconstruction_target,
-            )
+            if self.perceptual is not None:
+                perceptual_reconstruction = (
+                    reconstruction * reconstruction_valid
+                    + reconstruction_target * (1 - reconstruction_valid)
+                )
+                losses["perceptual"] = self.perceptual(
+                    perceptual_reconstruction,
+                    reconstruction_target,
+                )
+            else:
+                losses["perceptual"] = reconstruction.new_zeros(())
             losses["gradient"] = gradient_loss(
                 reconstruction,
                 reconstruction_target,
@@ -591,13 +727,38 @@ class Trainer:
                 reconstruction_target,
                 mask=reconstruction_valid,
             )
+            losses["radiometric"] = radiometric_loss(
+                reconstruction,
+                reconstruction_target,
+                mask=reconstruction_valid,
+            )
+            losses["residual_supervision"] = residual_supervision_loss(
+                output.residual[reconstruction_samples],
+                base[reconstruction_samples],
+                reconstruction_target,
+                mask=reconstruction_valid,
+            )
+            losses["base_guard"] = base_guard_loss(
+                reconstruction,
+                reconstruction_target,
+                base[reconstruction_samples],
+                margin=float(
+                    self.config["training"].get("base_guard_margin", 0.0)
+                ),
+                mask=reconstruction_valid,
+            )
         else:
             zero = prediction.new_zeros(())
             losses["charbonnier"] = zero
+            losses["mse"] = zero
+            losses["multiscale_mse"] = zero
             losses["ssim"] = zero
             losses["perceptual"] = zero
             losses["gradient"] = zero
             losses["wavelet"] = zero
+            losses["radiometric"] = zero
+            losses["residual_supervision"] = zero
+            losses["base_guard"] = zero
         losses["consistency"] = degradation_consistency(
             prediction,
             consistency_lr,
@@ -619,6 +780,18 @@ class Trainer:
                 self.config["training"].get(
                     "evidence_selectivity_weight",
                     0.0,
+                )
+            ),
+            mask=valid_mask,
+        )
+        losses["evidence_improvement"] = evidence_improvement_loss(
+            output.evidence_confidence,
+            output.ungated_sr,
+            base,
+            hr,
+            temperature=float(
+                self.config["training"].get(
+                    "evidence_improvement_temperature", 0.01
                 )
             ),
             mask=valid_mask,
@@ -686,6 +859,15 @@ class Trainer:
                 or training.get("progress_mode", "compact") != "tqdm"
             ),
         )
+        validation_sample_steps = max(
+            0, int(training.get("validation_sample_steps", 0))
+        )
+        validation_samples = max(
+            1, int(training.get("validation_samples", 1))
+        )
+        validation_back_projection_steps = max(
+            0, int(training.get("validation_back_projection_steps", 0))
+        )
         with torch.random.fork_rng(devices=cuda_devices):
             torch.manual_seed(seed)
             if self.device.type == "cuda":
@@ -701,6 +883,68 @@ class Trainer:
                         training=False,
                     )
                     total_loss = self._weighted_loss(losses)
+                    if (
+                        self.stage in ("joint", "edit")
+                        and validation_sample_steps > 0
+                    ):
+                        model: GeoDiffGAN = unwrap(self.model)  # type: ignore[assignment]
+                        lr = batch["lr"].to(self.device, non_blocking=True)
+                        degradation = batch["degradation"].to(
+                            self.device, non_blocking=True
+                        )
+                        projection_lr_value = batch.get("clean_lr")
+                        projection_lr = (
+                            projection_lr_value.to(
+                                self.device, non_blocking=True
+                            )
+                            if projection_lr_value is not None
+                            else model.output_lr(lr)
+                        )
+                        context, _, _, _ = self._contexts(
+                            list(batch["caption"]), training=False
+                        )
+                        base = model.base(lr)
+                        lr_features = model.lr_encoder(lr)
+                        sampled_outputs = []
+                        for sample_index in range(validation_samples):
+                            generator = torch.Generator(
+                                device=self.device
+                            ).manual_seed(seed + step * validation_samples + sample_index)
+                            sampled_outputs.append(
+                                model.sample(
+                                    lr,
+                                    context,
+                                    degradation=degradation,
+                                    projection_lr=projection_lr,
+                                    mode=("edit" if self.stage == "edit" else "sr"),
+                                    sample_steps=validation_sample_steps,
+                                    back_projection_steps=(
+                                        validation_back_projection_steps
+                                    ),
+                                    generator=generator,
+                                    base=base,
+                                    lr_features=lr_features,
+                                )
+                            )
+                        prediction = torch.stack(
+                            [output.image for output in sampled_outputs]
+                        ).mean(dim=0)
+                        if self.stage == "joint" and validation_samples > 1:
+                            stack = torch.stack(
+                                [output.image for output in sampled_outputs]
+                            )
+                            uncertainty = stack.var(
+                                dim=0, unbiased=False
+                            ).mean(dim=1)
+                            evidence = torch.stack(
+                                [
+                                    output.evidence_confidence
+                                    for output in sampled_outputs
+                                ]
+                            ).mean(dim=0)
+                            prediction, _, _ = model.apply_uncertainty_abstention(
+                                prediction, base, evidence, uncertainty
+                            )
                 for name, value in losses.items():
                     totals[f"loss_{name}"] += float(value.detach())
                 totals["loss_total"] += float(total_loss.detach())
@@ -745,6 +989,45 @@ class Trainer:
                     )
                     for name, value in values.items():
                         totals[name] += value
+                    if self.stage not in ("base", "diffusion"):
+                        validation_base = model.base(
+                            batch["lr"].to(self.device, non_blocking=True)
+                        )
+                        base_values = basic_metrics(
+                            validation_base,
+                            batch["hr"].to(self.device, non_blocking=True),
+                            metric_lr,
+                            batch["degradation"].to(
+                                self.device, non_blocking=True
+                            ),
+                            scale=model.scale,
+                            severity=model.degradation_severity,
+                            mask=(
+                                batch["valid_mask"].to(
+                                    self.device, non_blocking=True
+                                )
+                                if "valid_mask" in batch
+                                else None
+                            ),
+                            lr_mask=(
+                                batch["valid_mask_lr"].to(
+                                    self.device, non_blocking=True
+                                )
+                                if "valid_mask_lr" in batch
+                                else None
+                            ),
+                        )
+                        for name, value in base_values.items():
+                            totals[f"base_{name}"] += value
+                        totals["psnr_gain_vs_base"] += (
+                            values["psnr"] - base_values["psnr"]
+                        )
+                        totals["ssim_gain_vs_base"] += (
+                            values["ssim"] - base_values["ssim"]
+                        )
+                        totals["base_improvement_rate"] += float(
+                            values["l1"] < base_values["l1"]
+                        )
                 completed = step + 1
                 progress.set_postfix(
                     loss=f"{totals['loss_total'] / completed:.4f}",
@@ -765,6 +1048,8 @@ class Trainer:
         weights = self.config["training"].get("loss_weights", {})
         default_weights = {
             "charbonnier": 1.0,
+            "mse": 0.0,
+            "multiscale_mse": 0.0,
             "consistency": 1.0,
             "ssim": 0.2,
             "gradient": 0.1,
@@ -774,6 +1059,10 @@ class Trainer:
             "vae_reconstruction": 1.0,
             "diffusion": 1.0,
             "evidence_calibration": 0.1,
+            "evidence_improvement": 0.0,
+            "radiometric": 0.0,
+            "residual_supervision": 0.0,
+            "base_guard": 0.0,
             "edit_localization": 0.05,
             "edit_permission": 0.05,
             "prompt_alignment": 0.05,
@@ -835,6 +1124,12 @@ class Trainer:
             )
         validation_loader = self._loader("val")
         training = self.config["training"]
+        adversarial_weight = float(
+            training.get("loss_weights", {}).get("adversarial", 0.01)
+        )
+        adversarial_enabled = (
+            self.stage in ("joint", "edit") and adversarial_weight > 0
+        )
         accumulation = int(training.get("gradient_accumulation", 1))
         if accumulation < 1:
             raise ValueError("training.gradient_accumulation must be at least 1")
@@ -949,7 +1244,7 @@ class Trainer:
             if self.text_encoder is not None:
                 self.text_encoder.eval()
             self.optimizer.zero_grad(set_to_none=True)
-            if self.stage in ("joint", "edit"):
+            if adversarial_enabled:
                 self.patch_discriminator.train()
                 self.wavelet_discriminator.train()
                 self.discriminator_optimizer.zero_grad(set_to_none=True)
@@ -1024,7 +1319,7 @@ class Trainer:
                     prediction, losses = self._forward_stage(batch, diagnostics)
                     generator_loss = self._weighted_loss(losses)
                     discriminator_loss = None
-                    if self.stage in ("joint", "edit"):
+                    if adversarial_enabled:
                         adversarial_prediction = (
                             prediction * valid_mask + hr * (1 - valid_mask)
                         )
@@ -1033,9 +1328,7 @@ class Trainer:
                             lr,
                         )
                         losses["adversarial"] = adversarial
-                        generator_loss = generator_loss + adversarial * float(
-                            training.get("loss_weights", {}).get("adversarial", 0.01)
-                        )
+                        generator_loss = generator_loss + adversarial * adversarial_weight
                         discriminator_loss = self._discriminator_loss(
                             adversarial_prediction,
                             hr,
@@ -1067,7 +1360,7 @@ class Trainer:
                         self.scaler.step(self.discriminator_optimizer)
                     self.scaler.update()
                     self.optimizer.zero_grad(set_to_none=True)
-                    if self.stage in ("joint", "edit"):
+                    if adversarial_enabled:
                         self.discriminator_optimizer.zero_grad(set_to_none=True)
                 if diagnostics is not None:
                     if self.stage != "diffusion":
@@ -1245,6 +1538,12 @@ class Trainer:
                     "min_delta": early_stopping_min_delta,
                     "stopped": stop_training,
                 }
+                scheduler_metric = str(
+                    training.get("lr_scheduler_metric", checkpoint_metric)
+                )
+                scheduler_value = epoch_metrics.get(scheduler_metric)
+                if self.lr_scheduler is not None and scheduler_value is not None:
+                    self.lr_scheduler.step(float(scheduler_value))
                 if use_tqdm:
                     epoch_progress.set_postfix(
                         train_loss=f"{epoch_metrics.get('total', float('nan')):.4f}",
@@ -1271,6 +1570,11 @@ class Trainer:
                         ).state_dict(),
                         "discriminator_optimizer": self.discriminator_optimizer.state_dict(),
                         "scaler": self.scaler.state_dict(),
+                        "lr_scheduler": (
+                            self.lr_scheduler.state_dict()
+                            if self.lr_scheduler is not None
+                            else None
+                        ),
                     },
                 )
                 if keep_best_and_latest:

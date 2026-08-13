@@ -76,6 +76,15 @@ def main() -> None:
         type=int,
         help="Override SR/edit back-projection iterations for ablation.",
     )
+    parser.add_argument(
+        "--residual-scale",
+        type=float,
+        default=1.0,
+        help=(
+            "Scale the final correction relative to the deterministic base. "
+            "Use 0 for the base and values below 1 for fidelity ablations."
+        ),
+    )
     parser.add_argument("--mode", choices=("sr", "edit"), default="sr")
     parser.add_argument("--limit", type=int)
     parser.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto")
@@ -101,6 +110,8 @@ def main() -> None:
         parser.error("--steps must be at least 1")
     if args.back_projection_steps is not None and args.back_projection_steps < 0:
         parser.error("--back-projection-steps must be non-negative")
+    if args.residual_scale < 0:
+        parser.error("--residual-scale must be non-negative")
     config = load_config(args.config)
     device = _resolve_device(args.device)
     amp_enabled = bool(
@@ -281,6 +292,9 @@ def main() -> None:
             )
             abstention = 1 - combined_confidence
         base_image = outputs[0].base.float()
+        mean = (
+            base_image + float(args.residual_scale) * (mean - base_image)
+        ).clamp(0, 1)
         decoder_residual = torch.stack(
             [output.residual for output in outputs]
         ).float().mean(dim=0)
@@ -380,6 +394,7 @@ def main() -> None:
     summary["samples_per_patch"] = args.samples
     summary["diffusion_steps"] = args.steps
     summary["back_projection_steps"] = args.back_projection_steps
+    summary["residual_scale"] = args.residual_scale
     summary["device"] = str(device)
     summary["amp"] = amp_enabled
     summary["optional_metrics"] = args.optional_metrics

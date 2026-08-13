@@ -6,7 +6,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from .models.blocks import haar_wavelet
+from .models.blocks import haar_wavelet, high_pass
 from .models.degradation import sensor_degrade
 
 
@@ -28,6 +28,102 @@ def charbonnier(
 ) -> torch.Tensor:
     value = torch.sqrt((prediction - target).square() + epsilon**2)
     return _masked_mean(value, mask)
+
+
+def mse_loss(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Masked MSE, the distortion objective directly optimized by PSNR."""
+    return _masked_mean((prediction - target).square(), mask)
+
+
+def multiscale_mse_loss(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor | None = None,
+    scales: tuple[int, ...] = (1, 2, 4),
+) -> torch.Tensor:
+    """Match radiometry and structure at native and progressively coarser scales."""
+    losses = []
+    for scale in scales:
+        if scale < 1:
+            raise ValueError("multiscale MSE scales must be positive")
+        if scale == 1:
+            scaled_prediction = prediction
+            scaled_target = target
+            scaled_mask = mask
+        else:
+            scaled_prediction = F.avg_pool2d(prediction, scale, stride=scale)
+            scaled_target = F.avg_pool2d(target, scale, stride=scale)
+            scaled_mask = (
+                (F.avg_pool2d(mask.float(), scale, stride=scale) >= 0.999).float()
+                if mask is not None
+                else None
+            )
+        losses.append(mse_loss(scaled_prediction, scaled_target, scaled_mask))
+    return torch.stack(losses).mean()
+
+
+def radiometric_loss(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Match per-band mean and standard deviation on valid pixels."""
+    if mask is None:
+        mask = torch.ones_like(prediction[:, :1])
+    mask = F.interpolate(mask.float(), size=prediction.shape[-2:], mode="nearest")
+    if mask.shape[1] == 1:
+        mask = mask.expand(-1, prediction.shape[1], -1, -1)
+    denominator = mask.sum(dim=(-2, -1)).clamp_min(1.0)
+
+    def statistics(value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        mean = (value * mask).sum(dim=(-2, -1)) / denominator
+        variance = (
+            (value - mean[..., None, None]).square() * mask
+        ).sum(dim=(-2, -1)) / denominator
+        return mean, variance.clamp_min(1e-12).sqrt()
+
+    prediction_mean, prediction_std = statistics(prediction)
+    target_mean, target_std = statistics(target)
+    return F.l1_loss(prediction_mean, target_mean) + F.l1_loss(
+        prediction_std, target_std
+    )
+
+
+def base_guard_loss(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    base: torch.Tensor,
+    margin: float = 0.0,
+    mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Penalize samples whose reconstruction MSE is worse than the frozen base."""
+    error = (prediction - target).square().mean(dim=1, keepdim=True)
+    with torch.no_grad():
+        base_error = (base - target).square().mean(dim=1, keepdim=True)
+    if mask is None:
+        prediction_mse = error.flatten(1).mean(dim=1)
+        base_mse = base_error.flatten(1).mean(dim=1)
+    else:
+        mask = F.interpolate(mask.float(), size=error.shape[-2:], mode="nearest")
+        denominator = mask.flatten(1).sum(dim=1).clamp_min(1.0)
+        prediction_mse = (error * mask).flatten(1).sum(dim=1) / denominator
+        base_mse = (base_error * mask).flatten(1).sum(dim=1) / denominator
+    return F.relu(prediction_mse - base_mse + float(margin)).mean()
+
+
+def residual_supervision_loss(
+    residual: torch.Tensor,
+    base: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Supervise the SR branch against the high-frequency target residual."""
+    target_residual = high_pass(target - base)
+    return charbonnier(residual, target_residual, mask=mask)
 
 
 def _ssim_statistics(x: torch.Tensor, window: int = 11) -> tuple[torch.Tensor, ...]:
@@ -195,6 +291,51 @@ def evidence_calibration_loss(
     )
     selectivity = (1 - correlation).mean()
     return calibration + float(selectivity_weight) * selectivity
+
+
+def evidence_improvement_loss(
+    confidence: torch.Tensor,
+    ungated_prediction: torch.Tensor,
+    base: torch.Tensor,
+    target: torch.Tensor,
+    temperature: float = 0.01,
+    smoothing_window: int = 9,
+    mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Teach the gate to trust detail only where it improves on the base."""
+    with torch.no_grad():
+        candidate_error = (ungated_prediction - target).square().mean(
+            dim=1, keepdim=True
+        )
+        base_error = (base - target).square().mean(dim=1, keepdim=True)
+        improvement = base_error - candidate_error
+        improvement = F.avg_pool2d(
+            improvement,
+            smoothing_window,
+            stride=1,
+            padding=smoothing_window // 2,
+        )
+        target_confidence = torch.sigmoid(
+            improvement / max(float(temperature), 1e-8)
+        )
+        target_confidence = F.interpolate(
+            target_confidence,
+            size=confidence.shape[-2:],
+            mode="area",
+        )
+    confidence_mask = (
+        F.interpolate(mask.float(), size=confidence.shape[-2:], mode="nearest")
+        if mask is not None
+        else None
+    )
+    return _masked_mean(
+        F.binary_cross_entropy(
+            confidence.clamp(1e-6, 1 - 1e-6),
+            target_confidence,
+            reduction="none",
+        ),
+        confidence_mask,
+    )
 
 
 def edit_localization_loss(

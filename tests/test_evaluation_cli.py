@@ -88,6 +88,8 @@ class EvaluationCliTest(unittest.TestCase):
                 "--progress",
                 "compact",
                 "--no-text",
+                "--residual-scale",
+                "0",
             ]
             stream = io.StringIO()
             with (
@@ -110,6 +112,7 @@ class EvaluationCliTest(unittest.TestCase):
             self.assertEqual(metrics["device"], "cpu")
             self.assertFalse(metrics["amp"])
             self.assertFalse(metrics["text_conditioning"])
+            self.assertEqual(metrics["residual_scale"], 0.0)
             cache_path = next(output.glob("*_uncertainty.npz"))
             with np.load(cache_path) as cache:
                 self.assertIn("base", cache.files)
@@ -118,6 +121,7 @@ class EvaluationCliTest(unittest.TestCase):
                 self.assertEqual(cache["base"].shape, (3, 64, 64))
                 self.assertEqual(cache["decoder_residual"].shape, (3, 64, 64))
                 self.assertEqual(cache["net_addition"].shape, (3, 64, 64))
+                self.assertTrue(np.allclose(cache["mean"], cache["base"]))
             log = stream.getvalue()
             self.assertIn("[evaluate] device=cpu", log)
             self.assertIn("diffusion_unet_passes=1", log)

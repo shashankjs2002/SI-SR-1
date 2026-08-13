@@ -399,6 +399,48 @@ class TrainingSmokeTest(unittest.TestCase):
                 any(parameter.requires_grad for parameter in unfrozen_trainer.model.vae.parameters())
             )
 
+    def test_joint_supports_module_learning_rate_multipliers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, config = self._fixture(root)
+            config["training"].update(
+                {
+                    "stage": "joint",
+                    "output_dir": str(root / "joint_lrs"),
+                    "learning_rate": 1e-4,
+                    "module_learning_rate_multipliers": {
+                        "diffusion": 0.25,
+                        "decoder": 1.0,
+                    },
+                }
+            )
+            trainer = Trainer(config)
+            learning_rates = {
+                group.get("name"): group["lr"]
+                for group in trainer.optimizer.param_groups
+            }
+            self.assertAlmostEqual(learning_rates["diffusion"], 2.5e-5)
+            self.assertAlmostEqual(learning_rates["decoder"], 1e-4)
+
+    def test_zero_adversarial_weight_skips_discriminators(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, config = self._fixture(root)
+            config["training"].update(
+                {
+                    "stage": "joint",
+                    "output_dir": str(root / "no_gan"),
+                }
+            )
+            config["training"]["loss_weights"]["adversarial"] = 0.0
+            trainer = Trainer(config)
+            with mock.patch.object(
+                trainer,
+                "_discriminator_loss",
+                side_effect=AssertionError("discriminator should be skipped"),
+            ):
+                trainer.train()
+
     def test_counterfactual_edit_does_not_use_paired_reconstruction(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

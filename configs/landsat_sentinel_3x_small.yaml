@@ -19,7 +19,7 @@ model:
   decoder_upsample_mode: resize_conv
   diffusion_steps: 1000
   use_text_conditioning: false
-  use_degradation_conditioning: true
+  use_degradation_conditioning: false
   use_back_projection: true
 
 data:
@@ -48,28 +48,47 @@ training:
   validate_every: 1
   validation_limit: 64
   keep_best_and_latest: true
-  checkpoint_metric: val_l1
-  checkpoint_mode: min
+  checkpoint_metric: val_psnr
+  checkpoint_mode: max
+  early_stopping_metric: val_psnr
+  early_stopping_mode: max
   early_stopping_patience: 5
   early_stopping_min_epochs: 8
   early_stopping_min_delta: 0.0001
   train_back_projection_steps: 0
+  validation_sample_steps: 10
+  validation_samples: 1
+  validation_back_projection_steps: 0
+  base_guard_margin: 0.0
+  evidence_improvement_temperature: 0.0001
+  lr_scheduler_metric: val_psnr
+  lr_scheduler_mode: max
+  lr_scheduler_factor: 0.5
+  lr_scheduler_patience: 2
+  lr_scheduler_threshold: 0.0001
+  lr_scheduler_min_lr: 0.0000001
   discriminator_channels: 24
   output_dir: runs/landsat_sentinel_3x_small/base
   init_checkpoint: null
   resume: null
   loss_weights:
     charbonnier: 1.0
-    consistency: 0.25
-    ssim: 0.2
-    gradient: 0.15
-    perceptual: 0.1
-    wavelet: 0.1
+    mse: 50.0
+    multiscale_mse: 25.0
+    consistency: 0.0
+    ssim: 0.5
+    gradient: 0.05
+    perceptual: 0.0
+    wavelet: 0.01
+    radiometric: 0.1
+    residual_supervision: 0.5
+    base_guard: 100.0
     kl: 0.0001
     vae_reconstruction: 1.0
-    diffusion: 1.0
-    evidence_calibration: 0.15
+    diffusion: 0.25
+    evidence_calibration: 0.02
+    evidence_improvement: 0.1
     edit_localization: 0.05
     edit_permission: 0.05
     prompt_alignment: 0.0
-    adversarial: 0.003
+    adversarial: 0.0

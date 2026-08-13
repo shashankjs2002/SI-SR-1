@@ -30,6 +30,14 @@ from geodiff_gan.data.sentinel import (
     split_for_product,
 )
 from geodiff_gan.diagnostics import DiagnosticRecorder, tensor_statistics
+from geodiff_gan.losses import (
+    base_guard_loss,
+    evidence_improvement_loss,
+    mse_loss,
+    multiscale_mse_loss,
+    radiometric_loss,
+    residual_supervision_loss,
+)
 from geodiff_gan.metrics import edge_f1
 from geodiff_gan.models.base import WindowTransformerBlock
 from geodiff_gan.models.blocks import CrossAttention2d, high_pass
@@ -626,6 +634,44 @@ class CoreTests(unittest.TestCase):
             WindowTransformerBlock(channels=10, heads=6)
         with self.assertRaisesRegex(ValueError, "divisible"):
             CrossAttention2d(channels=10, context_dim=8, heads=6)
+
+    def test_fidelity_losses_reward_exact_reconstruction(self) -> None:
+        target = torch.rand(2, 3, 32, 32)
+        prediction = (target + 0.05).clamp(0, 1)
+        mask = torch.ones(2, 1, 32, 32)
+        self.assertEqual(float(mse_loss(target, target, mask)), 0.0)
+        self.assertGreater(float(mse_loss(prediction, target, mask)), 0.0)
+        self.assertEqual(
+            float(multiscale_mse_loss(target, target, mask)), 0.0
+        )
+        self.assertEqual(float(radiometric_loss(target, target, mask)), 0.0)
+
+    def test_base_guard_penalizes_only_regression(self) -> None:
+        target = torch.zeros(2, 3, 16, 16)
+        base = torch.full_like(target, 0.1)
+        better = torch.full_like(target, 0.05)
+        worse = torch.full_like(target, 0.2)
+        self.assertEqual(float(base_guard_loss(better, target, base)), 0.0)
+        self.assertGreater(float(base_guard_loss(worse, target, base)), 0.0)
+
+    def test_residual_and_improvement_supervision(self) -> None:
+        base = torch.rand(1, 3, 32, 32)
+        target = (base + 0.02 * torch.randn_like(base)).clamp(0, 1)
+        ideal = high_pass(target - base)
+        self.assertAlmostEqual(
+            float(residual_supervision_loss(ideal, base, target)),
+            0.001,
+            places=6,
+        )
+        confidence = torch.full((1, 1, 4, 4), 0.5)
+        improving = evidence_improvement_loss(
+            confidence, target, base, target
+        )
+        harmful = evidence_improvement_loss(
+            confidence, torch.ones_like(target), base, target
+        )
+        self.assertTrue(torch.isfinite(improving))
+        self.assertTrue(torch.isfinite(harmful))
 
     def test_rgb_window_maps_to_scl_resolution(self) -> None:
         try:
