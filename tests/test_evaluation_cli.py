@@ -27,9 +27,14 @@ class EvaluationCliTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             patch = root / "patch.npz"
+            selected_patch = root / "selected_patch.npz"
             np.savez_compressed(
                 patch,
                 hr=np.random.default_rng(5).random((3, 64, 64)).astype(np.float32),
+            )
+            np.savez_compressed(
+                selected_patch,
+                hr=np.random.default_rng(6).random((3, 64, 64)).astype(np.float32),
             )
             manifest = root / "manifest.jsonl"
             write_manifest(
@@ -43,7 +48,16 @@ class EvaluationCliTest(unittest.TestCase):
                         col=0,
                         valid_fraction=1.0,
                         caption="",
-                    )
+                    ),
+                    ManifestRecord(
+                        patch=str(selected_patch),
+                        tile_id="VAL_TILE",
+                        split="val",
+                        row=64,
+                        col=0,
+                        valid_fraction=1.0,
+                        caption="",
+                    ),
                 ],
             )
             config = load_config(
@@ -81,7 +95,7 @@ class EvaluationCliTest(unittest.TestCase):
                 "1",
                 "--steps",
                 "1",
-                "--limit",
+                "--index",
                 "1",
                 "--device",
                 "cpu",
@@ -113,6 +127,7 @@ class EvaluationCliTest(unittest.TestCase):
             self.assertFalse(metrics["amp"])
             self.assertFalse(metrics["text_conditioning"])
             self.assertEqual(metrics["residual_scale"], 0.0)
+            self.assertEqual(metrics["dataset_index"], 1)
             cache_path = next(output.glob("*_uncertainty.npz"))
             with np.load(cache_path) as cache:
                 self.assertIn("base", cache.files)
@@ -122,8 +137,10 @@ class EvaluationCliTest(unittest.TestCase):
                 self.assertEqual(cache["decoder_residual"].shape, (3, 64, 64))
                 self.assertEqual(cache["net_addition"].shape, (3, 64, 64))
                 self.assertTrue(np.allclose(cache["mean"], cache["base"]))
+                self.assertEqual(str(cache["source_patch"]), str(selected_patch))
             log = stream.getvalue()
             self.assertIn("[evaluate] device=cpu", log)
+            self.assertIn("selecting val dataset index 1", log)
             self.assertIn("diffusion_unet_passes=1", log)
             self.assertIn("sample 1/1", log)
             self.assertIn("patch 1/1 complete", log)

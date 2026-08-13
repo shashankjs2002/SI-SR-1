@@ -10,7 +10,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch.nn import functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from tqdm.auto import tqdm
 
 from ..config import load_config
@@ -87,6 +87,14 @@ def main() -> None:
     )
     parser.add_argument("--mode", choices=("sr", "edit"), default="sr")
     parser.add_argument("--limit", type=int)
+    parser.add_argument(
+        "--index",
+        type=int,
+        help=(
+            "Evaluate exactly one zero-based item from the selected split. "
+            "This is useful for reproducible indexed test visualization."
+        ),
+    )
     parser.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto")
     parser.add_argument(
         "--progress",
@@ -112,6 +120,10 @@ def main() -> None:
         parser.error("--back-projection-steps must be non-negative")
     if args.residual_scale < 0:
         parser.error("--residual-scale must be non-negative")
+    if args.index is not None and args.index < 0:
+        parser.error("--index must be non-negative")
+    if args.index is not None and args.limit is not None:
+        parser.error("--index and --limit cannot be used together")
     config = load_config(args.config)
     device = _resolve_device(args.device)
     amp_enabled = bool(
@@ -168,6 +180,17 @@ def main() -> None:
             f"No patches found for split {args.split!r}. "
             "Check the manifest SAFE-prefix assignments."
         )
+    if args.index is not None:
+        if args.index >= len(dataset):
+            raise SystemExit(
+                f"--index {args.index} is outside split {args.split!r}; "
+                f"valid indices are 0..{len(dataset) - 1}."
+            )
+        print(
+            f"[evaluate] selecting {args.split} dataset index {args.index}",
+            flush=True,
+        )
+        dataset = Subset(dataset, [args.index])
     loader = DataLoader(dataset, batch_size=1, shuffle=False)
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -399,6 +422,7 @@ def main() -> None:
     summary["amp"] = amp_enabled
     summary["optional_metrics"] = args.optional_metrics
     summary["text_conditioning"] = not args.no_text
+    summary["dataset_index"] = args.index
     with (output_dir / "metrics.json").open("w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2)
     print(f"[evaluate] complete in {_duration(time.monotonic() - started)}", flush=True)
