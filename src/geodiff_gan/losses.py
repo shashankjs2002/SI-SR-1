@@ -328,14 +328,19 @@ def evidence_improvement_loss(
         if mask is not None
         else None
     )
-    return _masked_mean(
-        F.binary_cross_entropy(
-            confidence.clamp(1e-6, 1 - 1e-6),
-            target_confidence,
+    # Probability-form BCE is intentionally rejected by PyTorch autocast because
+    # its half-precision backward can overflow. The mapper exposes calibrated
+    # probabilities (rather than logits), so keep that public contract and run
+    # this small loss calculation in FP32.
+    with torch.autocast(device_type=confidence.device.type, enabled=False):
+        probability = confidence.float().clamp(1e-6, 1 - 1e-6)
+        target_probability = target_confidence.float()
+        loss = F.binary_cross_entropy(
+            probability,
+            target_probability,
             reduction="none",
-        ),
-        confidence_mask,
-    )
+        )
+        return _masked_mean(loss, confidence_mask)
 
 
 def edit_localization_loss(

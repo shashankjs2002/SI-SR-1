@@ -673,6 +673,29 @@ class CoreTests(unittest.TestCase):
         self.assertTrue(torch.isfinite(improving))
         self.assertTrue(torch.isfinite(harmful))
 
+    def test_evidence_improvement_is_safe_inside_autocast(self) -> None:
+        confidence = torch.full(
+            (1, 1, 4, 4),
+            0.5,
+            dtype=torch.float32,
+            requires_grad=True,
+        )
+        base = torch.rand(1, 3, 32, 32)
+        target = torch.rand_like(base)
+        prediction = (target + 0.01).clamp(0, 1)
+        with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+            loss = evidence_improvement_loss(
+                confidence,
+                prediction,
+                base,
+                target,
+            )
+        loss.backward()
+        self.assertEqual(loss.dtype, torch.float32)
+        self.assertTrue(torch.isfinite(loss))
+        self.assertIsNotNone(confidence.grad)
+        self.assertTrue(torch.isfinite(confidence.grad).all())
+
     def test_rgb_window_maps_to_scl_resolution(self) -> None:
         try:
             from affine import Affine
