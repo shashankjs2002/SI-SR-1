@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections import Counter, defaultdict
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
 
 
@@ -217,6 +217,85 @@ def assign_within_tile_spatial_splits(
         }
     validate_within_tile_spatial_isolation(records, patch_size)
     return reports
+
+
+def build_within_tile_spatial_folds(
+    records: list[ManifestRecord],
+    patch_size: int,
+    folds: int = 5,
+    discard_split: str = "discard",
+) -> tuple[list[list[ManifestRecord]], dict[str, dict[str, object]]]:
+    """Build leakage-safe spatial K-fold manifests for every represented tile."""
+    if folds < 3:
+        raise ValueError("folds must be at least 3 to separate train, val, and test")
+    if patch_size <= 0:
+        raise ValueError("patch_size must be positive")
+    grouped: dict[str, list[ManifestRecord]] = defaultdict(list)
+    for record in records:
+        grouped[record.tile_id].append(record)
+    region_by_patch: dict[str, int | None] = {}
+    reports: dict[str, dict[str, object]] = {}
+    for tile_id, tile_records in sorted(grouped.items()):
+        spans = {
+            axis: max(getattr(record, axis) for record in tile_records)
+            + patch_size
+            - min(getattr(record, axis) for record in tile_records)
+            for axis in ("row", "col")
+        }
+        axis = sorted(spans, key=lambda value: (-spans[value], value))[0]
+        minimum = min(getattr(record, axis) for record in tile_records)
+        maximum = max(
+            getattr(record, axis) + patch_size for record in tile_records
+        )
+        boundaries = [
+            minimum + (maximum - minimum) * index / folds
+            for index in range(folds + 1)
+        ]
+        region_counts: Counter[int | str] = Counter()
+        for record in tile_records:
+            start = getattr(record, axis)
+            end = start + patch_size
+            region: int | None = None
+            for region_index, (left, right) in enumerate(
+                zip(boundaries[:-1], boundaries[1:])
+            ):
+                if start >= left and end <= right:
+                    region = region_index
+                    break
+            region_by_patch[record.patch] = region
+            region_counts[region if region is not None else discard_split] += 1
+        missing = [index for index in range(folds) if not region_counts[index]]
+        if missing:
+            raise ValueError(
+                f"Tile {tile_id!r} cannot populate spatial fold region(s) {missing}. "
+                "Use fewer folds or add more spatial coverage."
+            )
+        reports[tile_id] = {
+            "axis": axis,
+            "boundaries": boundaries,
+            "region_counts": {
+                str(index): region_counts[index] for index in range(folds)
+            },
+            "discarded": region_counts[discard_split],
+        }
+    manifests: list[list[ManifestRecord]] = []
+    for fold in range(folds):
+        test_region = fold
+        validation_region = (fold + 1) % folds
+        fold_records: list[ManifestRecord] = []
+        for record in records:
+            region = region_by_patch[record.patch]
+            if region is None:
+                split = discard_split
+            elif region == test_region:
+                split = "test"
+            elif region == validation_region:
+                split = "val"
+            else:
+                split = "train"
+            fold_records.append(replace(record, split=split))
+        manifests.append(fold_records)
+    return manifests, reports
 
 
 def load_manifest(path: str | Path, split: str | None = None) -> list[ManifestRecord]:

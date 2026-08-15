@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -17,6 +18,7 @@ from geodiff_gan.data.landsat_sentinel import (
 from geodiff_gan.data.manifest import (
     ManifestRecord,
     assign_within_tile_spatial_splits,
+    build_within_tile_spatial_folds,
     validate_within_tile_spatial_isolation,
     write_manifest,
 )
@@ -30,13 +32,28 @@ class LandsatSentinelDatasetTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             product = "LC09_L2SP_144044_20260527_20260528_02_T1"
-            for layer in ("SR_B2", "SR_B3", "SR_B4", "QA_PIXEL", "QA_RADSAT"):
+            for layer in (
+                "SR_B2",
+                "SR_B3",
+                "SR_B4",
+                "SR_B5",
+                "SR_B6",
+                "SR_B7",
+                "QA_PIXEL",
+                "QA_RADSAT",
+            ):
                 (root / f"{product}_{layer}.TIF").touch()
             (root / f"{product}_MTL.txt").touch()
             products = discover_landsat_products(root)
             self.assertEqual(len(products), 1)
             self.assertEqual(products[0].product_id, product)
             self.assertIn("MTL.txt", products[0].files)
+            self.assertTrue(
+                all(
+                    layer in products[0].files
+                    for layer in ("SR_B5", "SR_B6", "SR_B7")
+                )
+            )
 
     def test_parses_sensor_acquisition_dates(self) -> None:
         self.assertEqual(
@@ -107,6 +124,55 @@ class LandsatSentinelDatasetTest(unittest.TestCase):
             self.assertEqual(tuple(sample["valid_mask_lr"].shape), (1, 24, 24))
             self.assertTrue(np.allclose(sample["lr"].numpy(), lr))
 
+    def test_paired_dataset_loads_real_multispectral_lr(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            patch = root / "pair_ms.npz"
+            rng = np.random.default_rng(22)
+            hr = rng.random((3, 72, 72)).astype(np.float32)
+            lr = rng.random((3, 24, 24)).astype(np.float32)
+            lr_ms = rng.random((6, 24, 24)).astype(np.float32)
+            lr_ms[:3] = lr
+            np.savez_compressed(
+                patch,
+                hr=hr,
+                lr=lr,
+                clean_lr=lr,
+                lr_ms=lr_ms,
+                clean_lr_ms=lr_ms,
+                degradation=np.array([0.5, 1.0, 0.0, 0.0], dtype=np.float32),
+                valid_mask_hr=np.ones((1, 72, 72), dtype=np.float32),
+                valid_mask_lr=np.ones((1, 24, 24), dtype=np.float32),
+            )
+            manifest = root / "manifest.jsonl"
+            write_manifest(
+                manifest,
+                [
+                    ManifestRecord(
+                        patch=str(patch),
+                        tile_id="44RPQ",
+                        split="train",
+                        row=0,
+                        col=0,
+                        valid_fraction=1.0,
+                        scale=3,
+                    )
+                ],
+            )
+            sample = SentinelPatchDataset(
+                manifest,
+                split="train",
+                scale=3,
+                condition_key="lr_ms",
+                input_mode="paired",
+                output_channels=3,
+                augment=False,
+            )[0]
+            self.assertEqual(tuple(sample["lr"].shape), (6, 24, 24))
+            self.assertEqual(tuple(sample["lr_rgb"].shape), (3, 24, 24))
+            self.assertTrue(np.allclose(sample["lr"].numpy(), lr_ms))
+            self.assertTrue(np.allclose(sample["lr_rgb"].numpy(), lr))
+
     def test_resize_conv_base_supports_three_x(self) -> None:
         model = SwinIRBase(
             embed_dim=8,
@@ -172,6 +238,54 @@ class LandsatSentinelDatasetTest(unittest.TestCase):
             max(record.col + 100 for record in by_split["val"]),
             min(record.col for record in by_split["test"]),
         )
+
+    def test_spatial_kfold_populates_every_tile_without_overlap(self) -> None:
+        records = [
+            ManifestRecord(
+                patch=f"{tile}_patch_{row}_{col}.npz",
+                tile_id=tile,
+                split="train",
+                row=row,
+                col=col,
+                valid_fraction=1.0,
+                scale=3,
+            )
+            for tile in ("44QLL", "44QMM")
+            for row in (0, 80)
+            for col in range(0, 4000, 80)
+        ]
+        manifests, reports = build_within_tile_spatial_folds(
+            records,
+            patch_size=100,
+            folds=5,
+        )
+        self.assertEqual(len(manifests), 5)
+        self.assertEqual(set(reports), {"44QLL", "44QMM"})
+        for fold_records in manifests:
+            for tile in ("44QLL", "44QMM"):
+                tile_records = [
+                    record for record in fold_records if record.tile_id == tile
+                ]
+                counts = Counter(record.split for record in tile_records)
+                self.assertGreater(counts["train"], 0)
+                self.assertGreater(counts["val"], 0)
+                self.assertGreater(counts["test"], 0)
+                active = [
+                    record for record in tile_records if record.split != "discard"
+                ]
+                for left_index, left in enumerate(active):
+                    for right in active[left_index + 1 :]:
+                        if left.split == right.split:
+                            continue
+                        row_overlap = not (
+                            left.row + 100 <= right.row
+                            or right.row + 100 <= left.row
+                        )
+                        col_overlap = not (
+                            left.col + 100 <= right.col
+                            or right.col + 100 <= left.col
+                        )
+                        self.assertFalse(row_overlap and col_overlap)
 
 
 if __name__ == "__main__":

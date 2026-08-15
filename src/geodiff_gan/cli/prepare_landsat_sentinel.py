@@ -49,6 +49,14 @@ def build_parser() -> argparse.ArgumentParser:
             "Published HLS coefficients are not applied to S2C."
         ),
     )
+    parser.add_argument(
+        "--include-multispectral",
+        action="store_true",
+        help=(
+            "Also store Landsat [R,G,B,NIR,SWIR1,SWIR2] as lr_ms for "
+            "six-channel conditioning."
+        ),
+    )
     parser.add_argument("--max-pairs", type=int)
     parser.add_argument("--val-prefix", action="append", default=[])
     parser.add_argument("--test-prefix", action="append", default=[])
@@ -90,6 +98,7 @@ def _settings(args: argparse.Namespace) -> dict[str, Any]:
         "minimum_overlap_fraction": args.minimum_overlap_fraction,
         "minimum_valid_fraction": args.minimum_valid_fraction,
         "bandpass_adjustment": args.bandpass_adjustment,
+        "include_multispectral": args.include_multispectral,
     }
 
 
@@ -249,7 +258,10 @@ def main() -> None:
     if not args.rebuild:
         state = _load_state(state_path)
         if state:
-            if state.get("settings") != settings:
+            saved_settings = dict(state.get("settings", {}))
+            # State files created before multispectral support are RGB-only.
+            saved_settings.setdefault("include_multispectral", False)
+            if saved_settings != settings:
                 raise SystemExit(
                     "Paired preparation settings changed. Use a new output/manifest "
                     "or pass --rebuild."
@@ -275,6 +287,7 @@ def main() -> None:
             validation_prefixes=args.val_prefix,
             test_prefixes=args.test_prefix,
             unmatched_split=args.unmatched_split,
+            include_multispectral=args.include_multispectral,
             show_progress=True,
         )
         records = _merge_records([*records, *additions])

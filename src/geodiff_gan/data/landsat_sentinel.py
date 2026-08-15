@@ -27,8 +27,25 @@ LANDSAT_REQUIRED_LAYERS = (
     "QA_PIXEL",
     "QA_RADSAT",
 )
-LANDSAT_OPTIONAL_LAYERS = ("SR_QA_AEROSOL", "MTL.txt", "MTL.xml", "ANG.txt")
+LANDSAT_OPTIONAL_LAYERS = (
+    "SR_B5",
+    "SR_B6",
+    "SR_B7",
+    "SR_QA_AEROSOL",
+    "MTL.txt",
+    "MTL.xml",
+    "ANG.txt",
+)
 LANDSAT_RGB_LAYERS = ("SR_B4", "SR_B3", "SR_B2")
+LANDSAT_MULTISPECTRAL_LAYERS = (
+    "SR_B4",
+    "SR_B3",
+    "SR_B2",
+    "SR_B5",
+    "SR_B6",
+    "SR_B7",
+)
+LANDSAT_MULTISPECTRAL_BAND_NUMBERS = (4, 3, 2, 5, 6, 7)
 SENTINEL_RGB_BANDS = ("B04", "B03", "B02")
 
 # HLS v2 coefficients adjust Sentinel-2 MSI reflectance to the Landsat OLI
@@ -116,7 +133,8 @@ def discover_landsat_products(root: str | Path) -> list[LandsatProduct]:
                 "Download the RGB and QA files from the same Collection 2 Level-2 product."
             )
         for layer in LANDSAT_OPTIONAL_LAYERS:
-            name = f"{product_id}_{layer}".casefold()
+            suffix = layer if "." in layer else f"{layer}.TIF"
+            name = f"{product_id}_{suffix}".casefold()
             if name in siblings:
                 files[layer] = siblings[name]
         key = product_id.casefold()
@@ -367,6 +385,7 @@ def extract_pair_patches(
     validation_prefixes: list[str] | None = None,
     test_prefixes: list[str] | None = None,
     unmatched_split: str = "hash",
+    include_multispectral: bool = False,
     show_progress: bool = False,
 ) -> list[ManifestRecord]:
     try:
@@ -402,6 +421,19 @@ def extract_pair_patches(
         _find_band(sentinel, SENTINEL_BAND_PATTERNS[band])
         for band in SENTINEL_RGB_BANDS
     ]
+    landsat_signal_layers = (
+        LANDSAT_MULTISPECTRAL_LAYERS
+        if include_multispectral
+        else LANDSAT_RGB_LAYERS
+    )
+    missing_multispectral = [
+        layer for layer in landsat_signal_layers if layer not in landsat.files
+    ]
+    if missing_multispectral:
+        raise ValueError(
+            f"Landsat product {landsat.product_id} is missing multispectral "
+            f"layers {missing_multispectral}. Download SR_B2 through SR_B7."
+        )
     scl_path = _find_band(sentinel, "*_SCL_20m.jp2")
     records: list[ManifestRecord] = []
 
@@ -412,7 +444,7 @@ def extract_pair_patches(
         scl = stack.enter_context(rasterio.open(scl_path))
         landsat_datasets = {
             layer: stack.enter_context(rasterio.open(landsat.files[layer]))
-            for layer in (*LANDSAT_RGB_LAYERS, "QA_PIXEL", "QA_RADSAT")
+            for layer in (*landsat_signal_layers, "QA_PIXEL", "QA_RADSAT")
         }
         aerosol = (
             stack.enter_context(rasterio.open(landsat.files["SR_QA_AEROSOL"]))
@@ -460,7 +492,7 @@ def extract_pair_patches(
                 )
 
                 landsat_dn = []
-                for layer in LANDSAT_RGB_LAYERS:
+                for layer in landsat_signal_layers:
                     landsat_dn.append(
                         _reproject_band(
                             rasterio.band(landsat_datasets[layer], 1),
@@ -514,14 +546,20 @@ def extract_pair_patches(
                 if valid_fraction < minimum_valid_fraction:
                     continue
 
-                lr = np.stack(
+                lr_all = np.stack(
                     [
                         landsat_reflectance(values, landsat, band_number)
-                        for values, band_number in zip(landsat_dn_array, (4, 3, 2))
+                        for values, band_number in zip(
+                            landsat_dn_array,
+                            LANDSAT_MULTISPECTRAL_BAND_NUMBERS
+                            if include_multispectral
+                            else (4, 3, 2),
+                        )
                     ]
                 )
                 hr = np.clip(hr, 0, 1).astype(np.float32)
-                lr = np.clip(lr, 0, 1).astype(np.float32)
+                lr_all = np.clip(lr_all, 0, 1).astype(np.float32)
+                lr = lr_all[:3]
                 platform_condition = 1.0 if landsat.platform == "LC09" else 0.0
                 sensor_condition = np.array(
                     [
@@ -533,15 +571,18 @@ def extract_pair_patches(
                     dtype=np.float32,
                 )
                 patch_path = destination / f"r{row:05d}_c{col:05d}.npz"
-                np.savez_compressed(
-                    patch_path,
-                    hr=hr,
-                    lr=lr,
-                    clean_lr=lr,
-                    degradation=sensor_condition,
-                    valid_mask_hr=valid_hr[None].astype(np.float32),
-                    valid_mask_lr=landsat_valid[None].astype(np.float32),
-                )
+                arrays = {
+                    "hr": hr,
+                    "lr": lr,
+                    "clean_lr": lr,
+                    "degradation": sensor_condition,
+                    "valid_mask_hr": valid_hr[None].astype(np.float32),
+                    "valid_mask_lr": landsat_valid[None].astype(np.float32),
+                }
+                if include_multispectral:
+                    arrays["lr_ms"] = lr_all
+                    arrays["clean_lr_ms"] = lr_all
+                np.savez_compressed(patch_path, **arrays)
                 records.append(
                     ManifestRecord(
                         patch=str(patch_path),

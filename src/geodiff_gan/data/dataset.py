@@ -176,14 +176,23 @@ class SentinelPatchDataset(Dataset):
                 )
             target = self._to_channel_first(data[self.target_key], self.target_key)
             if self.input_mode == "paired":
-                if "lr" not in data.files:
+                paired_lr_key = self.condition_key or "lr"
+                if paired_lr_key not in data.files:
                     raise KeyError(
-                        f"Paired patch {record.patch} does not contain an 'lr' array"
+                        f"Paired patch {record.patch} does not contain "
+                        f"{paired_lr_key!r}"
                     )
-                stored_lr = self._to_channel_first(data["lr"], "lr")
+                clean_lr_key = (
+                    "clean_lr_ms" if paired_lr_key == "lr_ms" else "clean_lr"
+                )
+                stored_lr = self._to_channel_first(
+                    data[paired_lr_key], paired_lr_key
+                )
                 stored_clean_lr = self._to_channel_first(
-                    data["clean_lr"] if "clean_lr" in data.files else data["lr"],
-                    "clean_lr",
+                    data[clean_lr_key]
+                    if clean_lr_key in data.files
+                    else data[paired_lr_key],
+                    clean_lr_key,
                 )
                 stored_degradation = torch.from_numpy(
                     data["degradation"]
