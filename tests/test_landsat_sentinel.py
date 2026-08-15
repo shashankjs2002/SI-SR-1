@@ -14,7 +14,12 @@ from geodiff_gan.data.landsat_sentinel import (
     landsat_valid_mask,
     sentinel_acquisition_date,
 )
-from geodiff_gan.data.manifest import ManifestRecord, write_manifest
+from geodiff_gan.data.manifest import (
+    ManifestRecord,
+    assign_within_tile_spatial_splits,
+    validate_within_tile_spatial_isolation,
+    write_manifest,
+)
 from geodiff_gan.losses import charbonnier
 from geodiff_gan.metrics import psnr
 from geodiff_gan.models.base import SwinIRBase
@@ -124,6 +129,49 @@ class LandsatSentinelDatasetTest(unittest.TestCase):
             0.0,
         )
         self.assertGreater(float(psnr(prediction, target, mask=mask)), 100.0)
+
+    def test_within_tile_spatial_split_has_guard_bands(self) -> None:
+        records = [
+            ManifestRecord(
+                patch=f"patch_{row}_{col}.npz",
+                tile_id="44QLL",
+                split="train",
+                row=row,
+                col=col,
+                valid_fraction=1.0,
+                scale=3,
+            )
+            for row in (0, 80)
+            for col in range(0, 800, 80)
+        ]
+        report = assign_within_tile_spatial_splits(
+            records,
+            patch_size=100,
+            train_fraction=0.8,
+            validation_fraction=0.1,
+        )
+        counts = {split: 0 for split in ("train", "val", "test", "discard")}
+        for record in records:
+            counts[record.split] += 1
+        self.assertGreater(counts["train"], 0)
+        self.assertGreater(counts["val"], 0)
+        self.assertGreater(counts["test"], 0)
+        self.assertGreater(counts["discard"], 0)
+        self.assertEqual(report["44QLL"]["axis"], "col")
+        validate_within_tile_spatial_isolation(records, patch_size=100)
+
+        by_split = {
+            split: [record for record in records if record.split == split]
+            for split in ("train", "val", "test")
+        }
+        self.assertLessEqual(
+            max(record.col + 100 for record in by_split["train"]),
+            min(record.col for record in by_split["val"]),
+        )
+        self.assertLessEqual(
+            max(record.col + 100 for record in by_split["val"]),
+            min(record.col for record in by_split["test"]),
+        )
 
 
 if __name__ == "__main__":

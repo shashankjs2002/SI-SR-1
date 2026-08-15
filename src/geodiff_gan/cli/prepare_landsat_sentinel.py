@@ -14,6 +14,7 @@ from ..data.landsat_sentinel import (
 )
 from ..data.manifest import (
     ManifestRecord,
+    assign_within_tile_spatial_splits,
     load_manifest,
     validate_tile_split_isolation,
     write_manifest,
@@ -51,6 +52,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-pairs", type=int)
     parser.add_argument("--val-prefix", action="append", default=[])
     parser.add_argument("--test-prefix", action="append", default=[])
+    parser.add_argument(
+        "--split-strategy",
+        choices=("tile-holdout", "within-tile-spatial"),
+        default="tile-holdout",
+        help=(
+            "Use complete held-out MGRS tiles, or create spatially isolated "
+            "train/val/test regions inside every tile."
+        ),
+    )
+    parser.add_argument("--train-fraction", type=float, default=0.8)
+    parser.add_argument("--validation-fraction", type=float, default=0.1)
     parser.add_argument(
         "--unmatched-split",
         choices=("hash", "train", "val", "test"),
@@ -141,7 +153,17 @@ def _merge_records(records: list[ManifestRecord]) -> list[ManifestRecord]:
     )
 
 
-def _assign_splits(records: list[ManifestRecord], args: argparse.Namespace) -> None:
+def _assign_splits(
+    records: list[ManifestRecord],
+    args: argparse.Namespace,
+) -> dict[str, dict[str, object]]:
+    if args.split_strategy == "within-tile-spatial":
+        return assign_within_tile_spatial_splits(
+            records,
+            patch_size=args.patch_size,
+            train_fraction=args.train_fraction,
+            validation_fraction=args.validation_fraction,
+        )
     for record in records:
         record.split = split_for_product(
             record.sentinel_product or record.source_product,
@@ -150,6 +172,8 @@ def _assign_splits(records: list[ManifestRecord], args: argparse.Namespace) -> N
             test_prefixes=args.test_prefix,
             unmatched_split=args.unmatched_split,
         )
+    validate_tile_split_isolation(records)
+    return {}
 
 
 def _print_pair(pair: ScenePair) -> None:
@@ -172,8 +196,24 @@ def main() -> None:
         raise SystemExit("--minimum-overlap-fraction must be in (0, 1]")
     if not 0 < args.minimum_valid_fraction <= 1:
         raise SystemExit("--minimum-valid-fraction must be in (0, 1]")
+    if not 0 < args.train_fraction < 1:
+        raise SystemExit("--train-fraction must be in (0, 1)")
+    if not 0 < args.validation_fraction < 1:
+        raise SystemExit("--validation-fraction must be in (0, 1)")
+    if args.train_fraction + args.validation_fraction >= 1:
+        raise SystemExit(
+            "--train-fraction + --validation-fraction must be below 1"
+        )
     if args.max_pairs is not None and args.max_pairs < 1:
         raise SystemExit("--max-pairs must be at least 1")
+    if args.split_strategy == "within-tile-spatial" and (
+        args.val_prefix or args.test_prefix
+    ):
+        print(
+            "WARNING: --val-prefix/--test-prefix are ignored by "
+            "--split-strategy within-tile-spatial",
+            flush=True,
+        )
 
     manifest_path = Path(args.manifest)
     state_path = _state_path(manifest_path, args.state)
@@ -239,7 +279,6 @@ def main() -> None:
         )
         records = _merge_records([*records, *additions])
         _assign_splits(records, args)
-        validate_tile_split_isolation(records)
         write_manifest(manifest_path, records)
         completed_pairs.add(pair.pair_id)
         _write_state(state_path, settings, completed_pairs, len(records))
@@ -248,13 +287,18 @@ def main() -> None:
             flush=True,
         )
 
-    _assign_splits(records, args)
-    validate_tile_split_isolation(records)
+    spatial_reports = _assign_splits(records, args)
     if records:
         write_manifest(manifest_path, records)
     _write_state(state_path, settings, completed_pairs, len(records))
     counts = Counter(record.split for record in records)
     print(f"wrote {len(records)} records to {manifest_path}: {dict(counts)}")
+    for tile_id, report in spatial_reports.items():
+        print(
+            f"  tile={tile_id} axis={report['axis']} "
+            f"counts={report['counts']} boundaries={report['boundaries']}",
+            flush=True,
+        )
     print(f"state: {state_path}")
     if unmatched:
         print(

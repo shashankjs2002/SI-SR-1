@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 
@@ -61,6 +62,161 @@ def validate_tile_split_isolation(records: list[ManifestRecord]) -> None:
             "MGRS tile leakage detected: one geographic tile was assigned to "
             f"multiple splits ({details}). Adjust the SAFE prefix rules."
         )
+
+
+def validate_within_tile_spatial_isolation(
+    records: list[ManifestRecord],
+    patch_size: int,
+) -> None:
+    """Validate per-tile train/val/test coverage and non-overlapping footprints."""
+    if patch_size <= 0:
+        raise ValueError("patch_size must be positive")
+    grouped: dict[str, list[ManifestRecord]] = defaultdict(list)
+    for record in records:
+        grouped[record.tile_id].append(record)
+    required = ("train", "val", "test")
+    for tile_id, tile_records in sorted(grouped.items()):
+        active = {
+            split: [record for record in tile_records if record.split == split]
+            for split in required
+        }
+        missing = [split for split, values in active.items() if not values]
+        if missing:
+            raise ValueError(
+                f"Tile {tile_id!r} has no patches for split(s) {missing}. "
+                "It needs greater spatial coverage for a leakage-safe within-tile split."
+            )
+        separated = False
+        for coordinate in ("row", "col"):
+            train_end = max(
+                getattr(record, coordinate) + patch_size
+                for record in active["train"]
+            )
+            val_start = min(
+                getattr(record, coordinate) for record in active["val"]
+            )
+            val_end = max(
+                getattr(record, coordinate) + patch_size
+                for record in active["val"]
+            )
+            test_start = min(
+                getattr(record, coordinate) for record in active["test"]
+            )
+            if train_end <= val_start and val_end <= test_start:
+                separated = True
+                break
+        if not separated:
+            raise ValueError(
+                f"Tile {tile_id!r} does not have spatially isolated train/val/test "
+                "footprints. Do not use random overlapping-patch splits."
+            )
+
+
+def assign_within_tile_spatial_splits(
+    records: list[ManifestRecord],
+    patch_size: int,
+    train_fraction: float = 0.8,
+    validation_fraction: float = 0.1,
+    discard_split: str = "discard",
+) -> dict[str, dict[str, object]]:
+    """Assign every tile to leakage-safe spatial train/val/test regions.
+
+    Windows crossing either region boundary are assigned to ``discard_split``.
+    This guard band is necessary when extraction stride is smaller than the patch
+    size, because adjacent patches otherwise share target pixels.
+    """
+    test_fraction = 1.0 - float(train_fraction) - float(validation_fraction)
+    fractions = {
+        "train": float(train_fraction),
+        "val": float(validation_fraction),
+        "test": test_fraction,
+    }
+    if patch_size <= 0:
+        raise ValueError("patch_size must be positive")
+    if any(value <= 0 for value in fractions.values()):
+        raise ValueError(
+            "train_fraction and validation_fraction must leave positive "
+            "train, validation, and test fractions"
+        )
+    grouped: dict[str, list[ManifestRecord]] = defaultdict(list)
+    for record in records:
+        grouped[record.tile_id].append(record)
+    reports: dict[str, dict[str, object]] = {}
+    for tile_id, tile_records in sorted(grouped.items()):
+        axis_spans = {
+            axis: max(getattr(record, axis) for record in tile_records)
+            - min(getattr(record, axis) for record in tile_records)
+            for axis in ("row", "col")
+        }
+        axes = sorted(axis_spans, key=lambda axis: (-axis_spans[axis], axis))
+        best: tuple[
+            float, int, int, int, int, str, dict[int, str]
+        ] | None = None
+        for axis_rank, axis in enumerate(axes):
+            starts = [getattr(record, axis) for record in tile_records]
+            boundaries = sorted(
+                set(starts) | {start + patch_size for start in starts}
+            )
+            for first_index, first_boundary in enumerate(boundaries[:-1]):
+                for second_boundary in boundaries[first_index + 1 :]:
+                    assignments: dict[int, str] = {}
+                    counts: Counter[str] = Counter()
+                    for record_index, (record, start) in enumerate(
+                        zip(tile_records, starts)
+                    ):
+                        end = start + patch_size
+                        if end <= first_boundary:
+                            split = "train"
+                        elif start >= first_boundary and end <= second_boundary:
+                            split = "val"
+                        elif start >= second_boundary:
+                            split = "test"
+                        else:
+                            split = discard_split
+                        assignments[record_index] = split
+                        counts[split] += 1
+                    if any(counts[split] == 0 for split in fractions):
+                        continue
+                    retained = sum(counts[split] for split in fractions)
+                    ratio_error = sum(
+                        abs(counts[split] / retained - target)
+                        for split, target in fractions.items()
+                    )
+                    discard_fraction = counts[discard_split] / len(tile_records)
+                    score = ratio_error + 2.0 * discard_fraction
+                    candidate = (
+                        score,
+                        counts[discard_split],
+                        axis_rank,
+                        first_boundary,
+                        second_boundary,
+                        axis,
+                        assignments,
+                    )
+                    if best is None or candidate[:5] < best[:5]:
+                        best = candidate
+        if best is None:
+            raise ValueError(
+                f"Tile {tile_id!r} cannot provide leakage-safe train/val/test "
+                f"regions for patch_size={patch_size}. Add more spatial coverage."
+            )
+        _, _, _, first_boundary, second_boundary, axis, assignments = best
+        for record_index, split in assignments.items():
+            tile_records[record_index].split = split
+        counts = Counter(record.split for record in tile_records)
+        retained = sum(counts[split] for split in fractions)
+        reports[tile_id] = {
+            "axis": axis,
+            "boundaries": [first_boundary, second_boundary],
+            "counts": dict(counts),
+            "retained": retained,
+            "discarded": counts[discard_split],
+            "retained_fractions": {
+                split: counts[split] / retained for split in fractions
+            },
+        }
+    validate_within_tile_spatial_isolation(records, patch_size)
+    return reports
 
 
 def load_manifest(path: str | Path, split: str | None = None) -> list[ManifestRecord]:
