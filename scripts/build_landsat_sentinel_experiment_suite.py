@@ -88,7 +88,7 @@ cells: list[dict[str, object]] = [
         # Keep this enabled for progress-report metrics. Set False only when the
         # session has no Internet and LPIPS/DISTS weights are not cached.
         RUN_OPTIONAL_METRICS = True
-        RUN_GRADIO = False
+        RUN_GRADIO = True
 
         K_FOLDS = 5
         RUN_CV_RGB_STANDARD = False
@@ -1231,10 +1231,225 @@ cells: list[dict[str, object]] = [
         comparisons, error maps, experiment metrics, and available K-fold summaries.
         """
     ),
-    markdown("## 20. Build and optionally launch the Gradio dataset/model explorer"),
+    markdown(
+        "## 20. Standalone Gradio dataset/model explorer\n\n"
+        "After one completed experiment run, this is the only cell that must be "
+        "rerun after a kernel restart. It reconstructs its state from saved files."
+    ),
     code(
         """
+        # This cell is intentionally restart-safe. After the experiment cells have
+        # completed once, rerun only this cell after a kernel restart.
+        from pathlib import Path
+        import json
+        import os
+        import subprocess
+        import sys
+
         import gradio as gr
+        import matplotlib.pyplot as plt
+        import numpy as np
+        import pandas as pd
+        import torch
+        from torch.nn import functional as F
+
+        RUN_GRADIO = True
+        REPOSITORY_DIR = Path("/kaggle/working/geodiff-gan-sr3x-suite")
+        SUITE_ROOT = Path("/kaggle/working/geodiff-ls-s2-3x-suite")
+        DATA_ROOTS = {
+            "rgb": SUITE_ROOT / "datasets" / "rgb",
+            "multispectral": SUITE_ROOT / "datasets" / "multispectral",
+        }
+        EXPERIMENT_ROOT = SUITE_ROOT / "experiments"
+        CV_ROOT = SUITE_ROOT / "cross_validation"
+
+        if not SUITE_ROOT.exists():
+            raise FileNotFoundError(
+                f"Saved experiment suite not found: {SUITE_ROOT}. This standalone "
+                "cell works after a kernel restart in the same Kaggle session. After "
+                "a new Kaggle session, restore the suite archive first."
+            )
+
+        def read_jsonl(path):
+            path = Path(path)
+            if not path.exists():
+                raise FileNotFoundError(f"Missing saved manifest: {path}")
+            return [
+                json.loads(line)
+                for line in path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+
+        def chw(array):
+            tensor = torch.from_numpy(np.asarray(array)).float()
+            return tensor if tensor.shape[0] <= 16 else tensor.permute(2, 0, 1)
+
+        def target_stretch(images, target, valid):
+            values = target[:, valid]
+            low = torch.quantile(values, 0.02)
+            high = torch.quantile(values, 0.98).clamp_min(low + 1e-6)
+            return [((image - low) / (high - low)).clamp(0, 1) for image in images]
+
+        def unit_stretch(image, low_quantile=0.02, high_quantile=0.98):
+            low = torch.quantile(image.float(), low_quantile)
+            high = torch.quantile(image.float(), high_quantile).clamp_min(low + 1e-6)
+            return ((image - low) / (high - low)).clamp(0, 1)
+
+        RGB_DATA = {
+            "name": "rgb",
+            "root": DATA_ROOTS["rgb"],
+            "manifest": DATA_ROOTS["rgb"] / "manifest.jsonl",
+            "multispectral": False,
+        }
+        MULTISPECTRAL_DATA = {
+            "name": "multispectral",
+            "root": DATA_ROOTS["multispectral"],
+            "manifest": DATA_ROOTS["multispectral"] / "manifest.jsonl",
+            "multispectral": True,
+        }
+        RGB_RECORDS = read_jsonl(RGB_DATA["manifest"])
+        MS_RECORDS = read_jsonl(MULTISPECTRAL_DATA["manifest"])
+
+        def load_saved_experiment(name):
+            root = EXPERIMENT_ROOT / name
+            descriptor_path = root / "experiment.json"
+            if not descriptor_path.exists():
+                raise FileNotFoundError(
+                    f"Missing {descriptor_path}. Run the {name} training/evaluation "
+                    "cells once before launching Gradio."
+                )
+            descriptor = json.loads(descriptor_path.read_text(encoding="utf-8"))
+            descriptor["paths"] = {
+                key: Path(value) for key, value in descriptor["paths"].items()
+            }
+            descriptor["configs"] = {
+                key: Path(value) for key, value in descriptor["configs"].items()
+            }
+            descriptor["checkpoints"] = {
+                key: Path(value) for key, value in descriptor["checkpoints"].items()
+            }
+            selection_path = descriptor["paths"]["tables"] / "selected_inference.json"
+            metrics_path = descriptor["paths"]["evaluation"] / "test" / "metrics.json"
+            if not selection_path.exists() or not metrics_path.exists():
+                raise FileNotFoundError(
+                    f"Saved evaluation is incomplete for {name}. Run its evaluation cell."
+                )
+            evaluation = {
+                "name": name,
+                "selection": json.loads(selection_path.read_text(encoding="utf-8")),
+                "metrics": json.loads(metrics_path.read_text(encoding="utf-8")),
+                "test_output": descriptor["paths"]["evaluation"] / "test",
+                "saved_examples": sorted(
+                    (descriptor["paths"]["figures"] / "test_examples").glob("*.png")
+                ),
+            }
+            return descriptor, evaluation
+
+        EXPERIMENT_RESULTS = {}
+        EXPERIMENT_EVALUATIONS = {}
+        for experiment_name in (
+            "rgb_standard",
+            "rgb_fidelity",
+            "multispectral_fidelity",
+        ):
+            result, evaluation = load_saved_experiment(experiment_name)
+            EXPERIMENT_RESULTS[experiment_name] = result
+            EXPERIMENT_EVALUATIONS[experiment_name] = evaluation
+
+        EXPERIMENT_COMPARISON = pd.DataFrame([
+            {"experiment": name, **evaluation["metrics"]}
+            for name, evaluation in EXPERIMENT_EVALUATIONS.items()
+        ])
+        cv_metrics_path = CV_ROOT / "all_fold_metrics.csv"
+        CV_COMPARISON = (
+            pd.read_csv(cv_metrics_path)
+            if cv_metrics_path.exists()
+            else pd.DataFrame()
+        )
+
+        def record_identity(record):
+            return (
+                record.get("tile_id"),
+                record.get("sentinel_product"),
+                record.get("landsat_product"),
+                int(record["row"]),
+                int(record["col"]),
+            )
+
+        TEST_MAPS = {
+            "rgb": {
+                record_identity(record): record
+                for record in RGB_RECORDS if record["split"] == "test"
+            },
+            "multispectral": {
+                record_identity(record): record
+                for record in MS_RECORDS if record["split"] == "test"
+            },
+        }
+        COMMON_TEST_KEYS = sorted(set(TEST_MAPS["rgb"]) & set(TEST_MAPS["multispectral"]))
+        if not COMMON_TEST_KEYS:
+            raise RuntimeError("RGB and multispectral test manifests have no common patch.")
+
+        def run_saved_inference(command):
+            environment = os.environ.copy()
+            source_root = REPOSITORY_DIR / "src"
+            environment["PYTHONPATH"] = os.pathsep.join(
+                value for value in (
+                    str(source_root), environment.get("PYTHONPATH", "")
+                ) if value
+            )
+            print("+", " ".join(map(str, command)), flush=True)
+            subprocess.run(
+                [str(value) for value in command],
+                cwd=REPOSITORY_DIR,
+                env=environment,
+                check=True,
+            )
+
+        def evaluate_common_patch(experiment_name, common_key):
+            result = EXPERIMENT_RESULTS[experiment_name]
+            evaluation = EXPERIMENT_EVALUATIONS[experiment_name]
+            manifest_records = [
+                record for record in read_jsonl(result["manifest"])
+                if record["split"] == "test"
+            ]
+            index_by_key = {
+                record_identity(record): index
+                for index, record in enumerate(manifest_records)
+            }
+            dataset_index = index_by_key[common_key]
+            output = result["paths"]["evaluation"] / "indexed_common" / str(dataset_index)
+            output.mkdir(parents=True, exist_ok=True)
+            cached = sorted(output.glob("*_uncertainty.npz"))
+            if not cached:
+                if not REPOSITORY_DIR.exists():
+                    raise FileNotFoundError(
+                        f"Missing repository {REPOSITORY_DIR}; cannot infer uncached index."
+                    )
+                selection = evaluation["selection"]
+                metrics = evaluation["metrics"]
+                command = [
+                    sys.executable,
+                    "-m", "geodiff_gan.cli.evaluate",
+                    "--config", result["configs"]["joint"],
+                    "--checkpoint", result["checkpoints"]["joint"],
+                    "--output", output,
+                    "--split", "test",
+                    "--samples", int(metrics.get("samples_per_patch", 4)),
+                    "--steps", int(metrics.get("diffusion_steps", 20)),
+                    "--back-projection-steps", int(selection["projection_steps"]),
+                    "--residual-scale", float(selection["residual_scale"]),
+                    "--mode", "sr",
+                    "--index", dataset_index,
+                    "--device", "cuda" if torch.cuda.is_available() else "cpu",
+                    "--progress", "compact",
+                    "--no-text",
+                ]
+                run_saved_inference(command)
+                cached = sorted(output.glob("*_uncertainty.npz"))
+            cache_path = cached[0]
+            with np.load(cache_path) as cache:
+                return chw(cache["mean"]), chw(cache["base"]), cache_path
 
         def to_rgb(image):
             image = image.detach().cpu().clamp(0, 1)
@@ -1289,8 +1504,33 @@ cells: list[dict[str, object]] = [
                     "SWIR2": float(lr_ms[5].mean()), "NDVI_mean": float(ndvi.mean()),
                     "NDBI_mean": float(ndbi.mean()),
                 })
-            metadata = {**record, "patch": str(record["patch"]), "spectral_summary": spectral}
+            metadata = {
+                **record,
+                "patch": str(record["patch"]),
+                "selected_index": index,
+                "split_patch_count": len(records),
+                "spectral_summary": spectral,
+            }
             return gallery, metadata
+
+        def move_dataset_index(dataset_name, split, index, step):
+            dataset = RGB_DATA if dataset_name == "rgb" else MULTISPECTRAL_DATA
+            records = [
+                record
+                for record in read_jsonl(dataset["manifest"])
+                if record["split"] == split
+            ]
+            if not records:
+                raise gr.Error(f"No {split} records in {dataset_name}")
+            next_index = (int(index) + step) % len(records)
+            gallery, metadata = dataset_explorer(dataset_name, split, next_index)
+            return next_index, gallery, metadata
+
+        def previous_dataset_patch(dataset_name, split, index):
+            return move_dataset_index(dataset_name, split, index, -1)
+
+        def next_dataset_patch(dataset_name, split, index):
+            return move_dataset_index(dataset_name, split, index, 1)
 
         def saved_model_gallery(experiment_name):
             evaluation = EXPERIMENT_EVALUATIONS[experiment_name]
@@ -1299,7 +1539,7 @@ cells: list[dict[str, object]] = [
                 images.append((str(path), path.stem))
             return images, evaluation["metrics"]
 
-        def model_cache_gallery(experiment_name, cache_index):
+        def model_cache_gallery(experiment_name, cache_index, show_base_psnr):
             evaluation = EXPERIMENT_EVALUATIONS[experiment_name]
             caches = sorted(Path(evaluation["test_output"]).glob("*_uncertainty.npz"))
             if not caches:
@@ -1350,6 +1590,15 @@ cells: list[dict[str, object]] = [
             masked_l1 = float(error[valid].mean())
             masked_base_l1 = float(base_error[valid].mean())
             mse = float(((prediction - hr).pow(2).mean(0))[valid].mean())
+            base_mse = float(((base - hr).pow(2).mean(0))[valid].mean())
+            output_psnr = float(-10 * np.log10(max(mse, 1e-12)))
+            base_psnr = float(-10 * np.log10(max(base_mse, 1e-12)))
+            gallery[1] = (
+                gallery[1][0],
+                f"SwinIR base; PSNR={base_psnr:.2f} dB"
+                if show_base_psnr
+                else "SwinIR base",
+            )
             per_patch = {
                 "experiment": experiment_name,
                 "cache_index": int(cache_index) % len(caches),
@@ -1357,12 +1606,14 @@ cells: list[dict[str, object]] = [
                 "source_patch": str(source_patch),
                 "output_masked_l1": masked_l1,
                 "base_masked_l1": masked_base_l1,
-                "output_psnr": float(-10 * np.log10(max(mse, 1e-12))),
+                "output_psnr": output_psnr,
                 "output_improves_over_base_l1": masked_l1 < masked_base_l1,
                 "mean_confidence": float(confidence.mean()),
                 "mean_abstention": float(abstention.mean()),
                 "mean_variance": float(variance.mean()),
             }
+            if show_base_psnr:
+                per_patch["base_psnr"] = base_psnr
             return gallery, per_patch
 
         def compare_common_patch(common_index):
@@ -1393,6 +1644,9 @@ cells: list[dict[str, object]] = [
                     dataset_split = gr.Dropdown(["train", "val", "test"], value="test", label="Split")
                     dataset_index = gr.Number(value=0, precision=0, label="Index")
                     dataset_button = gr.Button("Analyze patch")
+                with gr.Row():
+                    dataset_back = gr.Button("◀ Back")
+                    dataset_next = gr.Button("Next ▶")
                 dataset_gallery = gr.Gallery(label="Sensor views", columns=3, height="auto")
                 dataset_metadata = gr.JSON(label="Metadata and spectral evidence")
                 dataset_button.click(
@@ -1400,15 +1654,29 @@ cells: list[dict[str, object]] = [
                     [dataset_name, dataset_split, dataset_index],
                     [dataset_gallery, dataset_metadata],
                 )
+                dataset_back.click(
+                    previous_dataset_patch,
+                    [dataset_name, dataset_split, dataset_index],
+                    [dataset_index, dataset_gallery, dataset_metadata],
+                )
+                dataset_next.click(
+                    next_dataset_patch,
+                    [dataset_name, dataset_split, dataset_index],
+                    [dataset_index, dataset_gallery, dataset_metadata],
+                )
             with gr.Tab("Single-model results"):
                 model_name = gr.Dropdown(list(EXPERIMENT_RESULTS), value="rgb_fidelity", label="Experiment")
                 model_index = gr.Number(value=0, precision=0, label="Saved test-cache index")
+                show_base_psnr = gr.Checkbox(
+                    value=True,
+                    label="Show SwinIR-base PSNR in label and per-patch data",
+                )
                 model_button = gr.Button("Analyze saved model output")
                 model_gallery = gr.Gallery(label="Saved model internals", columns=3, height="auto")
                 model_metrics = gr.JSON(label="Test metrics")
                 model_button.click(
                     model_cache_gallery,
-                    [model_name, model_index],
+                    [model_name, model_index, show_base_psnr],
                     [model_gallery, model_metrics],
                 )
             with gr.Tab("Same-patch comparison"):
@@ -1435,7 +1703,7 @@ cells: list[dict[str, object]] = [
                 server_name="0.0.0.0",
             )
         else:
-            print("Gradio app built but not launched. Set RUN_GRADIO=True in Cell 1.")
+            print("Gradio app built but not launched. Set RUN_GRADIO=True in this cell.")
         """
     ),
     markdown("## 21. Export all reports without mixing or deleting source data"),
