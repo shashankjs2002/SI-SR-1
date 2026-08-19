@@ -172,6 +172,7 @@ def main() -> None:
         degradation_severity=config["data"].get("degradation_severity", "mild"),
         target_key=config["data"].get("target_key", "hr"),
         condition_key=config["data"].get("condition_key"),
+        radiometric_calibration=config["data"].get("radiometric_calibration"),
         output_channels=config["model"].get("output_channels", 3),
         input_mode=config["data"].get("input_mode", "synthetic"),
     )
@@ -195,6 +196,7 @@ def main() -> None:
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
     totals: defaultdict[str, float] = defaultdict(float)
+    per_patch_rows: list[dict[str, object]] = []
     count = 0
     total = min(len(loader), args.limit) if args.limit is not None else len(loader)
     total_passes = total * args.samples * args.steps
@@ -217,6 +219,7 @@ def main() -> None:
         lr = batch["lr"].to(device)
         lr_rgb = batch.get("lr_rgb", batch["lr"]).to(device)
         lr_rgb = lr_rgb[:, : int(config["model"].get("output_channels", 3))]
+        raw_lr_rgb = batch.get("lr_raw_rgb", lr_rgb).to(device)
         clean_lr = batch["clean_lr"].to(device)
         hr = batch["hr"].to(device)
         degradation = batch["degradation"].to(device)
@@ -246,7 +249,7 @@ def main() -> None:
             else:
                 context = text_encoder(list(batch["caption"]))
             with torch.no_grad():
-                base = model.base(lr)
+                base = model.predict_base(lr)
                 lr_features = model.lr_encoder(lr)
         outputs = []
         sample_progress = tqdm(
@@ -337,7 +340,20 @@ def main() -> None:
         values["observed_lr_noise_to_signal"] = float(
             observed_noise.abs().mean() / clean_lr.abs().mean().clamp_min(1e-8)
         )
+        values["radiometric_adjustment_l1"] = float(
+            (lr_rgb - raw_lr_rgb).abs().mean()
+        )
         values.update(optional_metrics(mean, hr, mask=valid_mask))
+        base_values = basic_metrics(
+            base_image,
+            hr,
+            clean_lr,
+            degradation,
+            scale=model.scale,
+            severity=model.degradation_severity,
+            mask=valid_mask,
+            lr_mask=valid_lr_mask,
+        )
         error_map = (mean - hr).abs().mean(dim=1, keepdim=True)
         metric_mask = F.interpolate(
             valid_mask,
@@ -380,6 +396,18 @@ def main() -> None:
             ssim=f"{totals['ssim'] / (count + 1):.4f}",
         )
         patch_path = Path(batch["patch"][0])
+        per_patch_rows.append(
+            {
+                "dataset_index": args.index if args.index is not None else index,
+                "patch": str(patch_path),
+                **{f"output_{name}": value for name, value in values.items()},
+                **{f"base_{name}": value for name, value in base_values.items()},
+                "psnr_delta_vs_base": values["psnr"] - base_values["psnr"],
+                "ssim_delta_vs_base": values["ssim"] - base_values["ssim"],
+                "l1_improvement_vs_base": base_values["l1"] - values["l1"],
+                "output_beats_base_psnr": values["psnr"] > base_values["psnr"],
+            }
+        )
         patch_name = "__".join(
             (
                 str(batch["tile_id"][0]),
@@ -423,8 +451,35 @@ def main() -> None:
     summary["optional_metrics"] = args.optional_metrics
     summary["text_conditioning"] = not args.no_text
     summary["dataset_index"] = args.index
+    if per_patch_rows:
+        summary["base_psnr"] = sum(
+            float(row["base_psnr"]) for row in per_patch_rows
+        ) / len(per_patch_rows)
+        summary["base_ssim"] = sum(
+            float(row["base_ssim"]) for row in per_patch_rows
+        ) / len(per_patch_rows)
+        summary["base_l1"] = sum(
+            float(row["base_l1"]) for row in per_patch_rows
+        ) / len(per_patch_rows)
+        summary["psnr_delta_vs_base"] = sum(
+            float(row["psnr_delta_vs_base"]) for row in per_patch_rows
+        ) / len(per_patch_rows)
+        summary["ssim_delta_vs_base"] = sum(
+            float(row["ssim_delta_vs_base"]) for row in per_patch_rows
+        ) / len(per_patch_rows)
+        summary["l1_improvement_vs_base"] = sum(
+            float(row["l1_improvement_vs_base"]) for row in per_patch_rows
+        ) / len(per_patch_rows)
+        summary["fraction_beating_base_psnr"] = sum(
+            bool(row["output_beats_base_psnr"]) for row in per_patch_rows
+        ) / len(per_patch_rows)
     with (output_dir / "metrics.json").open("w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2)
+    with (output_dir / "per_patch_metrics.jsonl").open(
+        "w", encoding="utf-8"
+    ) as handle:
+        for row in per_patch_rows:
+            handle.write(json.dumps(row) + "\n")
     print(f"[evaluate] complete in {_duration(time.monotonic() - started)}", flush=True)
     print(summary, flush=True)
 

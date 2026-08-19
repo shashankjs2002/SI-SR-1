@@ -45,6 +45,7 @@ class GeoDiffGAN(nn.Module):
         self,
         scale: int = 4,
         input_channels: int = 3,
+        base_input_channels: int | None = None,
         output_channels: int = 3,
         base_embed_dim: int = 60,
         base_depth: int = 6,
@@ -75,6 +76,17 @@ class GeoDiffGAN(nn.Module):
         super().__init__()
         self.scale = scale
         self.input_channels = input_channels
+        self.base_input_channels = int(
+            input_channels if base_input_channels is None else base_input_channels
+        )
+        if self.base_input_channels < output_channels:
+            raise ValueError(
+                "base_input_channels must include at least the output RGB channels"
+            )
+        if self.base_input_channels > input_channels:
+            raise ValueError(
+                "base_input_channels cannot exceed input_channels"
+            )
         self.output_channels = output_channels
         self.latent_channels = latent_channels
         self.context_dim = context_dim
@@ -86,7 +98,7 @@ class GeoDiffGAN(nn.Module):
         self.use_back_projection = use_back_projection
         self.degradation_severity = degradation_severity
         self.base = SwinIRBase(
-            in_channels=input_channels,
+            in_channels=self.base_input_channels,
             embed_dim=base_embed_dim,
             depth=base_depth,
             heads=base_heads,
@@ -128,6 +140,7 @@ class GeoDiffGAN(nn.Module):
         return cls(
             scale=model.get("scale", 4),
             input_channels=model.get("input_channels", 3),
+            base_input_channels=model.get("base_input_channels"),
             output_channels=model.get("output_channels", 3),
             base_embed_dim=model.get("base_embed_dim", 60),
             base_depth=model.get("base_depth", 6),
@@ -171,6 +184,19 @@ class GeoDiffGAN(nn.Module):
                 f"Expected at least {self.output_channels} LR channels, got {lr.shape[1]}"
             )
         return lr[:, : self.output_channels]
+
+    def base_lr(self, lr: torch.Tensor) -> torch.Tensor:
+        """Select only evidence intended for deterministic reconstruction."""
+        if lr.shape[1] < self.base_input_channels:
+            raise ValueError(
+                f"Expected at least {self.base_input_channels} base input channels, "
+                f"got {lr.shape[1]}"
+            )
+        return lr[:, : self.base_input_channels]
+
+    def predict_base(self, lr: torch.Tensor) -> torch.Tensor:
+        """Run the conservative base without leaking auxiliary spectral channels."""
+        return self.base(self.base_lr(lr))
 
     def apply_ablation_inputs(
         self, context: torch.Tensor, degradation: torch.Tensor
@@ -274,7 +300,7 @@ class GeoDiffGAN(nn.Module):
         conditioning_prepared: bool = False,
         lr_features: list[torch.Tensor] | None = None,
     ) -> GeoDiffOutput:
-        base = self.base(lr) if base is None else base
+        base = self.predict_base(lr) if base is None else base
         consistency_lr = self.output_lr(lr) if projection_lr is None else projection_lr
         if not conditioning_prepared:
             context, degradation = self.apply_ablation_inputs(context, degradation)
@@ -467,6 +493,7 @@ class GeoDiffGAN(nn.Module):
                     "synthetic_edit": mode == "edit",
                     "scale": self.scale,
                     "input_channels": self.input_channels,
+                    "base_input_channels": self.base_input_channels,
                     "output_channels": self.output_channels,
                     "back_projection_steps": steps,
                     "dual_policy_gating": True,
@@ -520,7 +547,7 @@ class GeoDiffGAN(nn.Module):
         context, degradation = self.apply_ablation_inputs(context, degradation)
         if null_context is not None and not self.use_text_conditioning:
             null_context = torch.zeros_like(null_context)
-        base = self.base(lr) if base is None else base
+        base = self.predict_base(lr) if base is None else base
         lr_features = self.lr_encoder(lr) if lr_features is None else lr_features
         latent_height = base.shape[-2] // self.vae.downsample_factor
         latent_width = base.shape[-1] // self.vae.downsample_factor

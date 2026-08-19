@@ -85,6 +85,9 @@ cells: list[dict[str, object]] = [
         RUN_RGB_STANDARD = True
         RUN_RGB_FIDELITY = True
         RUN_MULTISPECTRAL_FIDELITY = True
+        RUN_RGB_HARMONIZED_FIDELITY = True
+        RUN_MULTISPECTRAL_GUIDED_FIDELITY = True
+        REFIT_RADIOMETRIC_CALIBRATION = False
         # Keep this enabled for progress-report metrics. Set False only when the
         # session has no Internet and LPIPS/DISTS weights are not cached.
         RUN_OPTIONAL_METRICS = True
@@ -94,6 +97,8 @@ cells: list[dict[str, object]] = [
         RUN_CV_RGB_STANDARD = False
         RUN_CV_RGB_FIDELITY = False
         RUN_CV_MULTISPECTRAL_FIDELITY = False
+        RUN_CV_RGB_HARMONIZED_FIDELITY = False
+        RUN_CV_MULTISPECTRAL_GUIDED_FIDELITY = False
         CV_FOLDS_TO_RUN = list(range(K_FOLDS))
 
         EPOCHS = (
@@ -113,6 +118,7 @@ cells: list[dict[str, object]] = [
         VALIDATION_LIMIT = 4 if FAST_DEV_RUN else 64
         FIDELITY_RESIDUAL_SCALES = [0.0, 0.25, 0.5, 0.75, 1.0]
         FIDELITY_PROJECTION_STEPS = [0]
+        MINIMUM_VALIDATION_PSNR_GAIN_OVER_BASE = 0.05
         SAVED_EXAMPLES_PER_EXPERIMENT = 3 if FAST_DEV_RUN else 8
         COMPARISON_COMMON_INDEX = 0
         RANDOM_SEED = 42
@@ -122,12 +128,13 @@ cells: list[dict[str, object]] = [
             "multispectral": SUITE_ROOT / "datasets" / "multispectral",
         }
         EXPERIMENT_ROOT = SUITE_ROOT / "experiments"
+        CALIBRATION_ROOT = SUITE_ROOT / "radiometric_calibration"
         CV_ROOT = SUITE_ROOT / "cross_validation"
         SUITE_TABLE_ROOT = SUITE_ROOT / "tables"
         SUITE_FIGURE_ROOT = SUITE_ROOT / "figures"
         GRADIO_ROOT = SUITE_ROOT / "gradio"
         for path in (
-            *DATA_ROOTS.values(), EXPERIMENT_ROOT, CV_ROOT,
+            *DATA_ROOTS.values(), EXPERIMENT_ROOT, CALIBRATION_ROOT, CV_ROOT,
             SUITE_TABLE_ROOT, SUITE_FIGURE_ROOT, GRADIO_ROOT,
         ):
             path.mkdir(parents=True, exist_ok=True)
@@ -168,6 +175,8 @@ cells: list[dict[str, object]] = [
             "rgb_standard": RUN_CV_RGB_STANDARD,
             "rgb_fidelity": RUN_CV_RGB_FIDELITY,
             "multispectral_fidelity": RUN_CV_MULTISPECTRAL_FIDELITY,
+            "rgb_harmonized_fidelity": RUN_CV_RGB_HARMONIZED_FIDELITY,
+            "multispectral_guided_fidelity": RUN_CV_MULTISPECTRAL_GUIDED_FIDELITY,
         })
         """
     ),
@@ -386,7 +395,47 @@ cells: list[dict[str, object]] = [
         MS_RECORDS, MS_ACTIVE, MS_SPLIT_TABLE = audit_dataset(MULTISPECTRAL_DATA)
         """
     ),
-    markdown("## 7. Save and display RGB and multispectral data diagnostics"),
+    markdown(
+        "## 7. Fit train-only Landsat-to-Sentinel radiometric harmonization\n\n"
+        "The affine coefficients are fitted from training patches only. Validation and "
+        "test targets never contribute to the fit. The same cell also audits integer "
+        "registration offsets at the 30 m grid."
+    ),
+    code(
+        """
+        RGB_CALIBRATION = CALIBRATION_ROOT / "rgb_train_affine.json"
+        MS_CALIBRATION = CALIBRATION_ROOT / "multispectral_train_affine.json"
+
+        def fit_calibration(dataset, condition_key, destination):
+            if REFIT_RADIOMETRIC_CALIBRATION or not destination.exists():
+                run([
+                    sys.executable,
+                    "-m", "geodiff_gan.cli.fit_radiometric",
+                    "--manifest", dataset["manifest"],
+                    "--output", destination,
+                    "--condition-key", condition_key,
+                    "--scale", 3,
+                    "--maximum-patches", 100 if FAST_DEV_RUN else 2000,
+                    "--pixels-per-patch", 512 if FAST_DEV_RUN else 1024,
+                    "--maximum-shift", 2,
+                    "--seed", RANDOM_SEED,
+                ], cwd=REPOSITORY_DIR)
+            report = json.loads(destination.read_text(encoding="utf-8"))
+            channel_table = pd.DataFrame(report["channels"])
+            channel_table.insert(0, "dataset", dataset["name"])
+            display(channel_table)
+            print(json.dumps(report["registration_audit"], indent=2))
+            return report
+
+        RGB_CALIBRATION_REPORT = fit_calibration(
+            RGB_DATA, "lr", RGB_CALIBRATION
+        )
+        MS_CALIBRATION_REPORT = fit_calibration(
+            MULTISPECTRAL_DATA, "lr_ms", MS_CALIBRATION
+        )
+        """
+    ),
+    markdown("## 8. Save and display raw, harmonized, and multispectral diagnostics"),
     code(
         """
         def chw(array):
@@ -450,9 +499,62 @@ cells: list[dict[str, object]] = [
 
         RGB_DATA_FIGURE = save_dataset_diagnostic(RGB_DATA, RGB_RECORDS, 0)
         MS_DATA_FIGURE = save_dataset_diagnostic(MULTISPECTRAL_DATA, MS_RECORDS, 0)
+
+        def save_harmonization_diagnostic(dataset, records, calibration_path, index=0):
+            active = [r for r in records if r["split"] in ("val", "test")]
+            record = active[index % len(active)]
+            calibration = json.loads(Path(calibration_path).read_text(encoding="utf-8"))
+            slope = torch.tensor(calibration["slope"])[:, None, None]
+            offset = torch.tensor(calibration["offset"])[:, None, None]
+            with np.load(record["patch"]) as patch:
+                raw_lr = chw(patch["lr"])
+                hr = chw(patch["hr"])
+                valid = torch.from_numpy(patch["valid_mask_hr"][0]).bool()
+            calibrated_lr = (raw_lr * slope + offset).clamp(0, 1)
+            raw_up = F.interpolate(
+                raw_lr[None], size=hr.shape[-2:], mode="bicubic", align_corners=False
+            )[0]
+            calibrated_up = F.interpolate(
+                calibrated_lr[None], size=hr.shape[-2:], mode="bicubic", align_corners=False
+            )[0]
+            displays = target_stretch([raw_up, calibrated_up, hr], hr, valid)
+            raw_error = (raw_up - hr).abs().mean(0)
+            calibrated_error = (calibrated_up - hr).abs().mean(0)
+            error_limit = max(
+                0.03,
+                float(torch.quantile(torch.cat((raw_error[valid], calibrated_error[valid])), 0.99)),
+            )
+            fig, axes = plt.subplots(2, 3, figsize=(15, 10), squeeze=False)
+            panels = [
+                (displays[0], "Raw Landsat bicubic", "rgb"),
+                (displays[1], "Train-harmonized Landsat", "rgb"),
+                (displays[2], "Sentinel target", "rgb"),
+                (raw_error, f"Raw error L1={float(raw_error[valid].mean()):.5f}", "heat"),
+                (calibrated_error, f"Harmonized error L1={float(calibrated_error[valid].mean()):.5f}", "heat"),
+                (calibrated_error - raw_error, "Error change; negative is improvement", "diverging"),
+            ]
+            for axis, (image, title, kind) in zip(axes.flat, panels):
+                if kind == "rgb":
+                    axis.imshow(image.permute(1, 2, 0))
+                elif kind == "heat":
+                    axis.imshow(image, cmap="turbo", vmin=0, vmax=error_limit)
+                else:
+                    axis.imshow(image, cmap="RdBu_r", vmin=-error_limit, vmax=error_limit)
+                axis.set_title(title)
+                axis.axis("off")
+            output = dataset["figure_root"] / f"harmonization_index_{index:05d}.png"
+            fig.tight_layout()
+            fig.savefig(output, dpi=180, bbox_inches="tight")
+            plt.show()
+            display(DisplayImage(filename=str(output)))
+            return output
+
+        RGB_HARMONIZATION_FIGURE = save_harmonization_diagnostic(
+            RGB_DATA, RGB_RECORDS, RGB_CALIBRATION
+        )
         """
     ),
-    markdown("## 8. Shared experiment, training, evaluation, and figure helpers"),
+    markdown("## 9. Shared experiment, training, evaluation, and figure helpers"),
     code(
         """
         import copy
@@ -497,6 +599,25 @@ cells: list[dict[str, object]] = [
             "evidence_improvement": 0.1,
             "adversarial": 0.0,
         }
+        HARMONIZED_FIDELITY_LOSSES = {
+            "charbonnier": 0.5,
+            "mse": 100.0,
+            "multiscale_mse": 25.0,
+            "consistency": 0.0,
+            "ssim": 0.5,
+            "gradient": 0.0,
+            "perceptual": 0.0,
+            "wavelet": 0.0,
+            "radiometric": 0.25,
+            "residual_supervision": 0.1,
+            "base_guard": 200.0,
+            "kl": 0.0001,
+            "vae_reconstruction": 1.0,
+            "diffusion": 0.1,
+            "evidence_calibration": 0.01,
+            "evidence_improvement": 0.05,
+            "adversarial": 0.0,
+        }
 
         EXPERIMENT_SPECS = {
             "rgb_standard": {
@@ -516,6 +637,26 @@ cells: list[dict[str, object]] = [
                 "multispectral": True,
                 "fidelity": True,
                 "description": "Six-band Landsat conditioning with RGB fidelity target",
+            },
+            "rgb_harmonized_fidelity": {
+                "dataset": RGB_DATA,
+                "multispectral": False,
+                "fidelity": True,
+                "harmonized": True,
+                "radiometric_calibration": RGB_CALIBRATION,
+                "base_input_channels": 3,
+                "freeze_diffusion_in_joint": True,
+                "description": "Train-harmonized RGB fidelity control",
+            },
+            "multispectral_guided_fidelity": {
+                "dataset": MULTISPECTRAL_DATA,
+                "multispectral": True,
+                "fidelity": True,
+                "harmonized": True,
+                "radiometric_calibration": MS_CALIBRATION,
+                "base_input_channels": 3,
+                "freeze_diffusion_in_joint": True,
+                "description": "RGB-only base with six-band residual conditioning",
             },
         }
 
@@ -545,11 +686,20 @@ cells: list[dict[str, object]] = [
                 "input_mode": "paired",
                 "target_key": "hr",
                 "condition_key": "lr_ms" if spec["multispectral"] else None,
+                "radiometric_calibration": (
+                    str(spec["radiometric_calibration"])
+                    if spec.get("radiometric_calibration")
+                    else None
+                ),
                 "train_degradation_sampling": "fixed",
             })
             config["model"].update({
                 "scale": 3,
                 "input_channels": 6 if spec["multispectral"] else 3,
+                "base_input_channels": spec.get(
+                    "base_input_channels",
+                    6 if spec["multispectral"] else 3,
+                ),
                 "output_channels": 3,
                 "base_upsample_mode": "resize_conv",
                 "decoder_upsample_mode": "resize_conv",
@@ -594,9 +744,12 @@ cells: list[dict[str, object]] = [
                 "lr_scheduler_threshold": 1e-4,
                 "lr_scheduler_min_lr": 1e-7,
             })
-            config["training"]["loss_weights"].update(
-                FIDELITY_LOSSES if spec["fidelity"] else STANDARD_LOSSES
+            selected_losses = (
+                HARMONIZED_FIDELITY_LOSSES
+                if spec.get("harmonized")
+                else FIDELITY_LOSSES if spec["fidelity"] else STANDARD_LOSSES
             )
+            config["training"]["loss_weights"].update(selected_losses)
             config.setdefault("debug", {})
             config["debug"].update({
                 "enabled": False,
@@ -627,7 +780,36 @@ cells: list[dict[str, object]] = [
                 )
             if not manifest.exists():
                 manifest.write_bytes(source_bytes)
-            config = base_runtime_config(spec, manifest, paths)
+            runtime_spec = copy.deepcopy(spec)
+            source_calibration = spec.get("radiometric_calibration")
+            if source_calibration:
+                calibration = paths["dataset"] / "radiometric_calibration.json"
+                primary_manifest = Path(spec["dataset"]["manifest"])
+                if source_manifest.resolve() != primary_manifest.resolve():
+                    if enabled or not calibration.exists():
+                        run([
+                            sys.executable,
+                            "-m", "geodiff_gan.cli.fit_radiometric",
+                            "--manifest", manifest,
+                            "--output", calibration,
+                            "--condition-key", "lr_ms" if spec["multispectral"] else "lr",
+                            "--scale", 3,
+                            "--maximum-patches", 100 if FAST_DEV_RUN else 2000,
+                            "--pixels-per-patch", 512 if FAST_DEV_RUN else 1024,
+                            "--maximum-shift", 2,
+                            "--seed", RANDOM_SEED,
+                        ], cwd=REPOSITORY_DIR)
+                else:
+                    calibration_bytes = Path(source_calibration).read_bytes()
+                    if calibration.exists() and calibration.read_bytes() != calibration_bytes:
+                        raise RuntimeError(
+                            f"Calibration snapshot changed for {name}: {calibration}. "
+                            "Use a new experiment name to avoid mixing runs."
+                        )
+                    if not calibration.exists():
+                        calibration.write_bytes(calibration_bytes)
+                runtime_spec["radiometric_calibration"] = calibration
+            config = base_runtime_config(runtime_spec, manifest, paths)
             checkpoints = {}
             configs = {}
             previous = None
@@ -635,10 +817,15 @@ cells: list[dict[str, object]] = [
                 stage_config = copy.deepcopy(config)
                 stage_output = paths["runs"] / stage
                 stage_output.mkdir(parents=True, exist_ok=True)
+                stage_epochs = EPOCHS[stage]
+                stage_learning_rate = LEARNING_RATES[stage]
+                if spec.get("harmonized") and stage == "joint":
+                    stage_epochs = 1 if FAST_DEV_RUN else min(EPOCHS[stage], 8)
+                    stage_learning_rate = min(LEARNING_RATES[stage], 5e-6)
                 stage_config["training"].update({
                     "stage": stage,
-                    "epochs": EPOCHS[stage],
-                    "learning_rate": LEARNING_RATES[stage],
+                    "epochs": stage_epochs,
+                    "learning_rate": stage_learning_rate,
                     "output_dir": str(stage_output),
                     "init_checkpoint": str(previous) if previous else None,
                     "resume": None,
@@ -646,6 +833,17 @@ cells: list[dict[str, object]] = [
                 })
                 if stage != "joint":
                     stage_config["training"]["module_learning_rate_multipliers"] = {}
+                elif spec.get("freeze_diffusion_in_joint"):
+                    stage_config["training"].update({
+                        "trainable_modules": ["lr_encoder", "mapper", "decoder"],
+                        "module_learning_rate_multipliers": {
+                            "lr_encoder": 0.5,
+                            "mapper": 1.0,
+                            "decoder": 1.0,
+                        },
+                    })
+                    stage_config["training"]["loss_weights"]["diffusion"] = 0.0
+                    stage_config["training"]["loss_weights"]["adversarial"] = 0.0
                 if stage == "diffusion":
                     stage_config["training"]["loss_weights"]["diffusion"] = 1.0
                     stage_config["training"].update({
@@ -685,6 +883,13 @@ cells: list[dict[str, object]] = [
                 "manifest": str(manifest),
                 "multispectral": spec["multispectral"],
                 "fidelity": spec["fidelity"],
+                "harmonized": bool(spec.get("harmonized", False)),
+                "base_input_channels": runtime_spec.get("base_input_channels"),
+                "radiometric_calibration": (
+                    str(runtime_spec["radiometric_calibration"])
+                    if runtime_spec.get("radiometric_calibration")
+                    else None
+                ),
                 "paths": {key: str(value) for key, value in paths.items()},
                 "configs": {key: str(value) for key, value in configs.items()},
                 "checkpoints": {key: str(value) for key, value in checkpoints.items()},
@@ -787,6 +992,27 @@ cells: list[dict[str, object]] = [
                 sweep.to_csv(paths["tables"] / "validation_fidelity_sweep.csv", index=False)
                 display(sweep)
                 selected = sweep.iloc[0].to_dict()
+                if result.get("harmonized"):
+                    base_rows = sweep[sweep["residual_scale"] == 0.0]
+                    if base_rows.empty:
+                        raise RuntimeError("Fidelity sweep must include residual_scale=0.0")
+                    validation_base = base_rows.sort_values(
+                        ["psnr", "ssim"], ascending=False
+                    ).iloc[0]
+                    psnr_gain = float(selected["psnr"] - validation_base["psnr"])
+                    ssim_gain = float(selected["ssim"] - validation_base["ssim"])
+                    if psnr_gain < MINIMUM_VALIDATION_PSNR_GAIN_OVER_BASE or ssim_gain < 0:
+                        selected = validation_base.to_dict()
+                        selected["selection_reason"] = (
+                            "base fallback: learned correction did not clear the "
+                            "validation PSNR/SSIM guard"
+                        )
+                    else:
+                        selected["selection_reason"] = (
+                            "learned correction cleared the validation PSNR/SSIM guard"
+                        )
+                    selected["validation_psnr_gain_over_base"] = psnr_gain
+                    selected["validation_ssim_gain_over_base"] = ssim_gain
             else:
                 selected = {"residual_scale": 1.0, "projection_steps": 0}
             selection_path = paths["tables"] / "selected_inference.json"
@@ -922,18 +1148,81 @@ cells: list[dict[str, object]] = [
         )
         """
     ),
-    markdown("## 12. Compare the three single-split experiments"),
+    markdown(
+        """
+        ## 12. Experiment D: train-harmonized RGB fidelity
+
+        A robust affine mapping is fitted on training patches only, then applied to
+        Landsat RGB for train, validation, and test. Joint tuning is shortened to eight
+        epochs, diffusion weights are frozen, and only the LR encoder, mapper, and decoder
+        receive the conservative distortion objective. Validation can fall back to the
+        deterministic base by selecting residual scale zero.
+        """
+    ),
+    code(
+        """
+        RGB_HARMONIZED_RESULT = train_experiment(
+            "rgb_harmonized_fidelity",
+            EXPERIMENT_SPECS["rgb_harmonized_fidelity"],
+            enabled=RUN_RGB_HARMONIZED_FIDELITY,
+        )
+        """
+    ),
+    markdown("### 12.1 Evaluate the harmonized RGB experiment"),
+    code(
+        """
+        RGB_HARMONIZED_EVALUATION = evaluate_experiment(
+            "rgb_harmonized_fidelity",
+            RGB_HARMONIZED_RESULT,
+            select_fidelity=True,
+        )
+        """
+    ),
+    markdown(
+        """
+        ## 13. Experiment E: multispectral-guided fidelity
+
+        The deterministic SwinIR base receives only calibrated RGB. The residual pathway
+        receives all six Landsat bands `[R,G,B,NIR,SWIR1,SWIR2]`. This prevents NIR/SWIR
+        channels from directly changing RGB radiometry while retaining their structural
+        evidence for residual prediction.
+        """
+    ),
+    code(
+        """
+        MULTISPECTRAL_GUIDED_RESULT = train_experiment(
+            "multispectral_guided_fidelity",
+            EXPERIMENT_SPECS["multispectral_guided_fidelity"],
+            enabled=RUN_MULTISPECTRAL_GUIDED_FIDELITY,
+        )
+        """
+    ),
+    markdown("### 13.1 Evaluate the multispectral-guided experiment"),
+    code(
+        """
+        MULTISPECTRAL_GUIDED_EVALUATION = evaluate_experiment(
+            "multispectral_guided_fidelity",
+            MULTISPECTRAL_GUIDED_RESULT,
+            select_fidelity=True,
+        )
+        """
+    ),
+    markdown("## 14. Compare all five single-split experiments"),
     code(
         """
         EXPERIMENT_RESULTS = {
             "rgb_standard": RGB_STANDARD_RESULT,
             "rgb_fidelity": RGB_FIDELITY_RESULT,
             "multispectral_fidelity": MULTISPECTRAL_RESULT,
+            "rgb_harmonized_fidelity": RGB_HARMONIZED_RESULT,
+            "multispectral_guided_fidelity": MULTISPECTRAL_GUIDED_RESULT,
         }
         EXPERIMENT_EVALUATIONS = {
             "rgb_standard": RGB_STANDARD_EVALUATION,
             "rgb_fidelity": RGB_FIDELITY_EVALUATION,
             "multispectral_fidelity": MULTISPECTRAL_EVALUATION,
+            "rgb_harmonized_fidelity": RGB_HARMONIZED_EVALUATION,
+            "multispectral_guided_fidelity": MULTISPECTRAL_GUIDED_EVALUATION,
         }
         comparison_rows = [
             {"experiment": name, **evaluation["metrics"]}
@@ -944,6 +1233,20 @@ cells: list[dict[str, object]] = [
             SUITE_TABLE_ROOT / "single_split_model_comparison.csv", index=False
         )
         display(EXPERIMENT_COMPARISON)
+
+        base_delta_columns = [
+            "experiment", "psnr", "base_psnr", "psnr_delta_vs_base",
+            "ssim", "base_ssim", "ssim_delta_vs_base", "l1", "base_l1",
+            "l1_improvement_vs_base", "fraction_beating_base_psnr",
+        ]
+        BASE_DELTA_COMPARISON = EXPERIMENT_COMPARISON[[
+            column for column in base_delta_columns
+            if column in EXPERIMENT_COMPARISON.columns
+        ]]
+        BASE_DELTA_COMPARISON.to_csv(
+            SUITE_TABLE_ROOT / "final_vs_embedded_base.csv", index=False
+        )
+        display(BASE_DELTA_COMPARISON)
 
         metrics_to_plot = [
             metric for metric in ("psnr", "ssim", "l1", "edge_f1", "lpips", "dists")
@@ -969,7 +1272,7 @@ cells: list[dict[str, object]] = [
         print("Saved:", comparison_figure)
         """
     ),
-    markdown("## 13. Save a same-ground-patch visual comparison across all models"),
+    markdown("## 15. Save a same-ground-patch visual comparison across all models"),
     code(
         """
         def record_identity(record):
@@ -1043,15 +1346,40 @@ cells: list[dict[str, object]] = [
         images = [comparison_bicubic, *common_outputs.values(), comparison_hr]
         displays = target_stretch(images, comparison_hr, comparison_valid)
         titles = ["Landsat bicubic", *common_outputs.keys(), "Sentinel target"]
-        fig, axes = plt.subplots(2, len(images), figsize=(4.5 * len(images), 9), squeeze=False)
-        for column, (image, display_image, title) in enumerate(zip(images, displays, titles)):
-            axes[0, column].imshow(display_image.permute(1, 2, 0))
-            axes[0, column].set_title(title)
-            axes[0, column].axis("off")
+        comparison_columns = min(3, len(images))
+        comparison_groups = (len(images) + comparison_columns - 1) // comparison_columns
+        fig, axes = plt.subplots(
+            comparison_groups * 2,
+            comparison_columns,
+            figsize=(5 * comparison_columns, 8 * comparison_groups),
+            squeeze=False,
+        )
+        for panel_index, (image, display_image, title) in enumerate(
+            zip(images, displays, titles)
+        ):
+            group = panel_index // comparison_columns
+            column = panel_index % comparison_columns
+            image_axis = axes[group * 2, column]
+            error_axis = axes[group * 2 + 1, column]
+            image_axis.imshow(display_image.permute(1, 2, 0))
+            image_axis.set_title(title)
+            image_axis.axis("off")
             error = (image - comparison_hr).abs().mean(0) * comparison_valid
-            axes[1, column].imshow(error, cmap="turbo", vmin=0, vmax=max(0.03, float(torch.quantile(error[comparison_valid], 0.99))))
-            axes[1, column].set_title(f"masked L1={float(error[comparison_valid].mean()):.5f}")
-            axes[1, column].axis("off")
+            error_axis.imshow(
+                error,
+                cmap="turbo",
+                vmin=0,
+                vmax=max(0.03, float(torch.quantile(error[comparison_valid], 0.99))),
+            )
+            error_axis.set_title(
+                f"masked L1={float(error[comparison_valid].mean()):.5f}"
+            )
+            error_axis.axis("off")
+        for panel_index in range(len(images), comparison_groups * comparison_columns):
+            group = panel_index // comparison_columns
+            column = panel_index % comparison_columns
+            axes[group * 2, column].axis("off")
+            axes[group * 2 + 1, column].axis("off")
         same_image_figure = SUITE_FIGURE_ROOT / "same_patch_all_models.png"
         fig.suptitle(str(common_key))
         fig.tight_layout()
@@ -1067,11 +1395,12 @@ cells: list[dict[str, object]] = [
 
         The following cells are intentionally last. Each profile receives independent fold
         manifests, configs, checkpoints, test caches, tables, and figures. Five folds across
-        three four-stage models means fifteen complete training pipelines; enable only the
-        profiles that fit the available allocation.
+        five four-stage models means twenty-five complete training pipelines; enable only
+        the profiles that fit the available allocation. Harmonization is fitted separately
+        from each fold's training records, preventing validation/test target leakage.
         """
     ),
-    markdown("## 14. Create separate spatial K-fold manifests for RGB and multispectral data"),
+    markdown("## 16. Create separate spatial K-fold manifests for RGB and multispectral data"),
     code(
         """
         from geodiff_gan.data.manifest import (
@@ -1105,7 +1434,7 @@ cells: list[dict[str, object]] = [
         MS_FOLD_MANIFESTS, MS_FOLD_REPORT = create_fold_manifests(MULTISPECTRAL_DATA)
         """
     ),
-    markdown("## 15. Cross-validation helper"),
+    markdown("## 17. Cross-validation helper"),
     code(
         """
         CV_RESULTS = {}
@@ -1151,7 +1480,7 @@ cells: list[dict[str, object]] = [
             return table
         """
     ),
-    markdown("## 16. K-fold RGB-standard experiment"),
+    markdown("## 18. K-fold RGB-standard experiment"),
     code(
         """
         CV_RGB_STANDARD_TABLE = (
@@ -1163,7 +1492,7 @@ cells: list[dict[str, object]] = [
             print("Skipped. Set RUN_CV_RGB_STANDARD=True in Cell 1 to run it.")
         """
     ),
-    markdown("## 17. K-fold RGB-fidelity experiment"),
+    markdown("## 19. K-fold RGB-fidelity experiment"),
     code(
         """
         CV_RGB_FIDELITY_TABLE = (
@@ -1175,7 +1504,7 @@ cells: list[dict[str, object]] = [
             print("Skipped. Set RUN_CV_RGB_FIDELITY=True in Cell 1 to run it.")
         """
     ),
-    markdown("## 18. K-fold multispectral-fidelity experiment"),
+    markdown("## 20. K-fold multispectral-fidelity experiment"),
     code(
         """
         CV_MULTISPECTRAL_TABLE = (
@@ -1187,7 +1516,31 @@ cells: list[dict[str, object]] = [
             print("Skipped. Set RUN_CV_MULTISPECTRAL_FIDELITY=True in Cell 1 to run it.")
         """
     ),
-    markdown("## 19. Aggregate and plot all available K-fold results"),
+    markdown("## 21. K-fold harmonized RGB-fidelity experiment"),
+    code(
+        """
+        CV_RGB_HARMONIZED_TABLE = (
+            run_cross_validation("rgb_harmonized_fidelity", enabled=True)
+            if RUN_CV_RGB_HARMONIZED_FIDELITY
+            else pd.DataFrame()
+        )
+        if not RUN_CV_RGB_HARMONIZED_FIDELITY:
+            print("Skipped. Set RUN_CV_RGB_HARMONIZED_FIDELITY=True in Cell 1 to run it.")
+        """
+    ),
+    markdown("## 22. K-fold multispectral-guided fidelity experiment"),
+    code(
+        """
+        CV_MULTISPECTRAL_GUIDED_TABLE = (
+            run_cross_validation("multispectral_guided_fidelity", enabled=True)
+            if RUN_CV_MULTISPECTRAL_GUIDED_FIDELITY
+            else pd.DataFrame()
+        )
+        if not RUN_CV_MULTISPECTRAL_GUIDED_FIDELITY:
+            print("Skipped. Set RUN_CV_MULTISPECTRAL_GUIDED_FIDELITY=True in Cell 1 to run it.")
+        """
+    ),
+    markdown("## 23. Aggregate and plot all available K-fold results"),
     code(
         """
         cv_tables = [
@@ -1195,6 +1548,8 @@ cells: list[dict[str, object]] = [
                 CV_RGB_STANDARD_TABLE,
                 CV_RGB_FIDELITY_TABLE,
                 CV_MULTISPECTRAL_TABLE,
+                CV_RGB_HARMONIZED_TABLE,
+                CV_MULTISPECTRAL_GUIDED_TABLE,
             ) if not table.empty
         ]
         if cv_tables:
@@ -1228,11 +1583,12 @@ cells: list[dict[str, object]] = [
 
         The app reads saved patches and evaluation caches only. It does not retrain models.
         It provides dataset spectral inspection, model-specific result browsing, same-patch
-        comparisons, error maps, experiment metrics, and available K-fold summaries.
+        comparisons, error maps, experiment metrics, base-versus-final deltas, and
+        available K-fold summaries.
         """
     ),
     markdown(
-        "## 20. Standalone Gradio dataset/model explorer\n\n"
+        "## 24. Standalone Gradio dataset/model explorer\n\n"
         "After one completed experiment run, this is the only cell that must be "
         "rerun after a kernel restart. It reconstructs its state from saved files."
     ),
@@ -1351,10 +1707,18 @@ cells: list[dict[str, object]] = [
             "rgb_standard",
             "rgb_fidelity",
             "multispectral_fidelity",
+            "rgb_harmonized_fidelity",
+            "multispectral_guided_fidelity",
         ):
+            descriptor = EXPERIMENT_ROOT / experiment_name / "experiment.json"
+            if not descriptor.exists():
+                print("Skipping unavailable saved experiment:", experiment_name)
+                continue
             result, evaluation = load_saved_experiment(experiment_name)
             EXPERIMENT_RESULTS[experiment_name] = result
             EXPERIMENT_EVALUATIONS[experiment_name] = evaluation
+        if not EXPERIMENT_RESULTS:
+            raise RuntimeError("No completed saved experiments are available for Gradio.")
 
         EXPERIMENT_COMPARISON = pd.DataFrame([
             {"experiment": name, **evaluation["metrics"]}
@@ -1665,7 +2029,14 @@ cells: list[dict[str, object]] = [
                     [dataset_index, dataset_gallery, dataset_metadata],
                 )
             with gr.Tab("Single-model results"):
-                model_name = gr.Dropdown(list(EXPERIMENT_RESULTS), value="rgb_fidelity", label="Experiment")
+                default_experiment = (
+                    "rgb_harmonized_fidelity"
+                    if "rgb_harmonized_fidelity" in EXPERIMENT_RESULTS
+                    else next(iter(EXPERIMENT_RESULTS))
+                )
+                model_name = gr.Dropdown(
+                    list(EXPERIMENT_RESULTS), value=default_experiment, label="Experiment"
+                )
                 model_index = gr.Number(value=0, precision=0, label="Saved test-cache index")
                 show_base_psnr = gr.Checkbox(
                     value=True,
@@ -1706,7 +2077,7 @@ cells: list[dict[str, object]] = [
             print("Gradio app built but not launched. Set RUN_GRADIO=True in this cell.")
         """
     ),
-    markdown("## 21. Export all reports without mixing or deleting source data"),
+    markdown("## 25. Export all reports without mixing or deleting source data"),
     code(
         """
         import zipfile

@@ -63,6 +63,7 @@ and a visually sharp satellite image is not automatically a spatially faithful r
 | 35 | [Training, debugging, evaluation, and viva](35_training_debugging_evaluation_viva.md) | Defend modules, losses, diagnostics, results, ablations, and scientific claims |
 | 36 | [Spatial, spectral, radiometric, and temporal resolution](36_spatial_spectral_radiometric_temporal_resolution.md) | Separate the four sensor-resolution dimensions and diagnose their effects on real 3x SR |
 | 37 | [PSNR/SSIM fidelity-first training](37_psnr_ssim_fidelity_first_training.md) | Optimize distortion, guard the strong base, and validate sampled residual utility |
+| 38 | [Harmonized dual-stream cross-sensor experiment](38_harmonized_dual_stream_experiment.md) | Calibrate Landsat RGB, isolate NIR/SWIR guidance, and audit final gains against the embedded base |
 
 ## Recommended Pace
 
@@ -73,7 +74,7 @@ flowchart LR
     C["Week 3<br/>Ch. 08-10<br/>GeoDiff-GAN"] -->
     D["Week 4<br/>Ch. 11-18<br/>Evaluation and research"] -->
     E["Week 5<br/>Ch. 19-29<br/>Modules and improved experiment"] -->
-    F["Week 6<br/>Ch. 30-37<br/>Captions, benchmarks,<br/>and fidelity-first cross-sensor SR"]
+    F["Week 6<br/>Ch. 30-38<br/>Captions, benchmarks,<br/>and cross-sensor fidelity experiments"]
 ```
 
 For each chapter:

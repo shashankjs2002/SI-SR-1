@@ -63,6 +63,7 @@ def main() -> None:
         degradation_severity=config["data"].get("degradation_severity", "mild"),
         target_key=config["data"].get("target_key", "hr"),
         condition_key=config["data"].get("condition_key"),
+        radiometric_calibration=config["data"].get("radiometric_calibration"),
         output_channels=config["model"].get("output_channels", 3),
         input_mode=config["data"].get("input_mode", "synthetic"),
     )

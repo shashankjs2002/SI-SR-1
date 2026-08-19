@@ -60,6 +60,7 @@ def main() -> None:
         degradation_severity=config["data"].get("degradation_severity", "mild"),
         target_key=config["data"].get("target_key", "hr"),
         condition_key=config["data"].get("condition_key"),
+        radiometric_calibration=config["data"].get("radiometric_calibration"),
         output_channels=config["model"].get("output_channels", 3),
         input_mode=config["data"].get("input_mode", "synthetic"),
     )
@@ -109,6 +110,7 @@ def main() -> None:
             lr = batch["lr"].to(device)
             lr_rgb = batch.get("lr_rgb", batch["lr"]).to(device)
             lr_rgb = lr_rgb[:, : int(config["model"].get("output_channels", 3))]
+            raw_lr_rgb = batch.get("lr_raw_rgb", lr_rgb).to(device)
             clean_lr = batch["clean_lr"].to(device)
             hr = batch["hr"].to(device)
             degradation = batch["degradation"].to(device)
@@ -133,7 +135,7 @@ def main() -> None:
                     dtype=torch.float16,
                     enabled=amp_enabled,
                 ):
-                    predictions["base"] = model.base(lr).float()
+                    predictions["base"] = model.predict_base(lr).float()
             for name, prediction in predictions.items():
                 values = basic_metrics(
                     prediction,
@@ -151,6 +153,9 @@ def main() -> None:
                 values["observed_lr_noise_to_signal"] = float(
                     observed_noise.abs().mean()
                     / clean_lr.abs().mean().clamp_min(1e-8)
+                )
+                values["radiometric_adjustment_l1"] = float(
+                    (lr_rgb - raw_lr_rgb).abs().mean()
                 )
                 for metric, value in values.items():
                     totals[name][metric] += value

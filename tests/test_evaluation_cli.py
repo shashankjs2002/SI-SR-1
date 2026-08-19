@@ -128,6 +128,21 @@ class EvaluationCliTest(unittest.TestCase):
             self.assertFalse(metrics["text_conditioning"])
             self.assertEqual(metrics["residual_scale"], 0.0)
             self.assertEqual(metrics["dataset_index"], 1)
+            self.assertAlmostEqual(metrics["psnr_delta_vs_base"], 0.0, places=6)
+            self.assertAlmostEqual(metrics["ssim_delta_vs_base"], 0.0, places=6)
+            self.assertAlmostEqual(metrics["l1_improvement_vs_base"], 0.0, places=6)
+            per_patch_rows = [
+                json.loads(line)
+                for line in (output / "per_patch_metrics.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(len(per_patch_rows), 1)
+            self.assertEqual(per_patch_rows[0]["dataset_index"], 1)
+            self.assertEqual(per_patch_rows[0]["patch"], str(selected_patch))
+            self.assertIn("base_psnr", per_patch_rows[0])
+            self.assertIn("output_psnr", per_patch_rows[0])
             cache_path = next(output.glob("*_uncertainty.npz"))
             with np.load(cache_path) as cache:
                 self.assertIn("base", cache.files)

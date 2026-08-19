@@ -350,6 +350,7 @@ class Trainer:
             degradation_severity=data.get("degradation_severity", "mild"),
             target_key=data.get("target_key", "hr"),
             condition_key=data.get("condition_key"),
+            radiometric_calibration=data.get("radiometric_calibration"),
             output_channels=self.config["model"].get("output_channels", 3),
             input_mode=data.get("input_mode", "synthetic"),
         )
@@ -447,12 +448,18 @@ class Trainer:
         losses: dict[str, torch.Tensor] = {}
         if diagnostics is not None:
             diagnostics.capture("input.lr", lr, visual="rgb")
+            if "lr_raw_rgb" in batch:
+                diagnostics.capture(
+                    "input.lr_raw_rgb",
+                    batch["lr_raw_rgb"].to(self.device, non_blocking=True),
+                    visual="rgb",
+                )
             diagnostics.capture("target.hr", hr, visual="rgb")
             diagnostics.capture("target.valid_mask", valid_mask, visual="heatmap")
             diagnostics.capture("conditioning.degradation", degradation)
 
         if self.stage == "base":
-            prediction = model.base(lr)
+            prediction = model.predict_base(lr)
             if diagnostics is not None:
                 diagnostics.capture(
                     "base.bicubic",
@@ -491,7 +498,7 @@ class Trainer:
             training=training,
         )
         with torch.no_grad():
-            base = model.base(lr)
+            base = model.predict_base(lr)
             target_residual = (hr - base) * valid_mask
         lr_features = model.lr_encoder(lr)
         if diagnostics is not None:
@@ -903,7 +910,7 @@ class Trainer:
                         context, _, _, _ = self._contexts(
                             list(batch["caption"]), training=False
                         )
-                        base = model.base(lr)
+                        base = model.predict_base(lr)
                         lr_features = model.lr_encoder(lr)
                         sampled_outputs = []
                         for sample_index in range(validation_samples):
@@ -990,7 +997,7 @@ class Trainer:
                     for name, value in values.items():
                         totals[name] += value
                     if self.stage not in ("base", "diffusion"):
-                        validation_base = model.base(
+                        validation_base = model.predict_base(
                             batch["lr"].to(self.device, non_blocking=True)
                         )
                         base_values = basic_metrics(
@@ -1375,7 +1382,7 @@ class Trainer:
                                 align_corners=False,
                             )
                         else:
-                            debug_base = unwrap(self.model).base(lr)
+                            debug_base = unwrap(self.model).predict_base(lr)
                             debug_residual = prediction - debug_base
                         debug_lr_value = batch.get("lr_rgb")
                         debug_lr = (

@@ -34,6 +34,7 @@ class SentinelPatchDataset(Dataset):
         degradation_severity: str = "mild",
         target_key: str = "hr",
         condition_key: str | None = None,
+        radiometric_calibration: str | Path | None = None,
         output_channels: int = 3,
         input_mode: str = "synthetic",
     ) -> None:
@@ -45,6 +46,23 @@ class SentinelPatchDataset(Dataset):
         self.degradation_severity = degradation_severity
         self.target_key = target_key
         self.condition_key = condition_key
+        self.radiometric_slope: torch.Tensor | None = None
+        self.radiometric_offset: torch.Tensor | None = None
+        if radiometric_calibration:
+            calibration_path = Path(radiometric_calibration)
+            calibration = json.loads(calibration_path.read_text(encoding="utf-8"))
+            slope = calibration.get("slope")
+            offset = calibration.get("offset")
+            if not isinstance(slope, list) or not isinstance(offset, list):
+                raise ValueError(
+                    f"Invalid radiometric calibration: {calibration_path}"
+                )
+            if not slope or len(slope) != len(offset):
+                raise ValueError(
+                    "Radiometric slope and offset must be equally sized non-empty lists"
+                )
+            self.radiometric_slope = torch.tensor(slope, dtype=torch.float32)
+            self.radiometric_offset = torch.tensor(offset, dtype=torch.float32)
         self.output_channels = output_channels
         if input_mode not in ("synthetic", "paired"):
             raise ValueError("input_mode must be 'synthetic' or 'paired'")
@@ -166,6 +184,25 @@ class SentinelPatchDataset(Dataset):
     def _augment(self, image: torch.Tensor) -> torch.Tensor:
         return self._apply_augment(image, *self._augmentation_parameters())
 
+    def _apply_radiometric_calibration(
+        self, image: torch.Tensor
+    ) -> torch.Tensor:
+        if self.radiometric_slope is None or self.radiometric_offset is None:
+            return image
+        channels = self.radiometric_slope.numel()
+        if image.shape[0] < channels:
+            raise ValueError(
+                f"Radiometric calibration requires {channels} channels, "
+                f"but input has {image.shape[0]}"
+            )
+        calibrated = image.clone()
+        calibrated[:channels] = (
+            calibrated[:channels]
+            * self.radiometric_slope[:, None, None]
+            + self.radiometric_offset[:, None, None]
+        ).clamp(0, 1)
+        return calibrated
+
     def __getitem__(self, index: int) -> dict[str, torch.Tensor | str]:
         record: ManifestRecord = self.records[index]
         with np.load(record.patch) as data:
@@ -193,6 +230,11 @@ class SentinelPatchDataset(Dataset):
                     if clean_lr_key in data.files
                     else data[paired_lr_key],
                     clean_lr_key,
+                )
+                stored_raw_lr = stored_lr
+                stored_lr = self._apply_radiometric_calibration(stored_lr)
+                stored_clean_lr = self._apply_radiometric_calibration(
+                    stored_clean_lr
                 )
                 stored_degradation = torch.from_numpy(
                     data["degradation"]
@@ -240,6 +282,9 @@ class SentinelPatchDataset(Dataset):
         if self.input_mode == "paired":
             lr_value = self._apply_augment(
                 stored_lr.clamp(0, 1), flip_width, flip_height, rotations
+            )
+            raw_lr_value = self._apply_augment(
+                stored_raw_lr.clamp(0, 1), flip_width, flip_height, rotations
             )
             clean_lr_value = self._apply_augment(
                 stored_clean_lr.clamp(0, 1), flip_width, flip_height, rotations
@@ -295,7 +340,9 @@ class SentinelPatchDataset(Dataset):
             valid_mask_lr = torch.ones(
                 (1, *lr.shape[-2:]), dtype=hr.dtype
             )
+            raw_lr_value = lr[0]
         lr_rgb = lr[:, : self.output_channels]
+        raw_lr_rgb = raw_lr_value.unsqueeze(0)[:, : self.output_channels]
         clean_lr_rgb = clean_lr[:, : self.output_channels]
         caption = record.caption
         variants: dict[str, str] | None = None
@@ -319,6 +366,7 @@ class SentinelPatchDataset(Dataset):
             "hr": hr,
             "lr": lr[0],
             "lr_rgb": lr_rgb[0],
+            "lr_raw_rgb": raw_lr_rgb[0],
             "clean_lr": clean_lr_rgb[0],
             "degradation": degradation[0],
             "valid_mask": valid_mask,
