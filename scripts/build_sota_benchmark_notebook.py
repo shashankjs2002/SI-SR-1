@@ -434,7 +434,7 @@ comparison = pd.DataFrame(rows)
 preferred = [
     "family", "method", "architecture_mode", "source_revision",
     "parameters", "count", "l1", "psnr", "ssim",
-    "edge_f1", "redegradation_l1", "lpips", "dists",
+    "edge_f1", "redegradation_l1", "ergas", "sam_degrees", "uiqi", "scc",
 ]
 comparison = comparison[[name for name in preferred if name in comparison.columns]]
 comparison = comparison.sort_values("psnr", ascending=False)

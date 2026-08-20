@@ -35,14 +35,15 @@ cells = [
         - repairs old absolute manifest paths into a separate runtime manifest;
         - discovers saved GeoDiff-GAN and SOTA checkpoints;
         - evaluates all available models on identical deterministic 4x LR inputs;
-        - reports L1, PSNR, SSIM, edge F1, LR re-degradation error, LPIPS, and DISTS;
+        - reports L1, PSNR, SSIM, edge F1, LR re-degradation error, ERGAS, SAM, UIQI, and sCC;
         - caches per-image outputs so interrupted evaluation resumes;
         - shows LR, bicubic, target, every external model, and every GeoDiff variant side by side
           for a user-selected test index.
 
-        LPIPS/DISTS are perceptual metrics where **lower is better**. PSNR, SSIM, and edge F1 are
-        **higher is better**. This benchmark remains specific to this dataset, split, degradation
-        seed, and inference configuration.
+        ERGAS and SAM are **lower is better**. PSNR, SSIM, edge F1, UIQI, and sCC are
+        **higher is better**. These dependency-free metrics operate directly on the aligned
+        remote-sensing tensors. This benchmark remains specific to this dataset, split,
+        degradation seed, and inference configuration.
         """
     ),
     md("## 1. Locate the extracted backup and repository"),
@@ -102,7 +103,6 @@ cells = [
 
         run([
             sys.executable, "-m", "pip", "install", "-q",
-            "lpips>=0.1.4", "DISTS-pytorch>=0.1",
             "pandas>=2", "matplotlib>=3.7", "tqdm>=4.66",
             "einops>=0.8", "timm>=1.0.15",
         ])
@@ -166,7 +166,6 @@ cells = [
         EVALUATION_LIMIT = None  # None evaluates every patch in SPLIT.
         DEGRADATION_SEED = 42
         DEGRADATION_SEVERITY = "mild"
-        OPTIONAL_METRICS = True
 
         # GeoDiff is stochastic and much slower than deterministic competitors.
         GEODIFF_SAMPLES = 2
@@ -250,7 +249,7 @@ cells = [
         from tqdm.auto import tqdm
 
         from geodiff_gan.data import SentinelPatchDataset
-        from geodiff_gan.metrics import OptionalMetricSuite, basic_metrics
+        from geodiff_gan.metrics import basic_metrics
 
         dataset = SentinelPatchDataset(
             RUNTIME_MANIFEST,
@@ -265,7 +264,6 @@ cells = [
         TOTAL = len(dataset) if EVALUATION_LIMIT is None else min(len(dataset), EVALUATION_LIMIT)
         if TOTAL == 0:
             raise RuntimeError(f"No {SPLIT} patches")
-        optional_suite = OptionalMetricSuite(DEVICE, enabled=OPTIONAL_METRICS)
         print("Evaluation patches:", TOTAL)
 
         def to_device(sample):
@@ -320,7 +318,6 @@ cells = [
                     tensors["degradation"].float(), scale=4,
                     severity=DEGRADATION_SEVERITY,
                 )
-                metrics.update(optional_suite(prediction.float(), target.float()))
                 for key, value in metrics.items():
                     totals[key] += value
             result = {key: value / TOTAL for key, value in totals.items()}
@@ -411,7 +408,6 @@ cells = [
                     tensors["degradation"].float(), scale=4,
                     severity=DEGRADATION_SEVERITY,
                 )
-                metrics.update(optional_suite(prediction.float(), target.float()))
                 for key, value in metrics.items():
                     totals[key] += value
             result = {key: value / TOTAL for key, value in totals.items()}
@@ -450,25 +446,32 @@ cells = [
         comparison = pd.DataFrame(rows)
         preferred = [
             "family", "method", "count", "parameters", "l1", "psnr", "ssim",
-            "edge_f1", "redegradation_l1", "lpips", "dists",
+            "edge_f1", "redegradation_l1", "ergas", "sam_degrees", "uiqi", "scc",
             "architecture_mode", "samples", "diffusion_steps",
         ]
         comparison = comparison[[column for column in preferred if column in comparison]]
-        comparison = comparison.sort_values(["lpips", "psnr"], ascending=[True, False])
+        comparison = comparison.sort_values(["ergas", "psnr"], ascending=[True, False])
         display(comparison.round(6))
         comparison.to_csv(RESULT_ROOT / "saved_models_comparison.csv", index=False)
 
         import matplotlib.pyplot as plt
         metrics_to_plot = [
-            metric for metric in ("psnr", "ssim", "edge_f1", "lpips", "dists")
+            metric for metric in (
+                "psnr", "ssim", "edge_f1", "ergas", "sam_degrees", "uiqi", "scc"
+            )
             if metric in comparison.columns
         ]
         figure, axes = plt.subplots(1, len(metrics_to_plot), figsize=(5 * len(metrics_to_plot), 5))
         axes = np.atleast_1d(axes)
         for axis, metric in zip(axes, metrics_to_plot):
-            ordered = comparison.sort_values(metric, ascending=metric in ("lpips", "dists", "l1"))
+            ordered = comparison.sort_values(
+                metric,
+                ascending=metric in ("ergas", "sam_degrees", "l1"),
+            )
             axis.barh(ordered["method"], ordered[metric])
-            axis.set_title(f"{metric} ({'lower' if metric in ('lpips','dists','l1') else 'higher'} is better)")
+            axis.set_title(
+                f"{metric} ({'lower' if metric in ('ergas','sam_degrees','l1') else 'higher'} is better)"
+            )
             axis.grid(axis="x", alpha=0.25)
         plt.tight_layout()
         plt.show()
@@ -542,9 +545,9 @@ cells = [
         ## Interpretation
 
         - Use the same `EVALUATION_LIMIT`, manifest, seed, and degradation severity for every row.
-        - Do not compare old `test_metrics.json` files if they used different limits or optional metrics.
-        - LPIPS and DISTS may download pretrained feature weights on first use.
-        - A model can have higher PSNR but worse LPIPS or edge F1 because it produces smoother output.
+        - Do not compare old `test_metrics.json` files if they used different limits or metric definitions.
+        - ERGAS, SAM, UIQI, and sCC require no pretrained network or external weights.
+        - A model can have higher PSNR but worse sCC or edge F1 because it produces smoother output.
         - Low re-degradation error means the SR output remains consistent with the observed LR evidence.
         - GeoDiff uses stochastic samples; record `GEODIFF_SAMPLES` and `GEODIFF_STEPS` in the paper.
         """

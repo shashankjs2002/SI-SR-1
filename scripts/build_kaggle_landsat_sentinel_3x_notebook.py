@@ -50,7 +50,7 @@ cells = [
         3. creates resumable, exactly aligned 3x NPZ patches;
         4. audits geographic splits, dates, masks, geometry, and registration;
         5. trains base, VAE, diffusion, and joint stages with resume and early stopping;
-        6. evaluates masked PSNR, SSIM, edge F1, LPIPS/DISTS when installed, and LR consistency;
+        6. evaluates masked PSNR, SSIM, edge F1, ERGAS, SAM, UIQI, sCC, and LR consistency;
         7. exports intermediate features, diffusion trajectories, spectra, wavelets, policies,
            uncertainty, and back-projection diagnostics.
 
@@ -118,7 +118,6 @@ cells = [
             "quick": {"limit": 20, "samples": 2, "steps": 10},
             "full": {"limit": 100, "samples": 8, "steps": 20},
         }
-        EVALUATION_OPTIONAL_METRICS = False  # Set True after LPIPS/DISTS installation succeeds.
         EVALUATION_BACK_PROJECTION_STEPS = 3
         DEBUG_INDEX = 0
         VISUALIZATION_SAMPLES = 5
@@ -181,13 +180,6 @@ cells = [
             "rasterio>=1.3", "pandas>=2", "matplotlib>=3.7",
         ])
         run([sys.executable, "-m", "pip", "install", "-q", "-e", ".", "--no-deps"], cwd=REPOSITORY_DIR)
-
-        # These are optional. Failure does not block core evaluation.
-        optional_install = run([
-            sys.executable, "-m", "pip", "install", "-q",
-            "lpips>=0.1.4", "DISTS-pytorch>=0.1",
-        ], check=False)
-        print("Optional metric installation return code:", optional_install.returncode)
 
         source_root = (REPOSITORY_DIR / "src").resolve()
         if str(source_root) not in sys.path:
@@ -1032,8 +1024,6 @@ cells = [
             "--progress", "compact",
             "--no-text",
         ]
-        if EVALUATION_OPTIONAL_METRICS:
-            evaluation_command.append("--optional-metrics")
         run(evaluation_command, cwd=REPOSITORY_DIR)
 
         baseline_path = EVALUATION_ROOT / f"{EVALUATION_SPLIT}_baselines.json"
@@ -1048,8 +1038,6 @@ cells = [
         ]
         if base_checkpoint is not None:
             baseline_command.extend(["--base-checkpoint", base_checkpoint])
-        if EVALUATION_OPTIONAL_METRICS:
-            baseline_command.append("--optional-metrics")
         run(baseline_command, cwd=REPOSITORY_DIR)
 
         model_metrics = json.loads((split_output / "metrics.json").read_text(encoding="utf-8"))
@@ -1072,7 +1060,7 @@ cells = [
         metric_table = metric_table.sort_values("method").reset_index(drop=True)
         preferred = [
             "method", "count", "l1", "psnr", "ssim", "edge_f1",
-            "redegradation_l1", "lpips", "dists",
+            "redegradation_l1", "ergas", "sam_degrees", "uiqi", "scc",
         ]
         display(metric_table[[column for column in preferred if column in metric_table.columns]].round(6))
         print(
@@ -1086,7 +1074,10 @@ cells = [
     code(
         r"""
         available_metrics = [
-            metric for metric in ("psnr", "ssim", "edge_f1", "lpips", "dists", "redegradation_l1")
+            metric for metric in (
+                "psnr", "ssim", "edge_f1", "ergas", "sam_degrees",
+                "uiqi", "scc", "redegradation_l1",
+            )
             if metric in metric_table.columns and metric_table[metric].notna().any()
         ]
         if available_metrics:
@@ -1106,7 +1097,11 @@ cells = [
                     values[metric],
                     color=[palette.get(label, "#8064a2") for label in labels],
                 )
-                direction = "higher is better" if metric in ("psnr", "ssim", "edge_f1") else "lower is better"
+                direction = (
+                    "higher is better"
+                    if metric in ("psnr", "ssim", "edge_f1", "uiqi", "scc")
+                    else "lower is better"
+                )
                 axis.set_title(f"{metric} ({direction})")
                 axis.tick_params(axis="x", rotation=20)
                 axis.grid(axis="y", alpha=0.25)
@@ -1411,7 +1406,7 @@ cells = [
         ## 20. Optional fidelity-focused and full-unfreeze fine-tuning ablations
 
         Your current numbers show that the deterministic SwinIR base can beat the final
-        diffusion/GAN output on PSNR, SSIM, LPIPS, and DISTS. That means the joint stage is
+        diffusion/GAN output on PSNR, SSIM, ERGAS, SAM, UIQI, and sCC. That means the joint stage is
         useful for LR consistency and some edges, but it may be pulling the image away from
         the paired Sentinel target. Run this section only after the normal pipeline finishes.
 
@@ -1488,8 +1483,6 @@ cells = [
                 "--progress", "compact",
                 "--no-text",
             ]
-            if EVALUATION_OPTIONAL_METRICS:
-                command.append("--optional-metrics")
             run(command, cwd=REPOSITORY_DIR)
             return {
                 "name": name,
@@ -1534,12 +1527,15 @@ cells = [
         comparison_table = pd.DataFrame(comparison_rows)
         preferred = [
             "method", "count", "l1", "psnr", "ssim", "edge_f1",
-            "redegradation_l1", "lpips", "dists",
+            "redegradation_l1", "ergas", "sam_degrees", "uiqi", "scc",
         ]
         display(comparison_table[[column for column in preferred if column in comparison_table.columns]].round(6))
 
         plot_metrics = [
-            metric for metric in ("psnr", "ssim", "edge_f1", "lpips", "dists", "l1", "redegradation_l1")
+            metric for metric in (
+                "psnr", "ssim", "edge_f1", "ergas", "sam_degrees",
+                "uiqi", "scc", "l1", "redegradation_l1",
+            )
             if metric in comparison_table.columns and comparison_table[metric].notna().any()
         ]
         if plot_metrics:
@@ -1549,7 +1545,11 @@ cells = [
             for axis, metric in zip(axes.flat, plot_metrics):
                 values = comparison_table[["method", metric]].dropna()
                 axis.bar(values["method"], values[metric], color="#4f81bd")
-                direction = "higher is better" if metric in ("psnr", "ssim", "edge_f1") else "lower is better"
+                direction = (
+                    "higher is better"
+                    if metric in ("psnr", "ssim", "edge_f1", "uiqi", "scc")
+                    else "lower is better"
+                )
                 axis.set_title(f"{metric} ({direction})")
                 axis.tick_params(axis="x", rotation=30)
                 axis.grid(axis="y", alpha=0.25)

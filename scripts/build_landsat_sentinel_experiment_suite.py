@@ -88,9 +88,6 @@ cells: list[dict[str, object]] = [
         RUN_RGB_HARMONIZED_FIDELITY = True
         RUN_MULTISPECTRAL_GUIDED_FIDELITY = True
         REFIT_RADIOMETRIC_CALIBRATION = False
-        # Keep this enabled for progress-report metrics. Set False only when the
-        # session has no Internet and LPIPS/DISTS weights are not cached.
-        RUN_OPTIONAL_METRICS = True
         RUN_GRADIO = True
 
         K_FOLDS = 5
@@ -149,7 +146,7 @@ cells: list[dict[str, object]] = [
             "epochs": EPOCHS,
             "evaluation_samples": EVALUATION_SAMPLES,
             "evaluation_steps": EVALUATION_STEPS,
-            "optional_metrics": RUN_OPTIONAL_METRICS,
+            "remote_sensing_metrics": ["ergas", "sam_degrees", "uiqi", "scc"],
         }
         (SUITE_ROOT / "suite_settings.json").write_text(
             json.dumps(suite_settings, indent=2), encoding="utf-8"
@@ -206,11 +203,6 @@ cells: list[dict[str, object]] = [
             sys.executable, "-m", "pip", "install", "-q",
             "pandas", "matplotlib", "gradio>=4.44,<6", "plotly>=5.20",
         ])
-        if RUN_OPTIONAL_METRICS:
-            run([
-                sys.executable, "-m", "pip", "install", "-q",
-                "lpips>=0.1.4", "DISTS-pytorch>=0.1",
-            ])
         run([
             sys.executable, "-m", "pip", "install", "-q", "-e",
             REPOSITORY_DIR, "--no-deps",
@@ -916,8 +908,6 @@ cells: list[dict[str, object]] = [
                 "--progress", "compact",
                 "--no-text",
             ]
-            if RUN_OPTIONAL_METRICS:
-                command.append("--optional-metrics")
             return command
 
         def render_saved_examples(name, result, output_dir, maximum):
@@ -1039,8 +1029,6 @@ cells: list[dict[str, object]] = [
                 "--device", "cuda" if torch.cuda.is_available() else "cpu",
                 "--progress", "compact",
             ]
-            if RUN_OPTIONAL_METRICS:
-                baseline_command.append("--optional-metrics")
             run(baseline_command, cwd=REPOSITORY_DIR)
             model_metrics = json.loads((test_output / "metrics.json").read_text(encoding="utf-8"))
             baselines = json.loads(baseline_path.read_text(encoding="utf-8"))
@@ -1207,7 +1195,19 @@ cells: list[dict[str, object]] = [
         )
         """
     ),
-    markdown("## 14. Compare all five single-split experiments"),
+    markdown(
+        """
+        ## 14. Compare all five single-split experiments
+
+        The comparison uses dependency-free metrics suited to aligned remote-sensing
+        imagery. **ERGAS** and **SAM (degrees)** are lower-is-better measures of
+        relative radiometric and spectral error. **UIQI** and **sCC** are
+        higher-is-better measures of image-statistic agreement and correlation of
+        Laplacian high-frequency detail. QNR is not reported because it requires a
+        compatible high-resolution panchromatic reference, which these paired
+        Landsat surface-reflectance and Sentinel-2 patches do not contain.
+        """
+    ),
     code(
         """
         EXPERIMENT_RESULTS = {
@@ -1249,7 +1249,10 @@ cells: list[dict[str, object]] = [
         display(BASE_DELTA_COMPARISON)
 
         metrics_to_plot = [
-            metric for metric in ("psnr", "ssim", "l1", "edge_f1", "lpips", "dists")
+            metric for metric in (
+                "psnr", "ssim", "l1", "edge_f1", "ergas",
+                "sam_degrees", "uiqi", "scc",
+            )
             if metric in EXPERIMENT_COMPARISON.columns
             and EXPERIMENT_COMPARISON[metric].notna().any()
         ]
@@ -1258,7 +1261,11 @@ cells: list[dict[str, object]] = [
         fig, axes = plt.subplots(rows, columns, figsize=(5.5 * columns, 4.5 * rows), squeeze=False)
         for axis, metric in zip(axes.flat, metrics_to_plot):
             axis.bar(EXPERIMENT_COMPARISON["experiment"], EXPERIMENT_COMPARISON[metric])
-            better = "higher" if metric in ("psnr", "ssim", "edge_f1") else "lower"
+            better = (
+                "higher"
+                if metric in ("psnr", "ssim", "edge_f1", "uiqi", "scc")
+                else "lower"
+            )
             axis.set_title(f"{metric}: {better} is better")
             axis.tick_params(axis="x", rotation=20)
             axis.grid(axis="y", alpha=0.25)
@@ -1555,7 +1562,13 @@ cells: list[dict[str, object]] = [
         if cv_tables:
             CV_COMPARISON = pd.concat(cv_tables, ignore_index=True)
             CV_COMPARISON.to_csv(CV_ROOT / "all_fold_metrics.csv", index=False)
-            metrics = [m for m in ("psnr", "ssim", "l1", "edge_f1", "lpips") if m in CV_COMPARISON]
+            metrics = [
+                metric for metric in (
+                    "psnr", "ssim", "l1", "edge_f1", "ergas",
+                    "sam_degrees", "uiqi", "scc",
+                )
+                if metric in CV_COMPARISON
+            ]
             fig, axes = plt.subplots(1, len(metrics), figsize=(5.5 * len(metrics), 5), squeeze=False)
             for axis, metric in zip(axes[0], metrics):
                 groups = [
@@ -1903,7 +1916,7 @@ cells: list[dict[str, object]] = [
                 images.append((str(path), path.stem))
             return images, evaluation["metrics"]
 
-        def model_cache_gallery(experiment_name, cache_index, show_base_psnr):
+        def model_cache_gallery(experiment_name, cache_index, show_base_image):
             evaluation = EXPERIMENT_EVALUATIONS[experiment_name]
             caches = sorted(Path(evaluation["test_output"]).glob("*_uncertainty.npz"))
             if not caches:
@@ -1912,8 +1925,6 @@ cells: list[dict[str, object]] = [
             with np.load(cache_path) as cache:
                 prediction = chw(cache["mean"])
                 base = chw(cache["base"])
-                net_addition = chw(cache["net_addition"])
-                decoder_residual = chw(cache["decoder_residual"])
                 variance = torch.from_numpy(cache["variance"]).float()
                 confidence = torch.from_numpy(cache["evidence_confidence"]).float()
                 abstention = torch.from_numpy(cache["abstention_map"]).float()
@@ -1928,41 +1939,25 @@ cells: list[dict[str, object]] = [
             displays = target_stretch([bicubic, base, prediction, hr], hr, valid)
             error = (prediction - hr).abs().mean(0)
             base_error = (base - hr).abs().mean(0)
-            signed_limit = float(net_addition.abs().quantile(0.99).clamp_min(1e-6))
-            residual_display = (0.5 + net_addition * (0.45 / signed_limit)).clamp(0, 1)
-            decoder_limit = float(
-                decoder_residual.abs().quantile(0.99).clamp_min(1e-6)
-            )
-            decoder_display = (
-                0.5 + decoder_residual * (0.45 / decoder_limit)
-            ).clamp(0, 1)
-            error_limit = max(0.03, float(error[valid].quantile(0.99)))
-            base_error_limit = max(0.03, float(base_error[valid].quantile(0.99)))
-            gallery = [
-                (to_rgb(displays[0]), "Landsat bicubic"),
-                (to_rgb(displays[1]), "SwinIR base"),
-                (to_rgb(displays[2]), f"{experiment_name} output"),
-                (to_rgb(displays[3]), "Sentinel target"),
-                (to_rgb(decoder_display), "Decoder residual (signed)"),
-                (to_rgb(residual_display), "Final net addition (signed)"),
-                (to_heatmap(error, "turbo", 0.0, error_limit), "Output absolute error"),
-                (to_heatmap(base_error, "turbo", 0.0, base_error_limit), "Base absolute error"),
-                (to_heatmap(variance, "magma"), "Stochastic variance"),
-                (to_heatmap(confidence, "viridis", 0.0, 1.0), "Evidence confidence"),
-                (to_heatmap(abstention, "inferno", 0.0, 1.0), "Abstention"),
-            ]
             masked_l1 = float(error[valid].mean())
             masked_base_l1 = float(base_error[valid].mean())
             mse = float(((prediction - hr).pow(2).mean(0))[valid].mean())
             base_mse = float(((base - hr).pow(2).mean(0))[valid].mean())
             output_psnr = float(-10 * np.log10(max(mse, 1e-12)))
             base_psnr = float(-10 * np.log10(max(base_mse, 1e-12)))
-            gallery[1] = (
-                gallery[1][0],
-                f"SwinIR base; PSNR={base_psnr:.2f} dB"
-                if show_base_psnr
-                else "SwinIR base",
-            )
+            gallery = [
+                (to_rgb(displays[0]), "Landsat bicubic"),
+                (to_rgb(displays[2]), f"{experiment_name} output; PSNR={output_psnr:.2f} dB"),
+                (to_rgb(displays[3]), "Sentinel target"),
+            ]
+            if show_base_image:
+                gallery.insert(
+                    1,
+                    (
+                        to_rgb(displays[1]),
+                        f"SwinIR base; PSNR={base_psnr:.2f} dB",
+                    ),
+                )
             per_patch = {
                 "experiment": experiment_name,
                 "cache_index": int(cache_index) % len(caches),
@@ -1976,7 +1971,7 @@ cells: list[dict[str, object]] = [
                 "mean_abstention": float(abstention.mean()),
                 "mean_variance": float(variance.mean()),
             }
-            if show_base_psnr:
+            if show_base_image:
                 per_patch["base_psnr"] = base_psnr
             return gallery, per_patch
 
@@ -2038,16 +2033,21 @@ cells: list[dict[str, object]] = [
                     list(EXPERIMENT_RESULTS), value=default_experiment, label="Experiment"
                 )
                 model_index = gr.Number(value=0, precision=0, label="Saved test-cache index")
-                show_base_psnr = gr.Checkbox(
-                    value=True,
-                    label="Show SwinIR-base PSNR in label and per-patch data",
+                show_base_image = gr.Checkbox(
+                    value=False,
+                    label="Show SwinIR base image and PSNR",
                 )
                 model_button = gr.Button("Analyze saved model output")
-                model_gallery = gr.Gallery(label="Saved model internals", columns=3, height="auto")
+                model_gallery = gr.Gallery(
+                    label="Saved model result",
+                    columns=4,
+                    height="80vh",
+                    object_fit="contain",
+                )
                 model_metrics = gr.JSON(label="Test metrics")
                 model_button.click(
                     model_cache_gallery,
-                    [model_name, model_index, show_base_psnr],
+                    [model_name, model_index, show_base_image],
                     [model_gallery, model_metrics],
                 )
             with gr.Tab("Same-patch comparison"):

@@ -1114,7 +1114,7 @@ for variant in ("small_improved", "medium", "small_improved_ms", "medium_ms"):
         rows.append({"family": "GeoDiff-GAN", "method": f"geodiff_{variant}", **json.loads(metrics_path.read_text(encoding="utf-8"))})
 
 comparison = pd.DataFrame(rows)
-preferred = ["family", "method", "architecture_mode", "parameters", "count", "l1", "psnr", "ssim", "edge_f1", "redegradation_l1", "lpips", "dists"]
+preferred = ["family", "method", "architecture_mode", "parameters", "count", "l1", "psnr", "ssim", "edge_f1", "redegradation_l1", "ergas", "sam_degrees", "uiqi", "scc"]
 comparison = comparison[[name for name in preferred if name in comparison.columns]].sort_values("psnr", ascending=False)
 display(comparison.round(6))
 out = BENCHMARK_ROOT / ARCHITECTURE_MODE / PROFILE / "all_model_comparison.csv"
