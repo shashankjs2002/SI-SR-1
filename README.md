@@ -90,10 +90,10 @@ cd geodiff_gan
 pip install -e ".[geo]"
 ```
 
-Captioning and optional perceptual metrics use separate extras:
+Captioning and the optional LPIPS training loss use separate extras:
 
 ```bash
-pip install -e ".[caption,metrics]"
+pip install -e ".[caption,perceptual]"
 ```
 
 Qwen3-VL captioning should run in a separate Kaggle session or before SR training. The 8B model is
@@ -229,11 +229,13 @@ geodiff-evaluate \
   --split test --samples 8 --steps 20 --mode sr
 ```
 
-L1, PSNR, SSIM, edge F1, and LR re-degradation error are always reported. Evaluation also reports
-confidence-error correlation, uncertainty-error correlation, and selective L1 at 80% coverage.
-LPIPS and DISTS are added when the metrics extra is installed. Edit evaluation also reports frozen
-vision-language alignment. Super-resolution is a regression/generation task, so there is no
-classification accuracy value.
+L1, PSNR, SSIM, edge F1, LR re-degradation error, ERGAS, SAM in degrees, UIQI, and high-pass
+spatial correlation (sCC) are always reported. The remote-sensing metrics operate directly on
+aligned reflectance tensors and require no pretrained network. QNR is not reported for the paired
+Landsat-Sentinel experiment because it requires a compatible high-resolution panchromatic
+reference. Evaluation also reports confidence-error correlation, uncertainty-error correlation,
+and selective L1 at 80% coverage. Edit evaluation reports frozen vision-language alignment.
+Super-resolution is a regression/generation task, so there is no classification accuracy value.
 
 Generate the built-in bicubic and trained base-branch baselines:
 

@@ -21,7 +21,7 @@ from tqdm.auto import tqdm
 
 from ..data import SentinelPatchDataset
 from ..losses import charbonnier, gradient_loss, ssim, wavelet_loss
-from ..metrics import OptionalMetricSuite, basic_metrics
+from ..metrics import basic_metrics
 from .models import MODEL_SPECS, build_benchmark_model
 
 
@@ -74,7 +74,7 @@ class BenchmarkConfig:
     degradation_seed: int = 42
     degradation_severity: str = "mild"
     amp: bool = True
-    optional_metrics: bool = False
+    optional_metrics: bool = False  # Deprecated; domain metrics are always enabled.
     seed: int = 42
 
 
@@ -169,7 +169,6 @@ def evaluate(
     total = min(len(dataset), limit) if limit is not None else len(dataset)
     if total == 0:
         raise RuntimeError(f"No {split} records in {config.manifest}")
-    optional = OptionalMetricSuite(device, enabled=config.optional_metrics)
     totals: defaultdict[str, float] = defaultdict(float)
     image_dir = config.output / "images" / split
     if save_images:
@@ -198,7 +197,6 @@ def evaluate(
             scale=4,
             severity=config.degradation_severity,
         )
-        values.update(optional(prediction.float(), target.float()))
         for name, value in values.items():
             totals[name] += value
         if index < save_images:

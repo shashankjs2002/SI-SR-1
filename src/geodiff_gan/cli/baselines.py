@@ -14,7 +14,7 @@ from tqdm.auto import tqdm
 
 from ..config import load_config
 from ..data import SentinelPatchDataset
-from ..metrics import OptionalMetricSuite, basic_metrics
+from ..metrics import basic_metrics
 from ..models.system import GeoDiffGAN
 from ..training.checkpoint import load_checkpoint
 from .evaluate import _device_summary, _duration, _resolve_device
@@ -33,7 +33,7 @@ def main() -> None:
         choices=("compact", "tqdm", "quiet"),
         default="compact",
     )
-    parser.add_argument("--optional-metrics", action="store_true")
+    parser.add_argument("--optional-metrics", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -77,17 +77,14 @@ def main() -> None:
         load_checkpoint(args.base_checkpoint, model, strict=False)
     if args.optional_metrics:
         print(
-            "[baselines] loading LPIPS/DISTS; first use may download weights",
+            "[baselines] --optional-metrics is deprecated; ERGAS, SAM, UIQI, "
+            "and sCC are now computed automatically",
             flush=True,
         )
-    else:
-        print("[baselines] LPIPS/DISTS disabled", flush=True)
-    optional_metrics = OptionalMetricSuite(device, enabled=args.optional_metrics)
-    if args.optional_metrics:
-        loaded = ", ".join(optional_metrics.available_metrics) or "none"
-        print(f"[baselines] optional metrics ready: {loaded}", flush=True)
-        for name, error in optional_metrics.load_errors.items():
-            print(f"[baselines] optional metric unavailable: {name}: {error}", flush=True)
+    print(
+        "[baselines] remote-sensing metrics enabled: ERGAS, SAM, UIQI, sCC",
+        flush=True,
+    )
     totals: dict[str, defaultdict[str, float]] = {
         "bicubic": defaultdict(float),
         "base": defaultdict(float),
@@ -147,7 +144,6 @@ def main() -> None:
                     mask=valid_mask,
                     lr_mask=valid_lr_mask,
                 )
-                values.update(optional_metrics(prediction, hr, mask=valid_mask))
                 observed_noise = lr_rgb - clean_lr
                 values["observed_lr_noise_l1"] = float(observed_noise.abs().mean())
                 values["observed_lr_noise_to_signal"] = float(
@@ -186,7 +182,11 @@ def main() -> None:
     summary["count"] = count
     summary["device"] = str(device)
     summary["amp"] = amp_enabled
-    summary["optional_metrics"] = args.optional_metrics
+    summary["remote_sensing_metrics"] = True
+    summary["qnr_status"] = (
+        "not_computed: QNR requires a compatible high-resolution panchromatic "
+        "reference that is not present in the Landsat-Sentinel pairs"
+    )
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("w", encoding="utf-8") as handle:

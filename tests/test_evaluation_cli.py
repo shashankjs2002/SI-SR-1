@@ -131,6 +131,10 @@ class EvaluationCliTest(unittest.TestCase):
             self.assertAlmostEqual(metrics["psnr_delta_vs_base"], 0.0, places=6)
             self.assertAlmostEqual(metrics["ssim_delta_vs_base"], 0.0, places=6)
             self.assertAlmostEqual(metrics["l1_improvement_vs_base"], 0.0, places=6)
+            self.assertTrue(metrics["remote_sensing_metrics"])
+            self.assertIn("panchromatic", metrics["qnr_status"])
+            for metric in ("ergas", "sam_degrees", "uiqi", "scc"):
+                self.assertIn(metric, metrics)
             per_patch_rows = [
                 json.loads(line)
                 for line in (output / "per_patch_metrics.jsonl")

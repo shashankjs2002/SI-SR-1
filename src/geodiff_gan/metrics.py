@@ -1,12 +1,5 @@
 from __future__ import annotations
 
-import math
-import sys
-import sysconfig
-import warnings
-from importlib import metadata
-from pathlib import Path
-
 import torch
 from torch.nn import functional as F
 
@@ -30,6 +23,229 @@ def psnr(
 ) -> torch.Tensor:
     mse = _masked_mean((prediction - target).square(), mask)
     return -10 * torch.log10(mse.clamp_min(1e-12))
+
+
+def _expanded_mask(
+    value: torch.Tensor,
+    mask: torch.Tensor | None,
+) -> torch.Tensor:
+    if mask is None:
+        return torch.ones_like(value)
+    resized = F.interpolate(mask.float(), size=value.shape[-2:], mode="nearest")
+    if resized.shape[1] == 1 and value.shape[1] != 1:
+        resized = resized.expand(-1, value.shape[1], -1, -1)
+    return resized.to(dtype=value.dtype)
+
+
+def _masked_channel_moments(
+    first: torch.Tensor,
+    second: torch.Tensor,
+    mask: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    weights = _expanded_mask(first, mask)
+    count = weights.sum(dim=(-2, -1)).clamp_min(1.0)
+    first_mean = (first * weights).sum(dim=(-2, -1)) / count
+    second_mean = (second * weights).sum(dim=(-2, -1)) / count
+    first_centered = first - first_mean[..., None, None]
+    second_centered = second - second_mean[..., None, None]
+    first_variance = (first_centered.square() * weights).sum(dim=(-2, -1)) / count
+    second_variance = (second_centered.square() * weights).sum(dim=(-2, -1)) / count
+    covariance = (
+        first_centered * second_centered * weights
+    ).sum(dim=(-2, -1)) / count
+    return (
+        first_mean,
+        second_mean,
+        first_variance,
+        second_variance,
+        covariance,
+    )
+
+
+def ergas(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    scale: int,
+    mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Relative global synthesis error; lower is better."""
+    if scale < 1:
+        raise ValueError("ERGAS scale must be at least 1")
+    weights = _expanded_mask(prediction, mask)
+    count = weights.sum(dim=(-2, -1)).clamp_min(1.0)
+    rmse = torch.sqrt(
+        ((prediction - target).square() * weights).sum(dim=(-2, -1)) / count
+    )
+    reference_mean = (target * weights).sum(dim=(-2, -1)) / count
+    relative_error = rmse / reference_mean.abs().clamp_min(1e-8)
+    return (100.0 / float(scale)) * torch.sqrt(
+        relative_error.square().mean(dim=1)
+    ).mean()
+
+
+def spectral_angle_mapper(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Mean per-pixel spectral angle in degrees; lower is better."""
+    dot = (prediction * target).sum(dim=1, keepdim=True)
+    prediction_norm = torch.linalg.vector_norm(prediction, dim=1, keepdim=True)
+    target_norm = torch.linalg.vector_norm(target, dim=1, keepdim=True)
+    denominator = prediction_norm * target_norm
+    cosine = dot / denominator.clamp_min(1e-12)
+    identical = (prediction - target).abs().amax(dim=1, keepdim=True) < 1e-8
+    both_zero = (prediction_norm < 1e-8) & (target_norm < 1e-8)
+    one_zero = (prediction_norm < 1e-8) ^ (target_norm < 1e-8)
+    cosine = torch.where(both_zero | identical, torch.ones_like(cosine), cosine)
+    cosine = torch.where(one_zero, torch.zeros_like(cosine), cosine)
+    angle = torch.rad2deg(torch.acos(cosine.clamp(-1.0, 1.0)))
+    return _masked_mean(angle, mask)
+
+
+def uiqi(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Band-averaged universal image quality index; higher is better."""
+    (
+        prediction_mean,
+        target_mean,
+        prediction_variance,
+        target_variance,
+        covariance,
+    ) = _masked_channel_moments(prediction, target, mask)
+    numerator = 4.0 * covariance * prediction_mean * target_mean
+    denominator = (
+        (prediction_variance + target_variance)
+        * (prediction_mean.square() + target_mean.square())
+    )
+    score = numerator / denominator.clamp_min(1e-12)
+    weights = _expanded_mask(prediction, mask)
+    identical_degenerate = (
+        denominator < 1e-12
+    ) & (((prediction - target).abs() * weights).amax(dim=(-2, -1)) < 1e-8)
+    score = torch.where(identical_degenerate, torch.ones_like(score), score)
+    score = torch.where(
+        (denominator < 1e-12) & ~identical_degenerate,
+        torch.zeros_like(score),
+        score,
+    )
+    return score.clamp(-1.0, 1.0).mean()
+
+
+def spatial_correlation_coefficient(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Correlation of 3x3 Laplacian high-pass bands; higher is better."""
+    channels = prediction.shape[1]
+    kernel = prediction.new_tensor(
+        [[-1.0, -1.0, -1.0], [-1.0, 8.0, -1.0], [-1.0, -1.0, -1.0]]
+    ).view(1, 1, 3, 3).expand(channels, 1, 3, 3)
+
+    def high_pass(value: torch.Tensor) -> torch.Tensor:
+        padded = F.pad(value, (1, 1, 1, 1), mode="reflect")
+        return F.conv2d(padded, kernel, groups=channels)
+
+    prediction_high = high_pass(prediction)
+    target_high = high_pass(target)
+    correlation_mask = mask
+    if mask is not None:
+        resized = F.interpolate(mask.float(), size=prediction.shape[-2:], mode="nearest")
+        correlation_mask = (
+            F.avg_pool2d(resized, kernel_size=3, stride=1, padding=1) >= 1.0 - 1e-6
+        ).float()
+    (
+        _,
+        _,
+        prediction_variance,
+        target_variance,
+        covariance,
+    ) = _masked_channel_moments(
+        prediction_high,
+        target_high,
+        correlation_mask,
+    )
+    denominator = torch.sqrt(prediction_variance * target_variance)
+    score = covariance / denominator.clamp_min(1e-12)
+    weights = _expanded_mask(prediction_high, correlation_mask)
+    identical_degenerate = (
+        denominator < 1e-12
+    ) & (
+        ((prediction_high - target_high).abs() * weights).amax(dim=(-2, -1))
+        < 1e-8
+    )
+    score = torch.where(identical_degenerate, torch.ones_like(score), score)
+    score = torch.where(
+        (denominator < 1e-12) & ~identical_degenerate,
+        torch.zeros_like(score),
+        score,
+    )
+    return score.clamp(-1.0, 1.0).mean()
+
+
+def remote_sensing_metrics(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    scale: int,
+    mask: torch.Tensor | None = None,
+) -> dict[str, float]:
+    """Dependency-free, full-reference metrics for aligned remote-sensing data."""
+    prediction = prediction.float()
+    target = target.float()
+    return {
+        "ergas": float(ergas(prediction, target, scale=scale, mask=mask)),
+        "sam_degrees": float(spectral_angle_mapper(prediction, target, mask=mask)),
+        "uiqi": float(uiqi(prediction, target, mask=mask)),
+        "scc": float(spatial_correlation_coefficient(prediction, target, mask=mask)),
+    }
+
+
+class RemoteSensingMetricSuite:
+    """Compatibility wrapper for evaluation paths that use a metric suite."""
+
+    def __init__(
+        self,
+        device: torch.device | None = None,
+        enabled: bool = True,
+        scale: int = 4,
+    ) -> None:
+        del device
+        self.enabled = enabled
+        self.scale = scale
+        self.load_errors: dict[str, str] = {}
+
+    @property
+    def available_metrics(self) -> tuple[str, ...]:
+        return (
+            ("ergas", "sam_degrees", "uiqi", "scc")
+            if self.enabled
+            else ()
+        )
+
+    @torch.no_grad()
+    def __call__(
+        self,
+        prediction: torch.Tensor,
+        target: torch.Tensor,
+        mask: torch.Tensor | None = None,
+    ) -> dict[str, float]:
+        if not self.enabled:
+            return {}
+        return remote_sensing_metrics(
+            prediction,
+            target,
+            scale=self.scale,
+            mask=mask,
+        )
+
+
+# Retain the old import name for previously generated notebooks. It no longer
+# loads LPIPS or DISTS and now returns dependency-free remote-sensing metrics.
+OptionalMetricSuite = RemoteSensingMetricSuite
 
 
 def edge_f1(
@@ -121,7 +337,7 @@ def basic_metrics(
     mask: torch.Tensor | None = None,
     lr_mask: torch.Tensor | None = None,
 ) -> dict[str, float]:
-    return {
+    values = {
         "l1": float(charbonnier(prediction, target, epsilon=0.0, mask=mask)),
         "psnr": float(psnr(prediction, target, mask=mask)),
         "ssim": float(ssim(prediction, target, mask=mask)),
@@ -137,106 +353,5 @@ def basic_metrics(
             )
         ),
     }
-
-
-class OptionalMetricSuite:
-    def __init__(self, device: torch.device, enabled: bool = True) -> None:
-        self.lpips_model = None
-        self.dists_model = None
-        self.load_errors: dict[str, str] = {}
-        if not enabled:
-            return
-        try:
-            import lpips
-
-            self.lpips_model = lpips.LPIPS(net="alex").to(device).eval()
-        except Exception as error:
-            self._record_load_error("lpips", error)
-        try:
-            self.dists_model = _load_dists_model(device)
-        except Exception as error:
-            self._record_load_error("dists", error)
-
-    @property
-    def available_metrics(self) -> tuple[str, ...]:
-        return tuple(
-            name
-            for name, model in (
-                ("lpips", self.lpips_model),
-                ("dists", self.dists_model),
-            )
-            if model is not None
-        )
-
-    def _record_load_error(self, name: str, error: Exception) -> None:
-        message = f"{type(error).__name__}: {error}"
-        self.load_errors[name] = message
-        warnings.warn(
-            f"Optional metric {name.upper()} is unavailable ({message}). "
-            "Evaluation will continue with the remaining metrics.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-
-    @torch.no_grad()
-    def __call__(
-        self,
-        prediction: torch.Tensor,
-        target: torch.Tensor,
-        mask: torch.Tensor | None = None,
-    ) -> dict[str, float]:
-        values: dict[str, float] = {}
-        if mask is not None:
-            prediction = prediction * mask + target * (1 - mask)
-        if self.lpips_model is not None:
-            normalized_prediction = prediction * 2 - 1
-            normalized_target = target * 2 - 1
-            values["lpips"] = float(
-                self.lpips_model(normalized_prediction, normalized_target).mean()
-            )
-        if self.dists_model is not None:
-            values["dists"] = float(
-                self.dists_model(prediction, target).mean()
-            )
-        return values
-
-
-def _load_dists_model(device: torch.device) -> torch.nn.Module:
-    """Load DISTS despite the package's hard-coded ``sys.prefix`` weight path."""
-    import DISTS_pytorch
-
-    package_file = Path(DISTS_pytorch.__file__).resolve()
-    candidates = [
-        Path(sys.prefix) / "weights.pt",
-        Path(sysconfig.get_path("data")) / "weights.pt",
-        package_file.parent / "weights.pt",
-    ]
-    try:
-        distribution = metadata.distribution("DISTS-pytorch")
-    except metadata.PackageNotFoundError:
-        distribution = None
-    if distribution is not None:
-        candidates.extend(
-            Path(distribution.locate_file(file))
-            for file in distribution.files or ()
-            if Path(file).name == "weights.pt"
-        )
-    candidates = list(dict.fromkeys(candidates))
-    weights_path = next((path for path in candidates if path.is_file()), None)
-    if weights_path is None:
-        searched = ", ".join(str(path) for path in candidates)
-        raise FileNotFoundError(f"DISTS weights.pt was not found; searched: {searched}")
-
-    model = DISTS_pytorch.DISTS(load_weights=False)
-    weights = torch.load(
-        weights_path,
-        map_location="cpu",
-        weights_only=True,
-    )
-    missing = {"alpha", "beta"}.difference(weights)
-    if missing:
-        raise KeyError(f"DISTS weights are missing keys: {sorted(missing)}")
-    with torch.no_grad():
-        model.alpha.copy_(weights["alpha"])
-        model.beta.copy_(weights["beta"])
-    return model.to(device).eval()
+    values.update(remote_sensing_metrics(prediction, target, scale=scale, mask=mask))
+    return values

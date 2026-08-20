@@ -41,7 +41,11 @@ def main() -> None:
         choices=("mild", "moderate", "severe"),
         default="mild",
     )
-    parser.add_argument("--optional-metrics", action="store_true")
+    parser.add_argument(
+        "--optional-metrics",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--no-amp", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(

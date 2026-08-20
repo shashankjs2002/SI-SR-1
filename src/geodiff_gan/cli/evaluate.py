@@ -15,7 +15,7 @@ from tqdm.auto import tqdm
 
 from ..config import load_config
 from ..data import SentinelPatchDataset
-from ..metrics import OptionalMetricSuite, basic_metrics
+from ..metrics import basic_metrics
 from ..models.system import GeoDiffGAN
 from ..text import build_text_encoder
 from ..training.checkpoint import load_checkpoint
@@ -109,7 +109,7 @@ def main() -> None:
     parser.add_argument(
         "--optional-metrics",
         action="store_true",
-        help="Enable LPIPS/DISTS. Their first use may download external weights.",
+        help=argparse.SUPPRESS,
     )
     args = parser.parse_args()
     if args.samples < 1:
@@ -147,17 +147,14 @@ def main() -> None:
         print("[evaluate] text encoder ready", flush=True)
     if args.optional_metrics:
         print(
-            "[evaluate] loading LPIPS/DISTS; first use may download weights",
+            "[evaluate] --optional-metrics is deprecated; ERGAS, SAM, UIQI, "
+            "and sCC are now computed automatically",
             flush=True,
         )
-    else:
-        print("[evaluate] LPIPS/DISTS disabled", flush=True)
-    optional_metrics = OptionalMetricSuite(device, enabled=args.optional_metrics)
-    if args.optional_metrics:
-        loaded = ", ".join(optional_metrics.available_metrics) or "none"
-        print(f"[evaluate] optional metrics ready: {loaded}", flush=True)
-        for name, error in optional_metrics.load_errors.items():
-            print(f"[evaluate] optional metric unavailable: {name}: {error}", flush=True)
+    print(
+        "[evaluate] remote-sensing metrics enabled: ERGAS, SAM, UIQI, sCC",
+        flush=True,
+    )
     print(f"[evaluate] loading {args.split} dataset", flush=True)
     dataset = SentinelPatchDataset(
         config["data"]["manifest"],
@@ -343,7 +340,6 @@ def main() -> None:
         values["radiometric_adjustment_l1"] = float(
             (lr_rgb - raw_lr_rgb).abs().mean()
         )
-        values.update(optional_metrics(mean, hr, mask=valid_mask))
         base_values = basic_metrics(
             base_image,
             hr,
@@ -448,7 +444,11 @@ def main() -> None:
     summary["residual_scale"] = args.residual_scale
     summary["device"] = str(device)
     summary["amp"] = amp_enabled
-    summary["optional_metrics"] = args.optional_metrics
+    summary["remote_sensing_metrics"] = True
+    summary["qnr_status"] = (
+        "not_computed: QNR requires a compatible high-resolution panchromatic "
+        "reference that is not present in the Landsat-Sentinel pairs"
+    )
     summary["text_conditioning"] = not args.no_text
     summary["dataset_index"] = args.index
     if per_patch_rows:

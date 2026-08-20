@@ -24,7 +24,7 @@ caption = [
   "qwen-vl-utils>=0.0.8",
   "transformers>=4.57",
 ]
-metrics = ["lpips>=0.1.4", "DISTS-pytorch>=0.1"]
+perceptual = ["lpips>=0.1.4"]
 benchmark = [
   "einops>=0.8",
   "matplotlib>=3.8",
