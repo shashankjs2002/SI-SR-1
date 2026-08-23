@@ -64,6 +64,8 @@ and a visually sharp satellite image is not automatically a spatially faithful r
 | 36 | [Spatial, spectral, radiometric, and temporal resolution](36_spatial_spectral_radiometric_temporal_resolution.md) | Separate the four sensor-resolution dimensions and diagnose their effects on real 3x SR |
 | 37 | [PSNR/SSIM fidelity-first training](37_psnr_ssim_fidelity_first_training.md) | Optimize distortion, guard the strong base, and validate sampled residual utility |
 | 38 | [Harmonized dual-stream cross-sensor experiment](38_harmonized_dual_stream_experiment.md) | Calibrate Landsat RGB, isolate NIR/SWIR guidance, and audit final gains against the embedded base |
+| 39 | [Progress seminar presentation content](39_progress_seminar_presentation_content.md) | Present the complete project from layman motivation through results, limitations, and next experiments |
+| 40 | [Progress seminar cross-question handbook](40_progress_seminar_cross_questions.md) | Answer foundational, remote-sensing, architecture, training, evaluation, novelty, and ethics questions |
 
 ## Recommended Pace
 
@@ -74,7 +76,7 @@ flowchart LR
     C["Week 3<br/>Ch. 08-10<br/>GeoDiff-GAN"] -->
     D["Week 4<br/>Ch. 11-18<br/>Evaluation and research"] -->
     E["Week 5<br/>Ch. 19-29<br/>Modules and improved experiment"] -->
-    F["Week 6<br/>Ch. 30-38<br/>Captions, benchmarks,<br/>and cross-sensor fidelity experiments"]
+    F["Week 6<br/>Ch. 30-40<br/>Cross-sensor experiments,<br/>seminar, and viva preparation"]
 ```
 
 For each chapter:

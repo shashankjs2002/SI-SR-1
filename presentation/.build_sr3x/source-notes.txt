@@ -1,0 +1,17 @@
+GeoDiff-GAN SR-3x progress seminar source record
+
+Project sources:
+- src/geodiff_gan/models/system.py
+- src/geodiff_gan/models/base.py
+- src/geodiff_gan/models/generator.py
+- src/geodiff_gan/models/diffusion.py
+- src/geodiff_gan/models/vae.py
+- configs/landsat_sentinel_3x_multispectral_guided.yaml
+- learning/39_progress_seminar_presentation_content.md
+- learning/40_progress_seminar_cross_questions.md
+- outs/landsat_30m.webp
+- outs/infered_10m.webp
+- outs/sentinel_10m.webp
+
+External sources are listed in each slide's [Sources] speaker-notes block.
+No old 4x architecture infographic was used.
