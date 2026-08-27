@@ -23,6 +23,21 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class EvaluationCliTest(unittest.TestCase):
+    def test_cache_stem_sanitizes_nested_alsat_source_id(self) -> None:
+        first = evaluate._cache_stem(
+            "test/Agriculture/HR_0.jpg",
+            Path("/patches/test/example.npz"),
+        )
+        second = evaluate._cache_stem(
+            "test/Urban/HR_0.jpg",
+            Path("/patches/test/example.npz"),
+        )
+
+        self.assertNotIn("/", first)
+        self.assertNotIn("\\", first)
+        self.assertLessEqual(len(first), 174)
+        self.assertNotEqual(first, second)
+
     def test_no_text_cpu_evaluation_reports_progress(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

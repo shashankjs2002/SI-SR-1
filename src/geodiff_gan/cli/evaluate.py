@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import re
 import time
 from collections import defaultdict
 from itertools import islice
@@ -61,6 +63,14 @@ def _safe_correlation(first: torch.Tensor, second: torch.Tensor) -> float:
         return 0.0
     value = torch.corrcoef(torch.stack((first, second)))[0, 1]
     return float(value) if torch.isfinite(value) else 0.0
+
+
+def _cache_stem(tile_id: str, patch_path: Path) -> str:
+    """Return a portable, collision-resistant filename stem for one patch."""
+    raw = "__".join((tile_id, patch_path.parent.name, patch_path.stem))
+    readable = re.sub(r"[^A-Za-z0-9._-]+", "_", raw).strip("._")
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
+    return f"{readable[:160] or 'patch'}__{digest}"
 
 
 def main() -> None:
@@ -404,13 +414,7 @@ def main() -> None:
                 "output_beats_base_psnr": values["psnr"] > base_values["psnr"],
             }
         )
-        patch_name = "__".join(
-            (
-                str(batch["tile_id"][0]),
-                patch_path.parent.name,
-                patch_path.stem,
-            )
-        )
+        patch_name = _cache_stem(str(batch["tile_id"][0]), patch_path)
         np.savez_compressed(
             output_dir / f"{patch_name}_uncertainty.npz",
             mean=mean[0].detach().cpu().numpy(),
