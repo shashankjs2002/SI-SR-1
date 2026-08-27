@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 from pathlib import Path
 
 import numpy as np
@@ -23,13 +24,39 @@ def images_below(directory: Path) -> list[Path]:
     )
 
 
+def named_child(directory: Path, name: str) -> Path | None:
+    expected = name.casefold()
+    return next(
+        (
+            child
+            for child in directory.iterdir()
+            if child.is_dir() and child.name.casefold() == expected
+        ),
+        None,
+    )
+
+
+def dataset_directories(root: Path) -> tuple[Path, Path, Path | None]:
+    train = named_child(root, "train")
+    if train is None:
+        raise FileNotFoundError(f"ALSAT root has no Train directory: {root}")
+    train_hr = named_child(train, "hr")
+    train_lr = named_child(train, "lr")
+    if train_hr is None or train_lr is None:
+        raise FileNotFoundError(f"ALSAT Train directory needs HR and LR children: {train}")
+    return train_hr, train_lr, named_child(root, "test")
+
+
 def discover_root(input_root: Path) -> Path:
     candidates = []
     for candidate in (input_root, *input_root.rglob("*")):
         if not candidate.is_dir():
             continue
-        if (candidate / "Train" / "HR").is_dir() and (candidate / "Train" / "LR").is_dir():
-            candidates.append(candidate)
+        try:
+            dataset_directories(candidate)
+        except (FileNotFoundError, PermissionError, OSError):
+            continue
+        candidates.append(candidate)
     if not candidates:
         raise FileNotFoundError(
             f"Could not find an ALSAT root containing Train/HR and Train/LR under {input_root}"
@@ -44,39 +71,58 @@ def casefold_index(directory: Path) -> dict[str, Path]:
     }
 
 
+def canonical_pair_name(path: Path) -> str:
+    value = path.stem.casefold()
+    value = re.sub(r"(^|[_\-.\s])(hr|lr)(?=$|[_\-.\s])", r"\1pair", value)
+    value = re.sub(r"^(h|l)(?=\d)", "pair", value)
+    return re.sub(r"[^a-z0-9]+", "", value)
+
+
+def canonical_index(directory: Path) -> dict[str, Path]:
+    grouped: dict[str, list[Path]] = {}
+    for path in images_below(directory):
+        grouped.setdefault(canonical_pair_name(path), []).append(path)
+    return {
+        key: paths[0]
+        for key, paths in grouped.items()
+        if key and len(paths) == 1
+    }
+
+
 def paired_lr_path(
     hr_path: Path,
     hr_root: Path,
     lr_index: dict[str, Path],
-    train: bool,
+    lr_canonical_index: dict[str, Path],
 ) -> Path | None:
     relative = hr_path.relative_to(hr_root)
-    candidates = [relative]
-    if train:
-        candidates.extend(
-            [
-                relative.with_name(relative.name.replace("H", "L")),
-                relative.with_name(relative.name.replace("h", "l")),
-                relative.with_name(relative.name.replace("HR", "LR")),
-                relative.with_name(relative.name.replace("hr", "lr")),
-            ]
-        )
+    candidates = [
+        relative,
+        relative.with_name(relative.name.replace("HR", "LR")),
+        relative.with_name(relative.name.replace("hr", "lr")),
+        relative.with_name(relative.name.replace("_H", "_L")),
+        relative.with_name(relative.name.replace("_h", "_l")),
+        relative.with_name(re.sub(r"^H(?=\d)", "L", relative.name)),
+        relative.with_name(re.sub(r"^h(?=\d)", "l", relative.name)),
+    ]
     for candidate in candidates:
         key = str(candidate).replace("\\", "/").casefold()
         if key in lr_index:
             return lr_index[key]
-    return None
+    return lr_canonical_index.get(canonical_pair_name(hr_path))
 
 
 def collect_pairs(root: Path) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
     pairs: list[dict[str, object]] = []
     quarantine: list[dict[str, object]] = []
 
-    train_hr = root / "Train" / "HR"
-    train_lr = root / "Train" / "LR"
+    train_hr, train_lr, test_root = dataset_directories(root)
     train_lr_index = casefold_index(train_lr)
+    train_lr_canonical = canonical_index(train_lr)
     for hr_path in images_below(train_hr):
-        lr_path = paired_lr_path(hr_path, train_hr, train_lr_index, train=True)
+        lr_path = paired_lr_path(
+            hr_path, train_hr, train_lr_index, train_lr_canonical
+        )
         if lr_path is None:
             quarantine.append({"reason": "missing_train_lr", "hr": str(hr_path)})
             continue
@@ -85,16 +131,34 @@ def collect_pairs(root: Path) -> tuple[list[dict[str, object]], list[dict[str, o
             {"source_id": source_id, "category": "Train", "hr": hr_path, "lr": lr_path}
         )
 
-    test_root = root / "Test"
-    for hr_root in sorted(path for path in test_root.rglob("HR") if path.is_dir()):
-        lr_root = hr_root.parent / "LR"
+    if test_root is None:
+        quarantine.append({"reason": "missing_test_directory", "root": str(root)})
+        return pairs, quarantine
+    test_hr_roots = sorted(
+        path
+        for path in test_root.rglob("*")
+        if path.is_dir() and path.name.casefold() == "hr"
+    )
+    if not test_hr_roots:
+        quarantine.append(
+            {
+                "reason": "no_test_hr_directories",
+                "test_root": str(test_root),
+                "children": sorted(str(path.relative_to(test_root)) for path in test_root.rglob("*")),
+            }
+        )
+    for hr_root in test_hr_roots:
+        lr_root = named_child(hr_root.parent, "lr")
         category = hr_root.parent.relative_to(test_root).as_posix() or "Test"
-        if not lr_root.is_dir():
+        if lr_root is None:
             quarantine.append({"reason": "missing_test_lr_directory", "hr_root": str(hr_root)})
             continue
         test_lr_index = casefold_index(lr_root)
+        test_lr_canonical = canonical_index(lr_root)
         for hr_path in images_below(hr_root):
-            lr_path = paired_lr_path(hr_path, hr_root, test_lr_index, train=False)
+            lr_path = paired_lr_path(
+                hr_path, hr_root, test_lr_index, test_lr_canonical
+            )
             if lr_path is None:
                 quarantine.append({"reason": "missing_test_lr", "hr": str(hr_path)})
                 continue
@@ -252,15 +316,16 @@ def main() -> None:
 
     if not records:
         raise RuntimeError("No valid ALSAT patches were produced")
-    if not split_sources["train"] or not split_sources["val"] or not split_sources["test"]:
-        raise RuntimeError(
-            "ALSAT preparation needs non-empty train, val and test source sets; "
-            f"found { {key: len(value) for key, value in split_sources.items()} }"
-        )
     write_manifest(manifest_path, records)
     with quarantine_path.open("w", encoding="utf-8") as handle:
         for row in quarantine:
             handle.write(json.dumps(row) + "\n")
+    if not split_sources["train"] or not split_sources["val"] or not split_sources["test"]:
+        raise RuntimeError(
+            "ALSAT preparation needs non-empty train, val and test source sets; "
+            f"found { {key: len(value) for key, value in split_sources.items()} }. "
+            f"Partial manifest: {manifest_path}. Discovery log: {quarantine_path}."
+        )
     summary = {
         "root": str(root),
         "sources": {key: len(value) for key, value in split_sources.items()},
