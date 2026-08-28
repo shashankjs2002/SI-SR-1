@@ -115,6 +115,109 @@ def base_guard_loss(
     return F.relu(prediction_mse - base_mse + float(margin)).mean()
 
 
+def spatial_base_guard_loss(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    base: torch.Tensor,
+    margin: float = 0.0,
+    smoothing_window: int = 9,
+    mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Penalize local excess MSE that a sample-level guard can average away."""
+    if smoothing_window < 1 or smoothing_window % 2 == 0:
+        raise ValueError("smoothing_window must be a positive odd integer")
+    prediction_error = (prediction - target).square().mean(dim=1, keepdim=True)
+    with torch.no_grad():
+        base_error = (base - target).square().mean(dim=1, keepdim=True)
+    padding = smoothing_window // 2
+    prediction_error = F.avg_pool2d(
+        prediction_error,
+        smoothing_window,
+        stride=1,
+        padding=padding,
+    )
+    base_error = F.avg_pool2d(
+        base_error,
+        smoothing_window,
+        stride=1,
+        padding=padding,
+    )
+    excess = F.relu(prediction_error - base_error + float(margin))
+    return _masked_mean(excess, mask)
+
+
+def oracle_residual_trust(
+    candidate_residual: torch.Tensor,
+    base: torch.Tensor,
+    target: torch.Tensor,
+    maximum_scale: float = 1.0,
+    smoothing_window: int = 9,
+) -> torch.Tensor:
+    """Return the local least-squares gain for a proposed residual.
+
+    For each local window this solves ``argmin_a ||base + a*r - target||^2``
+    and clips the result to the permitted residual range.
+    """
+    if maximum_scale <= 0:
+        raise ValueError("maximum_scale must be positive")
+    if smoothing_window < 1 or smoothing_window % 2 == 0:
+        raise ValueError("smoothing_window must be a positive odd integer")
+    with torch.no_grad():
+        missing_detail = target - base
+        numerator = (candidate_residual * missing_detail).sum(
+            dim=1, keepdim=True
+        )
+        denominator = candidate_residual.square().sum(dim=1, keepdim=True)
+        if smoothing_window > 1:
+            padding = smoothing_window // 2
+            numerator = F.avg_pool2d(
+                numerator,
+                smoothing_window,
+                stride=1,
+                padding=padding,
+            )
+            denominator = F.avg_pool2d(
+                denominator,
+                smoothing_window,
+                stride=1,
+                padding=padding,
+            )
+        valid = denominator > 1e-10
+        trust = torch.where(
+            valid,
+            numerator / denominator.clamp_min(1e-10),
+            torch.zeros_like(numerator),
+        )
+        return trust.clamp(0, float(maximum_scale))
+
+
+def residual_trust_projection_loss(
+    trust_map: torch.Tensor,
+    candidate_residual: torch.Tensor,
+    base: torch.Tensor,
+    target: torch.Tensor,
+    maximum_scale: float = 1.0,
+    smoothing_window: int = 9,
+    mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Supervise spatial trust with the error-minimizing residual coefficient."""
+    target_trust = oracle_residual_trust(
+        candidate_residual,
+        base,
+        target,
+        maximum_scale=maximum_scale,
+        smoothing_window=smoothing_window,
+    )
+    trust_map = F.interpolate(
+        trust_map,
+        size=target_trust.shape[-2:],
+        mode="bilinear",
+        align_corners=False,
+    )
+    loss = F.smooth_l1_loss(trust_map, target_trust, reduction="none")
+    return _masked_mean(loss, mask)
+
+
 def residual_supervision_loss(
     residual: torch.Tensor,
     base: torch.Tensor,

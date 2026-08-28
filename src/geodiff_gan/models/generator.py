@@ -6,7 +6,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from .blocks import FiLMResidualBlock, ResidualBlock
+from .blocks import FiLMResidualBlock, ResidualBlock, high_pass
 
 
 class LREncoder(nn.Module):
@@ -72,6 +72,87 @@ class ResizeConvUpsample(nn.Module):
             antialias=True,
         )
         return self.convolution(x)
+
+
+class BaseReferencedTrustController(nn.Module):
+    """Predict a spatial gain for evidence-gated diffusion detail.
+
+    The final layer is initialized to a constant conservative gain. This makes
+    a newly enabled controller reproduce validation-calibrated residual scaling
+    before it learns where the stochastic residual actually improves the base.
+    """
+
+    def __init__(
+        self,
+        content_channels: int,
+        lr_channels: int,
+        hidden_channels: int = 32,
+        initial_scale: float = 0.25,
+        maximum_scale: float = 1.0,
+        blocks: int = 2,
+    ) -> None:
+        super().__init__()
+        if maximum_scale <= 0:
+            raise ValueError("maximum_scale must be positive")
+        if not 0 < initial_scale < maximum_scale:
+            raise ValueError(
+                "initial_scale must be strictly between zero and maximum_scale"
+            )
+        self.maximum_scale = float(maximum_scale)
+        input_channels = content_channels + lr_channels + 3
+        self.input = nn.Conv2d(input_channels, hidden_channels, 3, padding=1)
+        self.blocks = nn.Sequential(
+            *(ResidualBlock(hidden_channels) for _ in range(max(1, blocks)))
+        )
+        self.output = nn.Conv2d(hidden_channels, 1, 1)
+        probability = float(initial_scale) / self.maximum_scale
+        bias = torch.logit(torch.tensor(probability)).item()
+        nn.init.zeros_(self.output.weight)
+        nn.init.constant_(self.output.bias, bias)
+
+    def forward(
+        self,
+        content: torch.Tensor,
+        lr_feature: torch.Tensor,
+        evidence_confidence: torch.Tensor,
+        base: torch.Tensor,
+        candidate_residual: torch.Tensor,
+    ) -> torch.Tensor:
+        latent_size = content.shape[-2:]
+        lr_feature = F.interpolate(
+            lr_feature,
+            size=latent_size,
+            mode="bilinear",
+            align_corners=False,
+        )
+        evidence = F.interpolate(
+            evidence_confidence,
+            size=latent_size,
+            mode="bilinear",
+            align_corners=False,
+        )
+        residual_energy = F.interpolate(
+            candidate_residual.abs().mean(dim=1, keepdim=True),
+            size=latent_size,
+            mode="area",
+        )
+        base_detail = F.interpolate(
+            high_pass(base).abs().mean(dim=1, keepdim=True),
+            size=latent_size,
+            mode="area",
+        )
+        features = torch.cat(
+            (content, lr_feature, evidence, residual_energy, base_detail),
+            dim=1,
+        )
+        logits = self.output(self.blocks(F.silu(self.input(features))))
+        trust = self.maximum_scale * torch.sigmoid(logits)
+        return F.interpolate(
+            trust,
+            size=base.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )
 
 
 class GeoMapper(nn.Module):

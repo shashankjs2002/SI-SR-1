@@ -2,11 +2,21 @@ from __future__ import annotations
 
 import re
 import shutil
+import hashlib
 from pathlib import Path
 from typing import Any
 
 import torch
 from torch import nn
+
+
+def checkpoint_sha256(path: str | Path, chunk_size: int = 1024 * 1024) -> str:
+    """Hash a checkpoint so downstream runs can verify their parent lineage."""
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        while chunk := handle.read(chunk_size):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def unwrap(model: nn.Module) -> nn.Module:

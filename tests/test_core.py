@@ -35,14 +35,19 @@ from geodiff_gan.losses import (
     evidence_improvement_loss,
     mse_loss,
     multiscale_mse_loss,
+    oracle_residual_trust,
     radiometric_loss,
+    residual_trust_projection_loss,
     residual_supervision_loss,
 )
 from geodiff_gan.metrics import edge_f1
 from geodiff_gan.models.base import WindowTransformerBlock
 from geodiff_gan.models.blocks import CrossAttention2d, high_pass
 from geodiff_gan.models.degradation import back_project, random_degradation, sensor_degrade
-from geodiff_gan.models.generator import ResizeConvUpsample
+from geodiff_gan.models.generator import (
+    BaseReferencedTrustController,
+    ResizeConvUpsample,
+)
 from geodiff_gan.models.system import GeoDiffGAN
 from geodiff_gan.text import HashTextEncoder, PromptBatch, augment_prompts
 
@@ -94,6 +99,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(output.raw_detail_residual.shape, base.shape)
         self.assertEqual(output.raw_edit_residual.shape, base.shape)
         self.assertEqual(output.abstention_map.shape, (1, 1, 64, 64))
+        self.assertTrue(torch.equal(output.trust_map, torch.ones_like(output.trust_map)))
         self.assertFalse(output.metadata[0]["synthetic_edit"])
         edit = model.decode_latent(
             latent, lr, context, degradation, mode="edit", base=base, back_projection_steps=0
@@ -163,6 +169,99 @@ class CoreTests(unittest.TestCase):
                 back_projection_steps=0,
             )
         self.assertEqual(output.image.shape, (1, 3, 64, 64))
+
+    def test_base_referenced_trust_starts_at_conservative_scale(self) -> None:
+        controller = BaseReferencedTrustController(
+            content_channels=8,
+            lr_channels=6,
+            hidden_channels=4,
+            initial_scale=0.25,
+            maximum_scale=1.0,
+        ).eval()
+        trust = controller(
+            torch.rand(1, 8, 4, 4),
+            torch.rand(1, 6, 8, 8),
+            torch.rand(1, 1, 4, 4),
+            torch.rand(1, 3, 32, 32),
+            torch.rand(1, 3, 32, 32) - 0.5,
+        )
+        self.assertEqual(trust.shape, (1, 1, 32, 32))
+        self.assertTrue(torch.allclose(trust, torch.full_like(trust, 0.25)))
+
+    def test_oracle_trust_recovers_error_minimizing_residual_gain(self) -> None:
+        base = torch.zeros(1, 3, 16, 16)
+        residual = torch.ones_like(base)
+        target = torch.full_like(base, 0.4)
+        oracle = oracle_residual_trust(
+            residual,
+            base,
+            target,
+            maximum_scale=1.0,
+            smoothing_window=5,
+        )
+        self.assertTrue(torch.allclose(oracle, torch.full_like(oracle, 0.4)))
+        loss = residual_trust_projection_loss(
+            oracle,
+            residual,
+            base,
+            target,
+            maximum_scale=1.0,
+            smoothing_window=5,
+        )
+        self.assertLess(float(loss), 1e-8)
+
+    def test_fidelity_base_and_trust_model_preserve_geometry(self) -> None:
+        config = load_config(
+            ROOT / "configs/smoke.yaml",
+            ROOT / "configs/default.yaml",
+        )
+        config["model"].update(
+            {
+                "base_architecture": "fidelity_swinir",
+                "base_embed_dim": 12,
+                "base_depth": 4,
+                "base_heads": 3,
+                "base_group_size": 2,
+                "base_upsample_mode": "resize_conv",
+                "use_base_referenced_trust": True,
+                "trust_channels": 8,
+                "trust_initial_scale": 0.25,
+            }
+        )
+        model = GeoDiffGAN.from_config(config).eval()
+        lr = torch.rand(1, 3, 16, 16)
+        context = HashTextEncoder(32, 8)([""])
+        base = model.predict_base(lr)
+        bicubic = torch.nn.functional.interpolate(
+            lr,
+            scale_factor=4,
+            mode="bicubic",
+            align_corners=False,
+        ).clamp(0, 1)
+        self.assertTrue(torch.allclose(base, bicubic, atol=1e-6))
+        latent = torch.rand(1, 4, 8, 8)
+        output = model.decode_latent(
+            latent,
+            lr,
+            context,
+            torch.rand(1, 4),
+            mode="sr",
+            base=base,
+            back_projection_steps=0,
+        )
+        self.assertEqual(output.image.shape, (1, 3, 64, 64))
+        self.assertTrue(torch.allclose(output.trust_map, torch.full_like(output.trust_map, 0.25)))
+        self.assertTrue(output.metadata[0]["base_referenced_trust"])
+
+    def test_oli2msi_publication_variant_has_no_pixelshuffle(self) -> None:
+        config = load_config(ROOT / "configs/oli2msi_fidelity_trust_3x.yaml")
+        model = GeoDiffGAN.from_config(config)
+        pixel_shuffle_modules = [
+            module
+            for module in model.modules()
+            if isinstance(module, torch.nn.PixelShuffle)
+        ]
+        self.assertEqual(pixel_shuffle_modules, [])
 
     def test_evaluation_device_resolution(self) -> None:
         self.assertEqual(_resolve_device("cpu"), torch.device("cpu"))

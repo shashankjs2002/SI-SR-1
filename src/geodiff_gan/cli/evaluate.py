@@ -309,6 +309,9 @@ def main() -> None:
         edit_permission = torch.stack(
             [output.edit_permission for output in outputs]
         ).float().mean(dim=0)
+        trust_map = torch.stack(
+            [output.trust_map for output in outputs]
+        ).float().mean(dim=0)
         if args.mode == "sr":
             mean, combined_confidence, abstention = (
                 model.apply_uncertainty_abstention(
@@ -316,6 +319,7 @@ def main() -> None:
                     outputs[0].base,
                     evidence,
                     uncertainty,
+                    trust_map=trust_map,
                 )
             )
         else:
@@ -421,6 +425,7 @@ def main() -> None:
             raw_mean=raw_mean[0].detach().cpu().numpy(),
             variance=uncertainty[0].detach().cpu().numpy(),
             evidence_confidence=evidence[0].detach().cpu().numpy(),
+            trust_map=trust_map[0].detach().cpu().numpy(),
             edit_permission=edit_permission[0].detach().cpu().numpy(),
             abstention_map=abstention[0].detach().cpu().numpy(),
             valid_mask=valid_mask[0].detach().cpu().numpy(),

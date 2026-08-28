@@ -1,0 +1,135 @@
+seed: 42
+
+model:
+  scale: 3
+  input_channels: 3
+  output_channels: 3
+  base_architecture: fidelity_swinir
+  base_embed_dim: 72
+  base_depth: 12
+  base_heads: 6
+  base_group_size: 4
+  base_radiometric_calibration: true
+  window_size: 8
+  base_upsample_mode: resize_conv
+  latent_channels: 4
+  vae_channels: 32
+  vae_upsample_mode: resize_conv
+  lr_channels: 32
+  diffusion_widths: [64, 128, 192, 256]
+  diffusion_upsample_mode: resize_conv
+  context_dim: 768
+  degradation_dim: 4
+  mapper_channels: 64
+  style_dim: 128
+  decoder_channels: [64, 48, 32, 24]
+  decoder_upsample_mode: resize_conv
+  diffusion_steps: 1000
+  use_text_conditioning: false
+  use_degradation_conditioning: false
+  use_evidence_gate: true
+  use_edit_gate: true
+  use_uncertainty_abstention: true
+  use_base_referenced_trust: true
+  trust_channels: 32
+  trust_blocks: 2
+  trust_initial_scale: 0.25
+  trust_maximum_scale: 1.0
+  abstention_confidence_floor: 0.0
+  uncertainty_scale: 0.0025
+  use_back_projection: true
+
+data:
+  manifest: data/oli2msi_manifest.jsonl
+  captions: null
+  input_mode: paired
+  target_key: hr
+  condition_key: null
+  train_degradation_sampling: fixed
+  degradation_seed: 42
+  degradation_severity: mild
+
+training:
+  stage: base
+  epochs: 40
+  batch_size: 1
+  gradient_accumulation: 8
+  learning_rate: 0.0002
+  discriminator_learning_rate: 0.00005
+  weight_decay: 0.0001
+  num_workers: 4
+  amp: true
+  gradient_checkpointing: true
+  gradient_clip: 1.0
+  auto_resume: false
+  enforce_init_checkpoint_lineage: true
+  progress_mode: compact
+  progress_updates_per_epoch: 2
+  validate_every: 1
+  validation_limit: 100
+  keep_best_and_latest: true
+  checkpoint_metric: val_psnr
+  checkpoint_mode: max
+  early_stopping_metric: val_psnr
+  early_stopping_mode: max
+  early_stopping_patience: 8
+  early_stopping_min_epochs: 12
+  early_stopping_min_delta: 0.002
+  train_back_projection_steps: 0
+  validation_sample_steps: 20
+  validation_samples: 1
+  validation_fixed_seed: true
+  validation_back_projection_steps: 0
+  base_guard_margin: 0.0
+  spatial_base_guard_margin: 0.0
+  trust_smoothing_window: 9
+  joint_max_timestep_fraction: 0.35
+  evidence_calibration_temperature: 0.02
+  evidence_improvement_temperature: 0.0001
+  evidence_selectivity_weight: 0.02
+  lr_scheduler_metric: val_psnr
+  lr_scheduler_mode: max
+  lr_scheduler_factor: 0.5
+  lr_scheduler_patience: 3
+  lr_scheduler_threshold: 0.0001
+  lr_scheduler_min_lr: 0.0000001
+  discriminator_channels: 32
+  output_dir: runs/oli2msi_fidelity_trust_3x/base
+  init_checkpoint: null
+  resume: null
+  loss_weights:
+    charbonnier: 0.5
+    mse: 200.0
+    multiscale_mse: 20.0
+    consistency: 0.0
+    ssim: 0.1
+    gradient: 0.01
+    perceptual: 0.0
+    wavelet: 0.005
+    radiometric: 0.05
+    residual_supervision: 0.25
+    base_guard: 200.0
+    spatial_base_guard: 100.0
+    trust_projection: 0.1
+    kl: 0.0001
+    vae_reconstruction: 1.0
+    diffusion: 0.25
+    evidence_calibration: 0.02
+    evidence_improvement: 0.1
+    edit_localization: 0.0
+    edit_permission: 0.0
+    prompt_alignment: 0.0
+    adversarial: 0.0
+
+debug:
+  enabled: false
+  output_dir: runs/oli2msi_fidelity_trust_3x/debug
+  every_n_steps: 500
+  max_exports_per_epoch: 2
+  print_tensor_stats: true
+  fail_on_nonfinite: true
+  panel_size: 320
+  histogram_bins: 64
+  max_feature_channels: 16
+  save_tensors: false
+  max_saved_tensors: 32

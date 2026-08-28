@@ -135,8 +135,14 @@ class ConditionalDiffusionUNet(nn.Module):
         degradation_dim: int = 4,
         lr_condition_channels: int = 64,
         attention_levels: tuple[int, ...] = (1, 2),
+        upsample_mode: str = "pixelshuffle",
     ) -> None:
         super().__init__()
+        if upsample_mode not in ("pixelshuffle", "resize_conv"):
+            raise ValueError(
+                "diffusion upsample_mode must be 'pixelshuffle' or 'resize_conv'"
+            )
+        self.upsample_mode = upsample_mode
         condition_dim = widths[0] * 4
         self.time = nn.Sequential(
             SinusoidalEmbedding(widths[0]),
@@ -175,12 +181,17 @@ class ConditionalDiffusionUNet(nn.Module):
         self.upsamples = nn.ModuleList()
         self.up_levels = nn.ModuleList()
         for index in reversed(range(len(widths) - 1)):
-            self.upsamples.append(
-                nn.Sequential(
+            if upsample_mode == "pixelshuffle":
+                upsample = nn.Sequential(
                     nn.Conv2d(current, widths[index] * 4, 3, padding=1),
                     nn.PixelShuffle(2),
                 )
-            )
+            else:
+                upsample = nn.Sequential(
+                    nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+                    nn.Conv2d(current, widths[index], 3, padding=1),
+                )
+            self.upsamples.append(upsample)
             current = widths[index]
             self.up_levels.append(
                 _UNetLevel(

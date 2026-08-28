@@ -136,7 +136,7 @@ class ParameterAuditTest(unittest.TestCase):
         )
         self.assertEqual(
             report["training_stages"]["edit"]["trainable_modules"],
-            ["diffusion", "mapper", "decoder"],
+            ["diffusion", "mapper", "decoder", "trust_controller"],
         )
         self.assertEqual(
             report["training_configuration"]["optimizer_updates_per_epoch"],

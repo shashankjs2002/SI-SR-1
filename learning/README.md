@@ -125,3 +125,6 @@ flowchart TD
 ## Starting Point
 
 Begin with [00: Course Map](00_course_map.md).
+
+The latest OLI2MSI model revision is explained in
+[43: OLI2MSI Fidelity-Trust Experiment](43_oli2msi_fidelity_trust_experiment.md).

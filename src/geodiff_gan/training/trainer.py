@@ -36,12 +36,13 @@ from ..losses import (
     mse_loss,
     multiscale_mse_loss,
     radiometric_loss,
+    residual_trust_projection_loss,
     residual_supervision_loss,
     snr_weighted_velocity_loss,
+    spatial_base_guard_loss,
     ssim,
     wavelet_loss,
 )
-from ..models.blocks import high_pass
 from ..models.degradation import sensor_degrade
 from ..models.discriminators import MultiScaleDiscriminator, WaveletDiscriminator
 from ..models.system import GeoDiffGAN
@@ -49,6 +50,7 @@ from ..metrics import basic_metrics
 from ..text import PromptBatch, TextEncoder, augment_prompts, build_text_encoder
 from .checkpoint import (
     best_stage_checkpoint,
+    checkpoint_sha256,
     copy_checkpoint,
     latest_stage_checkpoint,
     load_checkpoint,
@@ -95,6 +97,10 @@ class Trainer:
                 training["resume"] = str(resume)
         self.model = GeoDiffGAN.from_config(config).to(self.device)
         init_checkpoint = training.get("init_checkpoint")
+        self.init_checkpoint = init_checkpoint
+        self.parent_checkpoint_sha256 = (
+            checkpoint_sha256(init_checkpoint) if init_checkpoint else None
+        )
         if init_checkpoint and not resume:
             load_checkpoint(init_checkpoint, self.model, strict=False)
         self.text_encoder: TextEncoder | None = None
@@ -178,6 +184,21 @@ class Trainer:
             self.start_epoch = int(payload["epoch"]) + 1
             extra = payload.get("extra", {})
             self.resume_extra = extra
+            if (
+                bool(training.get("enforce_init_checkpoint_lineage", False))
+                and self.parent_checkpoint_sha256 is not None
+            ):
+                stored_parent = extra.get("parent_checkpoint_sha256")
+                if stored_parent is None:
+                    raise RuntimeError(
+                        "Resume checkpoint has no parent lineage fingerprint. "
+                        "Use a fresh output directory for this downstream stage."
+                    )
+                if stored_parent != self.parent_checkpoint_sha256:
+                    raise RuntimeError(
+                        "Resume checkpoint was initialized from a different parent. "
+                        "Use a new stage output directory; do not mix checkpoint lineages."
+                    )
             if "patch_discriminator" in extra:
                 unwrap(self.patch_discriminator).load_state_dict(extra["patch_discriminator"])
             if "wavelet_discriminator" in extra:
@@ -513,15 +534,17 @@ class Trainer:
             mode_values = model.mode_tensor("sr", hr.shape[0], hr.device)
             mapped = model.mapper(latent, lr_features[1], context, mode_values)
             decoded = model.decoder(mapped, lr_features)
-            detail = high_pass(decoded.detail_residual)
-            evidence = model._resize_policy(
-                mapped.evidence_confidence, base.shape[-2:]
+            fusion = model.fuse_sr_detail(
+                decoded.detail_residual,
+                mapped,
+                lr_features,
+                base,
             )
-            detail = detail * model._effective_confidence(evidence)
+            detail = fusion["residual"]
             prediction = (base + detail).clamp(0, 1)
-            ungated_prediction = (base + high_pass(decoded.detail_residual)).clamp(
-                0, 1
-            )
+            ungated_prediction = (
+                base + fusion["detail_residual"]
+            ).clamp(0, 1)
             if diagnostics is not None:
                 diagnostics.capture("vae.latent", latent, visual="features")
                 diagnostics.capture("vae.mean", mean, visual="features")
@@ -551,6 +574,11 @@ class Trainer:
                     visual="residual",
                 )
                 diagnostics.capture("decoder.residual", detail, visual="residual")
+                diagnostics.capture(
+                    "mapper.base_referenced_trust",
+                    fusion["trust_map"],
+                    visual="heatmap",
+                )
                 diagnostics.capture("output.hr", prediction, visual="rgb")
             losses["vae_reconstruction"] = charbonnier(
                 reconstruction,
@@ -570,7 +598,14 @@ class Trainer:
                 prediction, hr, mask=valid_mask
             )
             losses["residual_supervision"] = residual_supervision_loss(
-                detail, base, hr, mask=valid_mask
+                (
+                    fusion["evidence_residual"]
+                    if model.use_base_referenced_trust
+                    else detail
+                ),
+                base,
+                hr,
+                mask=valid_mask,
             )
             losses["base_guard"] = base_guard_loss(
                 prediction,
@@ -580,6 +615,41 @@ class Trainer:
                     self.config["training"].get("base_guard_margin", 0.0)
                 ),
                 mask=valid_mask,
+            )
+            fidelity_weights = self.config["training"].get("loss_weights", {})
+            losses["spatial_base_guard"] = (
+                spatial_base_guard_loss(
+                    prediction,
+                    hr,
+                    base,
+                    margin=float(
+                        self.config["training"].get(
+                            "spatial_base_guard_margin", 0.0
+                        )
+                    ),
+                    smoothing_window=int(
+                        self.config["training"].get("trust_smoothing_window", 9)
+                    ),
+                    mask=valid_mask,
+                )
+                if float(fidelity_weights.get("spatial_base_guard", 0.0)) > 0
+                else prediction.new_zeros(())
+            )
+            losses["trust_projection"] = (
+                residual_trust_projection_loss(
+                    fusion["trust_map"],
+                    fusion["evidence_residual"],
+                    base,
+                    hr,
+                    maximum_scale=model.trust_maximum_scale,
+                    smoothing_window=int(
+                        self.config["training"].get("trust_smoothing_window", 9)
+                    ),
+                    mask=valid_mask,
+                )
+                if model.use_base_referenced_trust
+                and float(fidelity_weights.get("trust_projection", 0.0)) > 0
+                else prediction.new_zeros(())
             )
             losses["evidence_calibration"] = evidence_calibration_loss(
                 mapped.evidence_confidence,
@@ -614,7 +684,34 @@ class Trainer:
 
         with torch.no_grad():
             latent, _, _ = model.vae.encode(target_residual, sample=False)
-        diffusion_batch = model.prepare_diffusion_batch(latent)
+        diffusion_timesteps = None
+        if self.stage in ("joint", "edit"):
+            maximum_fraction = float(
+                self.config["training"].get(
+                    "joint_max_timestep_fraction", 1.0
+                )
+            )
+            if not 0 < maximum_fraction <= 1:
+                raise ValueError(
+                    "training.joint_max_timestep_fraction must be in (0, 1]"
+                )
+            maximum_timestep = max(
+                1,
+                min(
+                    model.scheduler.steps,
+                    int(round(model.scheduler.steps * maximum_fraction)),
+                ),
+            )
+            diffusion_timesteps = torch.randint(
+                0,
+                maximum_timestep,
+                (latent.shape[0],),
+                device=latent.device,
+            )
+        diffusion_batch = model.prepare_diffusion_batch(
+            latent,
+            timesteps=diffusion_timesteps,
+        )
         mode = "edit" if self.stage == "edit" else "sr"
         velocity = model.predict_velocity(
             diffusion_batch.noisy,
@@ -740,7 +837,11 @@ class Trainer:
                 mask=reconstruction_valid,
             )
             losses["residual_supervision"] = residual_supervision_loss(
-                output.residual[reconstruction_samples],
+                (
+                    output.evidence_residual[reconstruction_samples]
+                    if model.use_base_referenced_trust
+                    else output.residual[reconstruction_samples]
+                ),
                 base[reconstruction_samples],
                 reconstruction_target,
                 mask=reconstruction_valid,
@@ -754,6 +855,41 @@ class Trainer:
                 ),
                 mask=reconstruction_valid,
             )
+            fidelity_weights = self.config["training"].get("loss_weights", {})
+            losses["spatial_base_guard"] = (
+                spatial_base_guard_loss(
+                    reconstruction,
+                    reconstruction_target,
+                    base[reconstruction_samples],
+                    margin=float(
+                        self.config["training"].get(
+                            "spatial_base_guard_margin", 0.0
+                        )
+                    ),
+                    smoothing_window=int(
+                        self.config["training"].get("trust_smoothing_window", 9)
+                    ),
+                    mask=reconstruction_valid,
+                )
+                if float(fidelity_weights.get("spatial_base_guard", 0.0)) > 0
+                else reconstruction.new_zeros(())
+            )
+            losses["trust_projection"] = (
+                residual_trust_projection_loss(
+                    output.trust_map[reconstruction_samples],
+                    output.evidence_residual[reconstruction_samples],
+                    base[reconstruction_samples],
+                    reconstruction_target,
+                    maximum_scale=model.trust_maximum_scale,
+                    smoothing_window=int(
+                        self.config["training"].get("trust_smoothing_window", 9)
+                    ),
+                    mask=reconstruction_valid,
+                )
+                if model.use_base_referenced_trust
+                and float(fidelity_weights.get("trust_projection", 0.0)) > 0
+                else reconstruction.new_zeros(())
+            )
         else:
             zero = prediction.new_zeros(())
             losses["charbonnier"] = zero
@@ -766,6 +902,8 @@ class Trainer:
             losses["radiometric"] = zero
             losses["residual_supervision"] = zero
             losses["base_guard"] = zero
+            losses["spatial_base_guard"] = zero
+            losses["trust_projection"] = zero
         losses["consistency"] = degradation_consistency(
             prediction,
             consistency_lr,
@@ -851,7 +989,9 @@ class Trainer:
         if self.text_encoder is not None:
             self.text_encoder.eval()
         totals: defaultdict[str, float] = defaultdict(float)
-        seed = int(self.config.get("seed", 42)) + 10_000 + epoch
+        seed = int(self.config.get("seed", 42)) + 10_000
+        if not bool(training.get("validation_fixed_seed", False)):
+            seed += epoch
         cuda_devices = (
             [self.device.index or 0] if self.device.type == "cuda" else []
         )
@@ -949,8 +1089,15 @@ class Trainer:
                                     for output in sampled_outputs
                                 ]
                             ).mean(dim=0)
+                            trust = torch.stack(
+                                [output.trust_map for output in sampled_outputs]
+                            ).mean(dim=0)
                             prediction, _, _ = model.apply_uncertainty_abstention(
-                                prediction, base, evidence, uncertainty
+                                prediction,
+                                base,
+                                evidence,
+                                uncertainty,
+                                trust_map=trust,
                             )
                 for name, value in losses.items():
                     totals[f"loss_{name}"] += float(value.detach())
@@ -1070,6 +1217,8 @@ class Trainer:
             "radiometric": 0.0,
             "residual_supervision": 0.0,
             "base_guard": 0.0,
+            "spatial_base_guard": 0.0,
+            "trust_projection": 0.0,
             "edit_localization": 0.05,
             "edit_permission": 0.05,
             "prompt_alignment": 0.05,
@@ -1161,6 +1310,7 @@ class Trainer:
         best_checkpoint_path = output_dir / f"{self.stage}_best.pt"
         best_checkpoint_value: float | None = None
         best_checkpoint_metric: str | None = None
+        checkpoint_selection_mode = checkpoint_mode
         existing_best = best_stage_checkpoint(output_dir, self.stage)
         if existing_best is not None:
             best_payload = torch.load(
@@ -1173,10 +1323,11 @@ class Trainer:
                 {},
             )
             if (
-                selection.get("mode") == checkpoint_mode
+                selection.get("mode") in ("min", "max")
                 and selection.get("value") is not None
             ):
                 best_checkpoint_metric = str(selection["metric"])
+                checkpoint_selection_mode = str(selection["mode"])
                 best_checkpoint_value = float(selection["value"])
         early_stopping_patience = max(
             0,
@@ -1200,12 +1351,15 @@ class Trainer:
             raise ValueError(
                 "training.early_stopping_mode must be 'min' or 'max'"
             )
+        active_early_stopping_metric = early_stopping_metric
+        active_early_stopping_mode = early_stopping_mode
         resumed_early_state = self.resume_extra.get("early_stopping", {})
         if (
-            resumed_early_state.get("mode") == early_stopping_mode
+            resumed_early_state.get("mode") in ("min", "max")
             and resumed_early_state.get("best_value") is not None
         ):
-            early_stopping_metric = str(resumed_early_state["metric"])
+            active_early_stopping_metric = str(resumed_early_state["metric"])
+            active_early_stopping_mode = str(resumed_early_state["mode"])
             early_best_value = float(resumed_early_state["best_value"])
         else:
             early_best_value = None
@@ -1464,31 +1618,38 @@ class Trainer:
                 epoch_metrics.update(validation_metrics)
                 checkpoint_path = output_dir / f"{self.stage}_epoch_{epoch:04d}.pt"
                 selection_metric = checkpoint_metric
+                selection_mode = checkpoint_mode
                 selection_value = epoch_metrics.get(selection_metric)
                 if selection_value is None:
                     if "val_loss_total" in epoch_metrics:
                         selection_metric = "val_loss_total"
+                        selection_mode = "min"
                         selection_value = epoch_metrics[selection_metric]
                     elif len(validation_loader.dataset) == 0:
                         selection_metric = "total"
+                        selection_mode = "min"
                         selection_value = epoch_metrics.get(selection_metric)
                 if (
                     selection_value is not None
-                    and best_checkpoint_metric != selection_metric
+                    and (
+                        best_checkpoint_metric != selection_metric
+                        or checkpoint_selection_mode != selection_mode
+                    )
                 ):
                     best_checkpoint_metric = selection_metric
+                    checkpoint_selection_mode = selection_mode
                     best_checkpoint_value = None
                 is_best = (
                     selection_value is not None
                     and self._checkpoint_improved(
                         float(selection_value),
                         best_checkpoint_value,
-                        checkpoint_mode,
+                        selection_mode,
                     )
                 )
                 checkpoint_selection = {
                     "metric": selection_metric,
-                    "mode": checkpoint_mode,
+                    "mode": selection_mode,
                     "value": (
                         float(selection_value)
                         if selection_value is not None
@@ -1496,27 +1657,34 @@ class Trainer:
                     ),
                     "is_best": is_best,
                 }
-                early_metric_used = early_stopping_metric
+                early_metric_used = active_early_stopping_metric
+                early_mode_used = active_early_stopping_mode
                 early_value = epoch_metrics.get(early_metric_used)
                 if early_value is None:
                     if "val_loss_total" in epoch_metrics:
                         early_metric_used = "val_loss_total"
+                        early_mode_used = "min"
                         early_value = epoch_metrics[early_metric_used]
                     elif len(validation_loader.dataset) == 0:
                         early_metric_used = "total"
+                        early_mode_used = "min"
                         early_value = epoch_metrics.get(early_metric_used)
                 if (
                     early_value is not None
-                    and early_metric_used != early_stopping_metric
+                    and (
+                        early_metric_used != active_early_stopping_metric
+                        or early_mode_used != active_early_stopping_mode
+                    )
                 ):
-                    early_stopping_metric = early_metric_used
+                    active_early_stopping_metric = early_metric_used
+                    active_early_stopping_mode = early_mode_used
                     early_best_value = None
                     early_bad_epochs = 0
                 if early_value is not None:
                     early_value = float(early_value)
                     if early_best_value is None:
                         early_improved = True
-                    elif early_stopping_mode == "min":
+                    elif early_mode_used == "min":
                         early_improved = (
                             early_value
                             < early_best_value - early_stopping_min_delta
@@ -1537,8 +1705,8 @@ class Trainer:
                         and early_bad_epochs >= early_stopping_patience
                     )
                 early_stopping_state = {
-                    "metric": early_stopping_metric,
-                    "mode": early_stopping_mode,
+                    "metric": early_metric_used,
+                    "mode": early_mode_used,
                     "best_value": early_best_value,
                     "bad_epochs": early_bad_epochs,
                     "patience": early_stopping_patience,
@@ -1582,6 +1750,12 @@ class Trainer:
                             if self.lr_scheduler is not None
                             else None
                         ),
+                        "parent_checkpoint": (
+                            str(self.init_checkpoint)
+                            if self.init_checkpoint
+                            else None
+                        ),
+                        "parent_checkpoint_sha256": self.parent_checkpoint_sha256,
                     },
                 )
                 if keep_best_and_latest:
@@ -1638,7 +1812,7 @@ class Trainer:
                 if stop_training:
                     print(
                         f"[{self.stage}] early stopping after epoch {epoch + 1}: "
-                        f"{early_stopping_metric} did not improve by "
+                        f"{early_metric_used} did not improve by "
                         f"{early_stopping_min_delta:g} for "
                         f"{early_bad_epochs} validation checks",
                         flush=True,

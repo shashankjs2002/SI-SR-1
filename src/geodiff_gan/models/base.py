@@ -105,6 +105,132 @@ class ResizeConvUpsampler(nn.Module):
         return self.convolution(value)
 
 
+class ResidualSwinGroup(nn.Module):
+    """A residual group of shifted-window transformer blocks."""
+
+    def __init__(
+        self,
+        channels: int,
+        depth: int,
+        window_size: int,
+        heads: int,
+        start_index: int = 0,
+    ) -> None:
+        super().__init__()
+        self.blocks = nn.ModuleList(
+            WindowTransformerBlock(
+                channels,
+                window_size=window_size,
+                heads=heads,
+                shift=bool((start_index + index) % 2),
+            )
+            for index in range(depth)
+        )
+        self.projection = nn.Conv2d(channels, channels, 3, padding=1)
+
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        residual = value
+        for block in self.blocks:
+            value = block(value)
+        return residual + self.projection(value)
+
+
+class FidelitySwinIRBase(nn.Module):
+    """Higher-capacity Swin reconstruction anchor for paired cross-sensor SR.
+
+    The nested residual groups preserve a short optimization path, while the
+    zero-initialized radiometric head can learn a scene-level RGB correction
+    without changing the bicubic anchor at initialization. Upsampling always
+    uses resize-convolution to avoid sub-pixel phase artifacts.
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 3,
+        embed_dim: int = 72,
+        depth: int = 12,
+        group_size: int = 4,
+        window_size: int = 8,
+        heads: int = 6,
+        scale: int = 3,
+        output_channels: int = 3,
+        radiometric_calibration: bool = True,
+    ) -> None:
+        super().__init__()
+        if scale < 2:
+            raise ValueError("scale must be an integer of at least 2")
+        if in_channels < output_channels:
+            raise ValueError("in_channels must be >= output_channels")
+        if depth < 1 or group_size < 1:
+            raise ValueError("depth and group_size must be positive")
+        self.scale = scale
+        self.output_channels = output_channels
+        self.upsample_mode = "resize_conv"
+        self.radiometric_calibration = radiometric_calibration
+        self.shallow = nn.Conv2d(in_channels, embed_dim, 3, padding=1)
+
+        groups: list[nn.Module] = []
+        consumed = 0
+        while consumed < depth:
+            group_depth = min(group_size, depth - consumed)
+            groups.append(
+                ResidualSwinGroup(
+                    embed_dim,
+                    depth=group_depth,
+                    window_size=window_size,
+                    heads=heads,
+                    start_index=consumed,
+                )
+            )
+            consumed += group_depth
+        self.groups = nn.ModuleList(groups)
+        self.body = nn.Sequential(
+            LayerNorm2d(embed_dim),
+            nn.Conv2d(embed_dim, embed_dim, 3, padding=1),
+        )
+        self.upsample = nn.Sequential(
+            ResizeConvUpsampler(embed_dim, scale),
+            nn.LeakyReLU(0.1, inplace=True),
+            nn.Conv2d(embed_dim, embed_dim, 3, padding=1),
+            nn.LeakyReLU(0.1, inplace=True),
+        )
+        self.output = nn.Conv2d(embed_dim, output_channels, 3, padding=1)
+        nn.init.zeros_(self.output.weight)
+        nn.init.zeros_(self.output.bias)
+        self.radiometric_head = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(embed_dim, embed_dim),
+            nn.GELU(),
+            nn.Linear(embed_dim, output_channels * 2),
+        )
+        nn.init.zeros_(self.radiometric_head[-1].weight)
+        nn.init.zeros_(self.radiometric_head[-1].bias)
+
+    def forward(self, lr: torch.Tensor) -> torch.Tensor:
+        shallow = self.shallow(lr)
+        features = shallow
+        for group in self.groups:
+            features = group(features)
+        features = shallow + self.body(features)
+
+        anchor = F.interpolate(
+            lr[:, : self.output_channels],
+            scale_factor=self.scale,
+            mode="bicubic",
+            align_corners=False,
+        )
+        if self.radiometric_calibration:
+            calibration = self.radiometric_head(shallow)
+            gain, bias = calibration.chunk(2, dim=1)
+            gain = 1 + 0.1 * torch.tanh(gain)[:, :, None, None]
+            bias = 0.1 * torch.tanh(bias)[:, :, None, None]
+            anchor = anchor * gain + bias
+
+        detail = self.output(self.upsample(features))
+        return (anchor + detail).clamp(0, 1)
+
+
 class SwinIRBase(nn.Module):
     """Compact SwinIR-style conservative integer-scale reconstruction branch."""
 

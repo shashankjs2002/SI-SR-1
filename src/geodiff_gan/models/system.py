@@ -6,11 +6,17 @@ from typing import TYPE_CHECKING, Any, Literal
 import torch
 from torch import nn
 
-from .base import SwinIRBase
+from .base import FidelitySwinIRBase, SwinIRBase
 from .blocks import high_pass
 from .degradation import back_project, default_degradation, sensor_degrade
 from .diffusion import ConditionalDiffusionUNet, DiffusionBatch, DiffusionScheduler
-from .generator import GeoMapper, LREncoder, ResidualSRDecoder
+from .generator import (
+    BaseReferencedTrustController,
+    GeoMapper,
+    LREncoder,
+    MapperOutput,
+    ResidualSRDecoder,
+)
 from .vae import ResidualVAE
 
 if TYPE_CHECKING:
@@ -30,7 +36,10 @@ class GeoDiffOutput:
     abstention_map: torch.Tensor
     raw_detail_residual: torch.Tensor
     raw_edit_residual: torch.Tensor
+    evidence_residual: torch.Tensor
+    trust_map: torch.Tensor
     ungated_sr: torch.Tensor
+    pretrust_sr: torch.Tensor
     sr_anchor: torch.Tensor
     metadata: list[dict[str, Any]]
 
@@ -52,10 +61,15 @@ class GeoDiffGAN(nn.Module):
         base_heads: int = 6,
         window_size: int = 8,
         base_upsample_mode: str = "pixelshuffle",
+        base_architecture: str = "swinir",
+        base_group_size: int = 4,
+        base_radiometric_calibration: bool = True,
         latent_channels: int = 4,
         vae_channels: int = 64,
+        vae_upsample_mode: str = "pixelshuffle",
         lr_channels: int = 64,
         diffusion_widths: tuple[int, ...] = (128, 256, 384, 512),
+        diffusion_upsample_mode: str = "pixelshuffle",
         context_dim: int = 768,
         degradation_dim: int = 4,
         mapper_channels: int = 128,
@@ -68,6 +82,11 @@ class GeoDiffGAN(nn.Module):
         use_evidence_gate: bool = True,
         use_edit_gate: bool = True,
         use_uncertainty_abstention: bool = True,
+        use_base_referenced_trust: bool = False,
+        trust_channels: int = 32,
+        trust_blocks: int = 2,
+        trust_initial_scale: float = 0.25,
+        trust_maximum_scale: float = 1.0,
         abstention_confidence_floor: float = 0.0,
         uncertainty_scale: float = 0.0025,
         use_back_projection: bool = True,
@@ -97,17 +116,43 @@ class GeoDiffGAN(nn.Module):
         self.uncertainty_scale = float(uncertainty_scale)
         self.use_back_projection = use_back_projection
         self.degradation_severity = degradation_severity
-        self.base = SwinIRBase(
-            in_channels=self.base_input_channels,
-            embed_dim=base_embed_dim,
-            depth=base_depth,
-            heads=base_heads,
-            window_size=window_size,
-            scale=scale,
-            output_channels=output_channels,
-            upsample_mode=base_upsample_mode,
+        if base_architecture == "swinir":
+            self.base = SwinIRBase(
+                in_channels=self.base_input_channels,
+                embed_dim=base_embed_dim,
+                depth=base_depth,
+                heads=base_heads,
+                window_size=window_size,
+                scale=scale,
+                output_channels=output_channels,
+                upsample_mode=base_upsample_mode,
+            )
+        elif base_architecture == "fidelity_swinir":
+            if base_upsample_mode != "resize_conv":
+                raise ValueError(
+                    "fidelity_swinir requires base_upsample_mode='resize_conv'"
+                )
+            self.base = FidelitySwinIRBase(
+                in_channels=self.base_input_channels,
+                embed_dim=base_embed_dim,
+                depth=base_depth,
+                group_size=base_group_size,
+                heads=base_heads,
+                window_size=window_size,
+                scale=scale,
+                output_channels=output_channels,
+                radiometric_calibration=base_radiometric_calibration,
+            )
+        else:
+            raise ValueError(
+                "base_architecture must be 'swinir' or 'fidelity_swinir'"
+            )
+        self.base_architecture = base_architecture
+        self.vae = ResidualVAE(
+            latent_channels=latent_channels,
+            base_channels=vae_channels,
+            upsample_mode=vae_upsample_mode,
         )
-        self.vae = ResidualVAE(latent_channels=latent_channels, base_channels=vae_channels)
         self.lr_encoder = LREncoder(in_channels=input_channels, channels=lr_channels)
         self.diffusion = ConditionalDiffusionUNet(
             latent_channels=latent_channels,
@@ -115,6 +160,7 @@ class GeoDiffGAN(nn.Module):
             context_dim=context_dim,
             degradation_dim=degradation_dim,
             lr_condition_channels=lr_channels * 2,
+            upsample_mode=diffusion_upsample_mode,
         )
         self.scheduler = DiffusionScheduler(diffusion_steps)
         self.mapper = GeoMapper(
@@ -133,6 +179,20 @@ class GeoDiffGAN(nn.Module):
             stage_channels=decoder_channels,
             upsample_mode=decoder_upsample_mode,
         )
+        self.use_base_referenced_trust = use_base_referenced_trust
+        self.trust_maximum_scale = float(trust_maximum_scale)
+        self.trust_controller = (
+            BaseReferencedTrustController(
+                content_channels=mapper_channels,
+                lr_channels=lr_channels * 2,
+                hidden_channels=trust_channels,
+                initial_scale=trust_initial_scale,
+                maximum_scale=trust_maximum_scale,
+                blocks=trust_blocks,
+            )
+            if use_base_referenced_trust
+            else nn.Identity()
+        )
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "GeoDiffGAN":
@@ -147,10 +207,19 @@ class GeoDiffGAN(nn.Module):
             base_heads=model.get("base_heads", 6),
             window_size=model.get("window_size", 8),
             base_upsample_mode=model.get("base_upsample_mode", "pixelshuffle"),
+            base_architecture=model.get("base_architecture", "swinir"),
+            base_group_size=model.get("base_group_size", 4),
+            base_radiometric_calibration=model.get(
+                "base_radiometric_calibration", True
+            ),
             latent_channels=model.get("latent_channels", 4),
             vae_channels=model.get("vae_channels", 64),
+            vae_upsample_mode=model.get("vae_upsample_mode", "pixelshuffle"),
             lr_channels=model.get("lr_channels", 64),
             diffusion_widths=tuple(model.get("diffusion_widths", [128, 256, 384, 512])),
+            diffusion_upsample_mode=model.get(
+                "diffusion_upsample_mode", "pixelshuffle"
+            ),
             context_dim=model.get("context_dim", 768),
             degradation_dim=model.get("degradation_dim", 4),
             mapper_channels=model.get("mapper_channels", 128),
@@ -168,6 +237,13 @@ class GeoDiffGAN(nn.Module):
             use_uncertainty_abstention=model.get(
                 "use_uncertainty_abstention", True
             ),
+            use_base_referenced_trust=model.get(
+                "use_base_referenced_trust", False
+            ),
+            trust_channels=model.get("trust_channels", 32),
+            trust_blocks=model.get("trust_blocks", 2),
+            trust_initial_scale=model.get("trust_initial_scale", 0.25),
+            trust_maximum_scale=model.get("trust_maximum_scale", 1.0),
             abstention_confidence_floor=model.get(
                 "abstention_confidence_floor", 0.0
             ),
@@ -227,6 +303,7 @@ class GeoDiffGAN(nn.Module):
         base: torch.Tensor,
         evidence_confidence: torch.Tensor,
         uncertainty: torch.Tensor,
+        trust_map: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Blend stochastic SR toward the deterministic base when support is weak."""
         evidence = self._resize_policy(evidence_confidence, image.shape[-2:])
@@ -238,14 +315,25 @@ class GeoDiffGAN(nn.Module):
             mode="bilinear",
             align_corners=False,
         ).clamp_min(0)
+        normalized_trust = (
+            torch.ones_like(evidence)
+            if trust_map is None
+            else torch.nn.functional.interpolate(
+                trust_map,
+                size=image.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            ).clamp(0, self.trust_maximum_scale)
+            / max(self.trust_maximum_scale, 1e-8)
+        )
         if self.use_uncertainty_abstention:
             agreement = torch.exp(
                 -uncertainty / max(self.uncertainty_scale, 1e-8)
             )
-            confidence = evidence * agreement
+            confidence = evidence * normalized_trust * agreement
             blend_strength = agreement
         else:
-            confidence = evidence
+            confidence = evidence * normalized_trust
             blend_strength = torch.ones_like(evidence)
         effective = self._effective_confidence(blend_strength)
         abstained = base + effective * (image - base)
@@ -265,6 +353,40 @@ class GeoDiffGAN(nn.Module):
         noisy, noise = self.scheduler.q_sample(latent, timesteps)
         target = self.scheduler.velocity_target(latent, noise, timesteps)
         return DiffusionBatch(noisy, noise, target, timesteps)
+
+    def fuse_sr_detail(
+        self,
+        raw_detail: torch.Tensor,
+        mapped: MapperOutput,
+        lr_features: list[torch.Tensor],
+        base: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Apply high-pass, evidence and base-referenced trust constraints."""
+        detail_residual = high_pass(raw_detail)
+        evidence_hr = self._resize_policy(
+            mapped.evidence_confidence, base.shape[-2:]
+        )
+        evidence_residual = detail_residual * self._effective_confidence(
+            evidence_hr
+        )
+        if self.use_base_referenced_trust:
+            trust_map = self.trust_controller(
+                mapped.content,
+                lr_features[1],
+                mapped.evidence_confidence,
+                base,
+                evidence_residual,
+            )
+        else:
+            trust_map = torch.ones_like(evidence_hr)
+        residual = evidence_residual * trust_map
+        return {
+            "detail_residual": detail_residual,
+            "evidence_hr": evidence_hr,
+            "evidence_residual": evidence_residual,
+            "trust_map": trust_map,
+            "residual": residual,
+        }
 
     def predict_velocity(
         self,
@@ -328,20 +450,21 @@ class GeoDiffGAN(nn.Module):
         decoded = self.decoder(mapped, lr_features)
         raw_detail = decoded.detail_residual
         raw_edit = decoded.edit_residual
-        evidence_hr = self._resize_policy(
-            mapped.evidence_confidence, base.shape[-2:]
-        )
         edit_hr = self._resize_policy(mapped.edit_permission, base.shape[-2:])
-        effective_evidence = self._effective_confidence(evidence_hr)
-        detail_residual = high_pass(raw_detail)
-        evidence_residual = detail_residual * effective_evidence
+        fusion = self.fuse_sr_detail(raw_detail, mapped, lr_features, base)
+        detail_residual = fusion["detail_residual"]
+        evidence_hr = fusion["evidence_hr"]
+        evidence_residual = fusion["evidence_residual"]
+        trust_map = fusion["trust_map"]
+        trusted_residual = fusion["residual"]
         edit_residual = raw_edit * edit_hr
         ungated_sr = (base + detail_residual).clamp(0, 1)
-        sr_anchor = (base + evidence_residual).clamp(0, 1)
+        pretrust_sr = (base + evidence_residual).clamp(0, 1)
+        sr_anchor = (base + trusted_residual).clamp(0, 1)
         residual = (
-            evidence_residual
+            trusted_residual
             if mode == "sr"
-            else evidence_residual + edit_residual
+            else trusted_residual + edit_residual
         )
         if diagnostics is not None:
             diagnostics.capture("mapper.content", mapped.content, visual="features")
@@ -374,11 +497,22 @@ class GeoDiffGAN(nn.Module):
                 visual="residual",
             )
             diagnostics.capture(
+                "mapper.base_referenced_trust",
+                trust_map,
+                visual="heatmap",
+            )
+            diagnostics.capture(
+                "decoder.trusted_residual",
+                trusted_residual,
+                visual="residual",
+            )
+            diagnostics.capture(
                 "decoder.permission_edit_residual",
                 edit_residual,
                 visual="residual",
             )
             diagnostics.capture("output.ungated_sr", ungated_sr, visual="rgb")
+            diagnostics.capture("output.pretrust_sr", pretrust_sr, visual="rgb")
             diagnostics.capture("output.sr_anchor", sr_anchor, visual="rgb")
             diagnostics.scalar(
                 "mapper.evidence_mean", mapped.evidence_confidence.mean()
@@ -399,8 +533,17 @@ class GeoDiffGAN(nn.Module):
             diagnostics.scalar(
                 "mapper.edit_permission_mean", mapped.edit_permission.mean()
             )
+            diagnostics.scalar("mapper.trust_mean", trust_map.mean())
+            diagnostics.scalar(
+                "mapper.trust_std", trust_map.std(unbiased=False)
+            )
+            normalized_trust = (
+                trust_map / max(self.trust_maximum_scale, 1e-8)
+            ).clamp(0, 1)
             diagnostics.capture(
-                "output.abstention_map", 1 - evidence_hr, visual="heatmap"
+                "output.abstention_map",
+                1 - evidence_hr * normalized_trust,
+                visual="heatmap",
             )
         if mode == "sr":
             if diagnostics is not None:
@@ -486,6 +629,7 @@ class GeoDiffGAN(nn.Module):
         metadata = []
         evidence_means = mapped.evidence_confidence.flatten(1).mean(dim=1)
         permission_means = mapped.edit_permission.flatten(1).mean(dim=1)
+        trust_means = trust_map.flatten(1).mean(dim=1)
         for index in range(lr.shape[0]):
             metadata.append(
                 {
@@ -498,14 +642,19 @@ class GeoDiffGAN(nn.Module):
                     "back_projection_steps": steps,
                     "dual_policy_gating": True,
                     "uncertainty_abstention": self.use_uncertainty_abstention,
+                    "base_referenced_trust": self.use_base_referenced_trust,
                     "evidence_confidence_mean": float(
                         evidence_means[index].detach()
                     ),
                     "edit_permission_mean": float(
                         permission_means[index].detach()
                     ),
+                    "trust_mean": float(trust_means[index].detach()),
                 }
             )
+        normalized_trust = (
+            trust_map / max(self.trust_maximum_scale, 1e-8)
+        ).clamp(0, 1)
         return GeoDiffOutput(
             image=image,
             base=base,
@@ -513,10 +662,13 @@ class GeoDiffGAN(nn.Module):
             latent=latent,
             evidence_confidence=mapped.evidence_confidence,
             edit_permission=mapped.edit_permission,
-            abstention_map=1 - evidence_hr,
+            abstention_map=1 - evidence_hr * normalized_trust,
             raw_detail_residual=raw_detail,
             raw_edit_residual=raw_edit,
+            evidence_residual=evidence_residual,
+            trust_map=trust_map,
             ungated_sr=ungated_sr,
+            pretrust_sr=pretrust_sr,
             sr_anchor=sr_anchor,
             metadata=metadata,
         )

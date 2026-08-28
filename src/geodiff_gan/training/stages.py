@@ -6,10 +6,16 @@ STAGES = ("base", "vae", "diffusion", "joint", "edit")
 
 STAGE_MODULES: dict[str, tuple[str, ...]] = {
     "base": ("base",),
-    "vae": ("vae", "lr_encoder", "mapper", "decoder"),
+    "vae": ("vae", "lr_encoder", "mapper", "decoder", "trust_controller"),
     "diffusion": ("diffusion",),
-    "joint": ("diffusion", "lr_encoder", "mapper", "decoder"),
-    "edit": ("diffusion", "mapper", "decoder"),
+    "joint": (
+        "diffusion",
+        "lr_encoder",
+        "mapper",
+        "decoder",
+        "trust_controller",
+    ),
+    "edit": ("diffusion", "mapper", "decoder", "trust_controller"),
 }
 
 

@@ -422,6 +422,78 @@ class TrainingSmokeTest(unittest.TestCase):
             self.assertAlmostEqual(learning_rates["diffusion"], 2.5e-5)
             self.assertAlmostEqual(learning_rates["decoder"], 1e-4)
 
+    def test_joint_trains_trust_controller_and_biases_reconstruction_timesteps(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, config = self._fixture(root)
+            config["model"].update(
+                {
+                    "use_base_referenced_trust": True,
+                    "trust_channels": 8,
+                    "trust_initial_scale": 0.25,
+                }
+            )
+            config["training"].update(
+                {
+                    "stage": "joint",
+                    "output_dir": str(root / "joint_trust"),
+                    "joint_max_timestep_fraction": 0.25,
+                }
+            )
+            trainer = Trainer(config)
+            self.assertTrue(
+                any(
+                    parameter.requires_grad
+                    for parameter in trainer.model.trust_controller.parameters()
+                )
+            )
+            batch = next(iter(trainer._loader("train")))
+            with mock.patch.object(
+                trainer.model,
+                "prepare_diffusion_batch",
+                wraps=trainer.model.prepare_diffusion_batch,
+            ) as prepare:
+                trainer._forward_stage(batch)
+            timesteps = prepare.call_args.kwargs["timesteps"]
+            self.assertIsNotNone(timesteps)
+            self.assertLess(int(timesteps.max()), 250)
+
+    def test_diffusion_checkpoint_fallback_minimizes_validation_loss(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, config = self._fixture(root, include_validation=True)
+            output = root / "diffusion_fallback"
+            config["training"].update(
+                {
+                    "stage": "diffusion",
+                    "epochs": 2,
+                    "output_dir": str(output),
+                    "checkpoint_metric": "val_psnr",
+                    "checkpoint_mode": "max",
+                    "early_stopping_patience": 0,
+                }
+            )
+            trainer = Trainer(config)
+            with mock.patch.object(
+                trainer,
+                "_validate",
+                side_effect=[
+                    {"val_loss_total": 2.0},
+                    {"val_loss_total": 1.0},
+                ],
+            ):
+                trainer.train()
+            payload = torch.load(
+                output / "diffusion_best.pt",
+                map_location="cpu",
+                weights_only=False,
+            )
+            selection = payload["extra"]["checkpoint_selection"]
+            self.assertEqual(payload["epoch"], 1)
+            self.assertEqual(selection["metric"], "val_loss_total")
+            self.assertEqual(selection["mode"], "min")
+            self.assertEqual(selection["value"], 1.0)
+
     def test_zero_adversarial_weight_skips_discriminators(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

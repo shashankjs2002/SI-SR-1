@@ -13,8 +13,12 @@ class ResidualVAE(nn.Module):
         in_channels: int = 3,
         latent_channels: int = 4,
         base_channels: int = 64,
+        upsample_mode: str = "pixelshuffle",
     ) -> None:
         super().__init__()
+        if upsample_mode not in ("pixelshuffle", "resize_conv"):
+            raise ValueError("VAE upsample_mode must be 'pixelshuffle' or 'resize_conv'")
+        self.upsample_mode = upsample_mode
         channels = [base_channels, base_channels * 2, base_channels * 4]
         self.downsample_factor = 2 ** len(channels)
         encoder: list[nn.Module] = [nn.Conv2d(in_channels, channels[0], 3, padding=1)]
@@ -30,13 +34,25 @@ class ResidualVAE(nn.Module):
         decoder: list[nn.Module] = []
         current = channels[-1]
         for channel in reversed(channels):
-            decoder.extend(
-                [
-                    ResidualBlock(current),
-                    nn.Conv2d(current, channel * 4, 3, padding=1),
-                    nn.PixelShuffle(2),
-                ]
-            )
+            decoder.append(ResidualBlock(current))
+            if upsample_mode == "pixelshuffle":
+                decoder.extend(
+                    [
+                        nn.Conv2d(current, channel * 4, 3, padding=1),
+                        nn.PixelShuffle(2),
+                    ]
+                )
+            else:
+                decoder.extend(
+                    [
+                        nn.Upsample(
+                            scale_factor=2,
+                            mode="bilinear",
+                            align_corners=False,
+                        ),
+                        nn.Conv2d(current, channel, 3, padding=1),
+                    ]
+                )
             current = channel
         self.decoder = nn.Sequential(*decoder)
         self.output = nn.Conv2d(current, in_channels, 3, padding=1)
