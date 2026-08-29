@@ -130,20 +130,65 @@ def spatial_base_guard_loss(
     with torch.no_grad():
         base_error = (base - target).square().mean(dim=1, keepdim=True)
     padding = smoothing_window // 2
-    prediction_error = F.avg_pool2d(
-        prediction_error,
-        smoothing_window,
-        stride=1,
-        padding=padding,
-    )
-    base_error = F.avg_pool2d(
-        base_error,
-        smoothing_window,
-        stride=1,
-        padding=padding,
-    )
+    if mask is None:
+        prediction_error = F.avg_pool2d(
+            prediction_error,
+            smoothing_window,
+            stride=1,
+            padding=padding,
+        )
+        base_error = F.avg_pool2d(
+            base_error,
+            smoothing_window,
+            stride=1,
+            padding=padding,
+        )
+    else:
+        weights = F.interpolate(
+            mask.float(),
+            size=prediction_error.shape[-2:],
+            mode="nearest",
+        ).to(device=prediction_error.device, dtype=prediction_error.dtype)
+        local_weight = F.avg_pool2d(
+            weights,
+            smoothing_window,
+            stride=1,
+            padding=padding,
+        ).clamp_min(1e-8)
+        prediction_error = F.avg_pool2d(
+            prediction_error * weights,
+            smoothing_window,
+            stride=1,
+            padding=padding,
+        ) / local_weight
+        base_error = F.avg_pool2d(
+            base_error * weights,
+            smoothing_window,
+            stride=1,
+            padding=padding,
+        ) / local_weight
     excess = F.relu(prediction_error - base_error + float(margin))
     return _masked_mean(excess, mask)
+
+
+def local_excess_mse_loss(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    base: torch.Tensor,
+    margin: float = 0.0,
+    smoothing_window: int = 9,
+    mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Penalize accepted detail only where its local MSE exceeds the base."""
+
+    return spatial_base_guard_loss(
+        prediction,
+        target,
+        base,
+        margin=margin,
+        smoothing_window=smoothing_window,
+        mask=mask,
+    )
 
 
 def oracle_residual_trust(
@@ -152,6 +197,9 @@ def oracle_residual_trust(
     target: torch.Tensor,
     maximum_scale: float = 1.0,
     smoothing_window: int = 9,
+    per_band: bool = False,
+    ridge: float = 1e-8,
+    mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Return the local least-squares gain for a proposed residual.
 
@@ -162,12 +210,31 @@ def oracle_residual_trust(
         raise ValueError("maximum_scale must be positive")
     if smoothing_window < 1 or smoothing_window % 2 == 0:
         raise ValueError("smoothing_window must be a positive odd integer")
+    if ridge < 0:
+        raise ValueError("ridge must be non-negative")
     with torch.no_grad():
         missing_detail = target - base
-        numerator = (candidate_residual * missing_detail).sum(
-            dim=1, keepdim=True
-        )
-        denominator = candidate_residual.square().sum(dim=1, keepdim=True)
+        product = candidate_residual * missing_detail
+        energy = candidate_residual.square()
+        if mask is not None:
+            weights = F.interpolate(
+                mask.float(),
+                size=candidate_residual.shape[-2:],
+                mode="nearest",
+            ).to(device=candidate_residual.device, dtype=candidate_residual.dtype)
+            if weights.shape[1] == 1 and candidate_residual.shape[1] != 1:
+                weights = weights.expand(
+                    -1,
+                    candidate_residual.shape[1],
+                    -1,
+                    -1,
+                )
+            if weights.shape[1] != candidate_residual.shape[1]:
+                raise ValueError("mask channels must be one or match the residual")
+            product = product * weights
+            energy = energy * weights
+        numerator = product if per_band else product.sum(dim=1, keepdim=True)
+        denominator = energy if per_band else energy.sum(dim=1, keepdim=True)
         if smoothing_window > 1:
             padding = smoothing_window // 2
             numerator = F.avg_pool2d(
@@ -185,7 +252,7 @@ def oracle_residual_trust(
         valid = denominator > 1e-10
         trust = torch.where(
             valid,
-            numerator / denominator.clamp_min(1e-10),
+            numerator / denominator.add(float(ridge)).clamp_min(1e-10),
             torch.zeros_like(numerator),
         )
         return trust.clamp(0, float(maximum_scale))
@@ -198,6 +265,7 @@ def residual_trust_projection_loss(
     target: torch.Tensor,
     maximum_scale: float = 1.0,
     smoothing_window: int = 9,
+    ridge: float = 1e-8,
     mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Supervise spatial trust with the error-minimizing residual coefficient."""
@@ -207,6 +275,12 @@ def residual_trust_projection_loss(
         target,
         maximum_scale=maximum_scale,
         smoothing_window=smoothing_window,
+        per_band=(
+            trust_map.shape[1] == candidate_residual.shape[1]
+            and trust_map.shape[1] > 1
+        ),
+        ridge=ridge,
+        mask=mask,
     )
     trust_map = F.interpolate(
         trust_map,

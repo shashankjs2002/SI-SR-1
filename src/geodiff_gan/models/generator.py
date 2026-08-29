@@ -90,6 +90,8 @@ class BaseReferencedTrustController(nn.Module):
         initial_scale: float = 0.25,
         maximum_scale: float = 1.0,
         blocks: int = 2,
+        mode: str = "scalar",
+        output_channels: int = 3,
     ) -> None:
         super().__init__()
         if maximum_scale <= 0:
@@ -98,13 +100,21 @@ class BaseReferencedTrustController(nn.Module):
             raise ValueError(
                 "initial_scale must be strictly between zero and maximum_scale"
             )
+        if mode not in ("scalar", "per_band"):
+            raise ValueError("trust mode must be 'scalar' or 'per_band'")
+        if output_channels < 1:
+            raise ValueError("output_channels must be positive")
         self.maximum_scale = float(maximum_scale)
-        input_channels = content_channels + lr_channels + 3
+        self.mode = mode
+        self.output_channels = output_channels
+        policy_channels = 3 if mode == "scalar" else 2 + 3 * output_channels
+        input_channels = content_channels + lr_channels + policy_channels
         self.input = nn.Conv2d(input_channels, hidden_channels, 3, padding=1)
         self.blocks = nn.Sequential(
             *(ResidualBlock(hidden_channels) for _ in range(max(1, blocks)))
         )
-        self.output = nn.Conv2d(hidden_channels, 1, 1)
+        trust_channels = 1 if mode == "scalar" else output_channels
+        self.output = nn.Conv2d(hidden_channels, trust_channels, 1)
         probability = float(initial_scale) / self.maximum_scale
         bias = torch.logit(torch.tensor(probability)).item()
         nn.init.zeros_(self.output.weight)
@@ -117,6 +127,8 @@ class BaseReferencedTrustController(nn.Module):
         evidence_confidence: torch.Tensor,
         base: torch.Tensor,
         candidate_residual: torch.Tensor,
+        consistency_error: torch.Tensor | None = None,
+        sample_variance: torch.Tensor | None = None,
     ) -> torch.Tensor:
         latent_size = content.shape[-2:]
         lr_feature = F.interpolate(
@@ -131,20 +143,55 @@ class BaseReferencedTrustController(nn.Module):
             mode="bilinear",
             align_corners=False,
         )
-        residual_energy = F.interpolate(
-            candidate_residual.abs().mean(dim=1, keepdim=True),
-            size=latent_size,
-            mode="area",
-        )
-        base_detail = F.interpolate(
-            high_pass(base).abs().mean(dim=1, keepdim=True),
-            size=latent_size,
-            mode="area",
-        )
-        features = torch.cat(
-            (content, lr_feature, evidence, residual_energy, base_detail),
-            dim=1,
-        )
+        if self.mode == "scalar":
+            residual_energy = F.interpolate(
+                candidate_residual.abs().mean(dim=1, keepdim=True),
+                size=latent_size,
+                mode="area",
+            )
+            base_detail = F.interpolate(
+                high_pass(base).abs().mean(dim=1, keepdim=True),
+                size=latent_size,
+                mode="area",
+            )
+            policy_features = (evidence, residual_energy, base_detail)
+        else:
+            candidate = F.interpolate(
+                candidate_residual[:, : self.output_channels],
+                size=latent_size,
+                mode="area",
+            )
+            base_detail = F.interpolate(
+                high_pass(base[:, : self.output_channels]),
+                size=latent_size,
+                mode="area",
+            )
+            if consistency_error is None:
+                consistency = torch.zeros_like(candidate)
+            else:
+                consistency = F.interpolate(
+                    consistency_error[:, : self.output_channels].abs(),
+                    size=latent_size,
+                    mode="area",
+                )
+            if sample_variance is None:
+                variance = torch.zeros_like(evidence)
+            else:
+                if sample_variance.ndim == 3:
+                    sample_variance = sample_variance[:, None]
+                variance = F.interpolate(
+                    sample_variance.mean(dim=1, keepdim=True),
+                    size=latent_size,
+                    mode="area",
+                )
+            policy_features = (
+                evidence,
+                candidate,
+                base_detail,
+                consistency,
+                variance,
+            )
+        features = torch.cat((content, lr_feature, *policy_features), dim=1)
         logits = self.output(self.blocks(F.silu(self.input(features))))
         trust = self.maximum_scale * torch.sigmoid(logits)
         return F.interpolate(

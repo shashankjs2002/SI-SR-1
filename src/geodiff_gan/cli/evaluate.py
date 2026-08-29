@@ -147,7 +147,14 @@ def main() -> None:
     print("[evaluate] building GeoDiff-GAN", flush=True)
     model = GeoDiffGAN.from_config(config).to(device).eval()
     print(f"[evaluate] loading checkpoint {args.checkpoint}", flush=True)
-    load_checkpoint(args.checkpoint, model, strict=False)
+    load_checkpoint(
+        args.checkpoint,
+        model,
+        strict=False,
+        prefer_ema=bool(
+            config.get("training", {}).get("use_ema_for_evaluation", True)
+        ),
+    )
     text_encoder = None
     if args.no_text:
         print("[evaluate] text conditioning disabled; using zero context", flush=True)
@@ -301,17 +308,44 @@ def main() -> None:
                 )
         predictions = [output.image for output in outputs]
         stack = torch.stack(predictions).float()
-        raw_mean = stack.mean(dim=0)
-        uncertainty = stack.var(dim=0, unbiased=False).mean(dim=1)
-        evidence = torch.stack(
-            [output.evidence_confidence for output in outputs]
-        ).float().mean(dim=0)
-        edit_permission = torch.stack(
-            [output.edit_permission for output in outputs]
-        ).float().mean(dim=0)
-        trust_map = torch.stack(
-            [output.trust_map for output in outputs]
-        ).float().mean(dim=0)
+        if args.mode == "sr" and model.trust_mode == "per_band":
+            with torch.no_grad(), torch.autocast(
+                device_type=device.type, dtype=torch.float16, enabled=amp_enabled
+            ):
+                aggregated = model.aggregate_sr_outputs(
+                    outputs,
+                    lr_features,
+                    clean_lr,
+                    degradation,
+                    back_projection_steps=(args.back_projection_steps or 0),
+                )
+            raw_mean = aggregated.image.float()
+            uncertainty = torch.stack(
+                [output.pretrust_sr for output in outputs]
+            ).float().var(dim=0, unbiased=False).mean(dim=1)
+            evidence = aggregated.evidence_confidence.float()
+            edit_permission = aggregated.edit_permission.float()
+            trust_map = aggregated.trust_map.float()
+            decoder_residual = aggregated.residual.float()
+            candidate_residual = aggregated.evidence_residual.float()
+        else:
+            raw_mean = stack.mean(dim=0)
+            uncertainty = stack.var(dim=0, unbiased=False).mean(dim=1)
+            evidence = torch.stack(
+                [output.evidence_confidence for output in outputs]
+            ).float().mean(dim=0)
+            edit_permission = torch.stack(
+                [output.edit_permission for output in outputs]
+            ).float().mean(dim=0)
+            trust_map = torch.stack(
+                [output.trust_map for output in outputs]
+            ).float().mean(dim=0)
+            decoder_residual = torch.stack(
+                [output.residual for output in outputs]
+            ).float().mean(dim=0)
+            candidate_residual = torch.stack(
+                [output.evidence_residual for output in outputs]
+            ).float().mean(dim=0)
         if args.mode == "sr":
             mean, combined_confidence, abstention = (
                 model.apply_uncertainty_abstention(
@@ -332,9 +366,6 @@ def main() -> None:
         mean = (
             base_image + float(args.residual_scale) * (mean - base_image)
         ).clamp(0, 1)
-        decoder_residual = torch.stack(
-            [output.residual for output in outputs]
-        ).float().mean(dim=0)
         net_addition = mean - base_image
         values = basic_metrics(
             mean,
@@ -431,6 +462,7 @@ def main() -> None:
             valid_mask=valid_mask[0].detach().cpu().numpy(),
             base=base_image[0].detach().cpu().numpy(),
             decoder_residual=decoder_residual[0].detach().cpu().numpy(),
+            candidate_residual=candidate_residual[0].detach().cpu().numpy(),
             net_addition=net_addition[0].detach().cpu().numpy(),
             source_patch=str(patch_path),
         )

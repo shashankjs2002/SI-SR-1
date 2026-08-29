@@ -74,7 +74,14 @@ def main() -> None:
     if args.base_checkpoint:
         print(f"[baselines] loading checkpoint {args.base_checkpoint}", flush=True)
         model = GeoDiffGAN.from_config(config).to(device).eval()
-        load_checkpoint(args.base_checkpoint, model, strict=False)
+        load_checkpoint(
+            args.base_checkpoint,
+            model,
+            strict=False,
+            prefer_ema=bool(
+                config.get("training", {}).get("use_ema_for_evaluation", True)
+            ),
+        )
     if args.optional_metrics:
         print(
             "[baselines] --optional-metrics is deprecated; ERGAS, SAM, UIQI, "

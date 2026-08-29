@@ -48,7 +48,14 @@ def main() -> None:
     debug_config = config.get("debug", {})
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = GeoDiffGAN.from_config(config).to(device).eval()
-    load_checkpoint(args.checkpoint, model, strict=False)
+    load_checkpoint(
+        args.checkpoint,
+        model,
+        strict=False,
+        prefer_ema=bool(
+            config.get("training", {}).get("use_ema_for_evaluation", True)
+        ),
+    )
     text_encoder = build_text_encoder(config).to(device).eval()
     dataset = SentinelPatchDataset(
         config["data"]["manifest"],

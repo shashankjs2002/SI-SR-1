@@ -98,9 +98,15 @@ def load_checkpoint(
     model: nn.Module,
     optimizer: torch.optim.Optimizer | None = None,
     strict: bool = True,
+    prefer_ema: bool = False,
 ) -> dict[str, Any]:
     payload = torch.load(path, map_location="cpu", weights_only=False)
-    unwrap(model).load_state_dict(payload["model"], strict=strict)
+    model_state = payload["model"]
+    if prefer_ema:
+        ema_state = payload.get("extra", {}).get("ema")
+        if isinstance(ema_state, dict) and isinstance(ema_state.get("shadow"), dict):
+            model_state = ema_state["shadow"]
+    unwrap(model).load_state_dict(model_state, strict=strict)
     if optimizer is not None and payload.get("optimizer"):
         optimizer.load_state_dict(payload["optimizer"])
     return payload

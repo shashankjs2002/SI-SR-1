@@ -7,6 +7,7 @@ import random
 import time
 from collections import defaultdict
 from contextlib import contextmanager
+from dataclasses import replace
 from itertools import islice
 from pathlib import Path
 from typing import Any
@@ -33,6 +34,7 @@ from ..losses import (
     generator_hinge,
     gradient_loss,
     kl_loss,
+    local_excess_mse_loss,
     mse_loss,
     multiscale_mse_loss,
     radiometric_loss,
@@ -58,6 +60,7 @@ from .checkpoint import (
     save_checkpoint,
     unwrap,
 )
+from .ema import ModelEMA
 from .stages import STAGES, configure_stage_trainability
 
 
@@ -102,7 +105,12 @@ class Trainer:
             checkpoint_sha256(init_checkpoint) if init_checkpoint else None
         )
         if init_checkpoint and not resume:
-            load_checkpoint(init_checkpoint, self.model, strict=False)
+            load_checkpoint(
+                init_checkpoint,
+                self.model,
+                strict=False,
+                prefer_ema=bool(training.get("init_use_ema", True)),
+            )
         self.text_encoder: TextEncoder | None = None
         if self.stage != "base" and self.model.use_text_conditioning:
             self.text_encoder = build_text_encoder(config).to(self.device).eval()
@@ -145,9 +153,27 @@ class Trainer:
             betas=(0.9, 0.99),
             weight_decay=float(config["training"].get("weight_decay", 1e-4)),
         )
+        self.max_optimizer_steps = max(
+            0, int(training.get("max_optimizer_steps", 0))
+        )
         scheduler_factor = float(training.get("lr_scheduler_factor", 1.0))
-        self.lr_scheduler = (
-            torch.optim.lr_scheduler.ReduceLROnPlateau(
+        scheduler_type = str(
+            training.get(
+                "lr_scheduler_type",
+                "plateau" if 0 < scheduler_factor < 1 else "none",
+            )
+        ).lower()
+        if scheduler_type not in ("none", "plateau", "cosine_warmup"):
+            raise ValueError(
+                "training.lr_scheduler_type must be none, plateau, or cosine_warmup"
+            )
+        self.lr_scheduler_step_per_update = scheduler_type == "cosine_warmup"
+        if scheduler_type == "plateau":
+            if not 0 < scheduler_factor < 1:
+                raise ValueError(
+                    "training.lr_scheduler_factor must be in (0, 1) for plateau"
+                )
+            self.lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
                 self.optimizer,
                 mode=str(training.get("lr_scheduler_mode", "max")),
                 factor=scheduler_factor,
@@ -157,9 +183,32 @@ class Trainer:
                 ),
                 min_lr=max(0.0, float(training.get("lr_scheduler_min_lr", 1e-7))),
             )
-            if 0 < scheduler_factor < 1
-            else None
-        )
+        elif scheduler_type == "cosine_warmup":
+            if self.max_optimizer_steps < 1:
+                raise ValueError(
+                    "training.max_optimizer_steps is required for cosine_warmup"
+                )
+            warmup_steps = max(0, int(training.get("warmup_steps", 0)))
+            minimum_lr = max(
+                0.0, float(training.get("lr_scheduler_min_lr", 0.0))
+            )
+            base_lr = float(training["learning_rate"])
+            minimum_factor = min(1.0, minimum_lr / max(base_lr, 1e-12))
+
+            def learning_rate_factor(step: int) -> float:
+                if warmup_steps > 0 and step < warmup_steps:
+                    return max(1, step + 1) / warmup_steps
+                span = max(1, self.max_optimizer_steps - warmup_steps)
+                progress = min(1.0, max(0.0, (step - warmup_steps) / span))
+                cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+                return minimum_factor + (1.0 - minimum_factor) * cosine
+
+            self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
+                self.optimizer,
+                lr_lambda=learning_rate_factor,
+            )
+        else:
+            self.lr_scheduler = None
         discriminator_parameters = list(self.patch_discriminator.parameters()) + list(
             self.wavelet_discriminator.parameters()
         )
@@ -172,6 +221,7 @@ class Trainer:
         self.amp_enabled = amp_enabled
         self.scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
         self.start_epoch = 0
+        self.optimizer_step = 0
         self.resume_extra: dict[str, Any] = {}
         if resume:
             payload = load_checkpoint(resume, self.model, self.optimizer, strict=False)
@@ -184,6 +234,7 @@ class Trainer:
             self.start_epoch = int(payload["epoch"]) + 1
             extra = payload.get("extra", {})
             self.resume_extra = extra
+            self.optimizer_step = int(extra.get("optimizer_step", 0))
             if (
                 bool(training.get("enforce_init_checkpoint_lineage", False))
                 and self.parent_checkpoint_sha256 is not None
@@ -219,6 +270,13 @@ class Trainer:
                     f"{self.start_epoch + 1}",
                     flush=True,
                 )
+        ema_decay = float(training.get("ema_decay", 0.0))
+        self.ema = ModelEMA(self.model, ema_decay) if ema_decay > 0 else None
+        if self.ema is not None and self.resume_extra.get("ema"):
+            self.ema.load_state_dict(self.resume_extra["ema"])
+        self.use_ema_for_evaluation = bool(
+            training.get("use_ema_for_evaluation", self.ema is not None)
+        )
 
     @staticmethod
     def _duration(seconds: float) -> str:
@@ -244,6 +302,14 @@ class Trainer:
         if mode == "max":
             return value > best
         raise ValueError("training.checkpoint_mode must be 'min' or 'max'")
+
+    @contextmanager
+    def _evaluation_parameters(self):
+        if self.ema is None or not self.use_ema_for_evaluation:
+            yield
+            return
+        with self.ema.average_parameters(self.model):
+            yield
 
     def _synchronize_model_gradients(self) -> None:
         if not self.distributed:
@@ -374,6 +440,9 @@ class Trainer:
             radiometric_calibration=data.get("radiometric_calibration"),
             output_channels=self.config["model"].get("output_channels", 3),
             input_mode=data.get("input_mode", "synthetic"),
+            paired_lr_crop_size=(
+                data.get("paired_lr_crop_size") if is_train else None
+            ),
         )
         sampler = (
             DistributedSampler(dataset, shuffle=split == "train")
@@ -425,6 +494,81 @@ class Trainer:
             captions,
             prompt_kinds,
         )
+
+    def _sampled_joint_output(
+        self,
+        model: GeoDiffGAN,
+        lr: torch.Tensor,
+        context: torch.Tensor,
+        degradation: torch.Tensor,
+        base: torch.Tensor,
+        lr_features: list[torch.Tensor],
+        consistency_lr: torch.Tensor,
+        diagnostics: DiagnosticRecorder | None,
+    ) -> Any:
+        training = self.config["training"]
+        sample_steps = int(training.get("joint_sample_steps", 8))
+        sample_count = int(training.get("trust_samples", 1))
+        if sample_steps < 1:
+            raise ValueError("training.joint_sample_steps must be positive")
+        if sample_count < 1:
+            raise ValueError("training.trust_samples must be positive")
+        prepared_context, prepared_degradation = model.apply_ablation_inputs(
+            context,
+            degradation,
+        )
+        outputs = []
+        for sample_index in range(sample_count):
+            random_seed = int(
+                torch.randint(0, 2**31 - 1, (), device="cpu").item()
+            )
+            generator = torch.Generator(device=self.device).manual_seed(random_seed)
+            latent = model.sample_latent(
+                lr,
+                prepared_context,
+                prepared_degradation,
+                mode="sr",
+                sample_steps=sample_steps,
+                generator=generator,
+                base=base,
+                lr_features=lr_features,
+                conditioning_prepared=True,
+            )
+            outputs.append(
+                model.decode_latent(
+                    latent,
+                    lr,
+                    prepared_context,
+                    prepared_degradation,
+                    mode="sr",
+                    base=base,
+                    projection_lr=consistency_lr,
+                    back_projection_steps=self.train_back_projection_steps,
+                    diagnostics=diagnostics if sample_index == 0 else None,
+                    conditioning_prepared=True,
+                    lr_features=lr_features,
+                )
+            )
+        if len(outputs) == 1:
+            return outputs[0]
+        aggregated = model.aggregate_sr_outputs(
+            outputs,
+            lr_features,
+            consistency_lr,
+            prepared_degradation,
+            back_projection_steps=self.train_back_projection_steps,
+        )
+        uncertainty = torch.stack(
+            [value.pretrust_sr for value in outputs]
+        ).var(dim=0, unbiased=False).mean(dim=1)
+        image, _, _ = model.apply_uncertainty_abstention(
+            aggregated.image,
+            base,
+            aggregated.evidence_confidence,
+            uncertainty,
+            trust_map=aggregated.trust_map,
+        )
+        return replace(aggregated, image=image)
 
     def _forward_stage(
         self,
@@ -539,6 +683,8 @@ class Trainer:
                 mapped,
                 lr_features,
                 base,
+                consistency_lr=consistency_lr,
+                degradation=degradation,
             )
             detail = fusion["residual"]
             prediction = (base + detail).clamp(0, 1)
@@ -645,6 +791,9 @@ class Trainer:
                     smoothing_window=int(
                         self.config["training"].get("trust_smoothing_window", 9)
                     ),
+                    ridge=float(
+                        self.config["training"].get("trust_ridge", 1e-8)
+                    ),
                     mask=valid_mask,
                 )
                 if model.use_base_referenced_trust
@@ -682,99 +831,119 @@ class Trainer:
             )
             return prediction, losses
 
-        with torch.no_grad():
-            latent, _, _ = model.vae.encode(target_residual, sample=False)
-        diffusion_timesteps = None
-        if self.stage in ("joint", "edit"):
-            maximum_fraction = float(
-                self.config["training"].get(
-                    "joint_max_timestep_fraction", 1.0
-                )
+        sampled_joint = (
+            self.stage == "joint"
+            and str(
+                self.config["training"].get("joint_latent_source", "noisy")
             )
-            if not 0 < maximum_fraction <= 1:
-                raise ValueError(
-                    "training.joint_max_timestep_fraction must be in (0, 1]"
-                )
-            maximum_timestep = max(
-                1,
-                min(
-                    model.scheduler.steps,
-                    int(round(model.scheduler.steps * maximum_fraction)),
-                ),
-            )
-            diffusion_timesteps = torch.randint(
-                0,
-                maximum_timestep,
-                (latent.shape[0],),
-                device=latent.device,
-            )
-        diffusion_batch = model.prepare_diffusion_batch(
-            latent,
-            timesteps=diffusion_timesteps,
+            == "sampled"
         )
-        mode = "edit" if self.stage == "edit" else "sr"
-        velocity = model.predict_velocity(
-            diffusion_batch.noisy,
-            diffusion_batch.timesteps,
-            context,
-            degradation,
-            mode,
-            lr_features,
-        )
-        if diagnostics is not None:
-            diagnostics.capture("diffusion.clean_latent", latent, visual="features")
-            diagnostics.capture("diffusion.noisy_latent", diffusion_batch.noisy, visual="features")
-            diagnostics.capture(
-                "diffusion.target_velocity",
+        if sampled_joint:
+            output = self._sampled_joint_output(
+                model,
+                lr,
+                context,
+                degradation,
+                base,
+                lr_features,
+                consistency_lr,
+                diagnostics,
+            )
+            losses["diffusion"] = output.image.new_zeros(())
+        else:
+            with torch.no_grad():
+                latent, _, _ = model.vae.encode(target_residual, sample=False)
+            diffusion_timesteps = None
+            if self.stage in ("joint", "edit"):
+                maximum_fraction = float(
+                    self.config["training"].get(
+                        "joint_max_timestep_fraction", 1.0
+                    )
+                )
+                if not 0 < maximum_fraction <= 1:
+                    raise ValueError(
+                        "training.joint_max_timestep_fraction must be in (0, 1]"
+                    )
+                maximum_timestep = max(
+                    1,
+                    min(
+                        model.scheduler.steps,
+                        int(round(model.scheduler.steps * maximum_fraction)),
+                    ),
+                )
+                diffusion_timesteps = torch.randint(
+                    0,
+                    maximum_timestep,
+                    (latent.shape[0],),
+                    device=latent.device,
+                )
+            diffusion_batch = model.prepare_diffusion_batch(
+                latent,
+                timesteps=diffusion_timesteps,
+            )
+            mode = "edit" if self.stage == "edit" else "sr"
+            velocity = model.predict_velocity(
+                diffusion_batch.noisy,
+                diffusion_batch.timesteps,
+                context,
+                degradation,
+                mode,
+                lr_features,
+            )
+            if diagnostics is not None:
+                diagnostics.capture("diffusion.clean_latent", latent, visual="features")
+                diagnostics.capture("diffusion.noisy_latent", diffusion_batch.noisy, visual="features")
+                diagnostics.capture(
+                    "diffusion.target_velocity",
+                    diffusion_batch.target_velocity,
+                    visual="features",
+                )
+                diagnostics.capture("diffusion.predicted_velocity", velocity, visual="features")
+                diagnostics.capture(
+                    "diffusion.velocity_absolute_error",
+                    (velocity - diffusion_batch.target_velocity).abs(),
+                    visual="heatmap",
+                )
+                diagnostics.scalar(
+                    "diffusion.timestep_mean", diffusion_batch.timesteps.float().mean()
+                )
+            losses["diffusion"] = snr_weighted_velocity_loss(
+                velocity,
                 diffusion_batch.target_velocity,
-                visual="features",
+                diffusion_batch.timesteps,
+                model.scheduler.alphas_cumprod,
             )
-            diagnostics.capture("diffusion.predicted_velocity", velocity, visual="features")
-            diagnostics.capture(
-                "diffusion.velocity_absolute_error",
-                (velocity - diffusion_batch.target_velocity).abs(),
-                visual="heatmap",
-            )
-            diagnostics.scalar(
-                "diffusion.timestep_mean", diffusion_batch.timesteps.float().mean()
-            )
-        losses["diffusion"] = snr_weighted_velocity_loss(
-            velocity,
-            diffusion_batch.target_velocity,
-            diffusion_batch.timesteps,
-            model.scheduler.alphas_cumprod,
-        )
-        if self.stage == "diffusion":
+            if self.stage == "diffusion":
+                clean = model.scheduler.predict_clean(
+                    diffusion_batch.noisy, velocity, diffusion_batch.timesteps
+                )
+                prediction = model.vae.decode(clean, hr.shape[-2:])
+                if diagnostics is not None:
+                    diagnostics.capture("latent.denoised", clean, visual="features")
+                    diagnostics.capture(
+                        "diffusion.decoded_residual", prediction, visual="residual"
+                    )
+                    diagnostics.capture(
+                        "diffusion.decoded_absolute_error",
+                        (prediction - target_residual).abs(),
+                        visual="heatmap",
+                    )
+                return prediction, losses
+
             clean = model.scheduler.predict_clean(
                 diffusion_batch.noisy, velocity, diffusion_batch.timesteps
             )
-            prediction = model.vae.decode(clean, hr.shape[-2:])
-            if diagnostics is not None:
-                diagnostics.capture("latent.denoised", clean, visual="features")
-                diagnostics.capture(
-                    "diffusion.decoded_residual", prediction, visual="residual"
-                )
-                diagnostics.capture(
-                    "diffusion.decoded_absolute_error",
-                    (prediction - target_residual).abs(),
-                    visual="heatmap",
-                )
-            return prediction, losses
-
-        clean = model.scheduler.predict_clean(
-            diffusion_batch.noisy, velocity, diffusion_batch.timesteps
-        )
-        output = model.decode_latent(
-            clean,
-            lr,
-            context,
-            degradation,
-            mode=mode,
-            base=base,
-            projection_lr=consistency_lr,
-            back_projection_steps=self.train_back_projection_steps,
-            diagnostics=diagnostics,
-        )
+            output = model.decode_latent(
+                clean,
+                lr,
+                context,
+                degradation,
+                mode=mode,
+                base=base,
+                projection_lr=consistency_lr,
+                back_projection_steps=self.train_back_projection_steps,
+                diagnostics=diagnostics,
+            )
         prediction = output.image
         counterfactual = torch.tensor(
             [kind == "mismatch" for kind in prompt_kinds],
@@ -874,6 +1043,24 @@ class Trainer:
                 if float(fidelity_weights.get("spatial_base_guard", 0.0)) > 0
                 else reconstruction.new_zeros(())
             )
+            losses["local_excess_mse"] = (
+                local_excess_mse_loss(
+                    reconstruction,
+                    reconstruction_target,
+                    base[reconstruction_samples],
+                    margin=float(
+                        self.config["training"].get(
+                            "local_excess_mse_margin", 0.0
+                        )
+                    ),
+                    smoothing_window=int(
+                        self.config["training"].get("trust_smoothing_window", 9)
+                    ),
+                    mask=reconstruction_valid,
+                )
+                if float(fidelity_weights.get("local_excess_mse", 0.0)) > 0
+                else reconstruction.new_zeros(())
+            )
             losses["trust_projection"] = (
                 residual_trust_projection_loss(
                     output.trust_map[reconstruction_samples],
@@ -883,6 +1070,9 @@ class Trainer:
                     maximum_scale=model.trust_maximum_scale,
                     smoothing_window=int(
                         self.config["training"].get("trust_smoothing_window", 9)
+                    ),
+                    ridge=float(
+                        self.config["training"].get("trust_ridge", 1e-8)
                     ),
                     mask=reconstruction_valid,
                 )
@@ -903,6 +1093,7 @@ class Trainer:
             losses["residual_supervision"] = zero
             losses["base_guard"] = zero
             losses["spatial_base_guard"] = zero
+            losses["local_excess_mse"] = zero
             losses["trust_projection"] = zero
         losses["consistency"] = degradation_consistency(
             prediction,
@@ -1073,25 +1264,49 @@ class Trainer:
                                     lr_features=lr_features,
                                 )
                             )
-                        prediction = torch.stack(
-                            [output.image for output in sampled_outputs]
-                        ).mean(dim=0)
+                        if (
+                            self.stage == "joint"
+                            and model.trust_mode == "per_band"
+                        ):
+                            aggregated = model.aggregate_sr_outputs(
+                                sampled_outputs,
+                                lr_features,
+                                projection_lr,
+                                degradation,
+                                back_projection_steps=(
+                                    validation_back_projection_steps
+                                ),
+                            )
+                            prediction = aggregated.image
+                        else:
+                            prediction = torch.stack(
+                                [output.image for output in sampled_outputs]
+                            ).mean(dim=0)
                         if self.stage == "joint" and validation_samples > 1:
                             stack = torch.stack(
-                                [output.image for output in sampled_outputs]
+                                [
+                                    output.pretrust_sr
+                                    if model.trust_mode == "per_band"
+                                    else output.image
+                                    for output in sampled_outputs
+                                ]
                             )
                             uncertainty = stack.var(
                                 dim=0, unbiased=False
                             ).mean(dim=1)
-                            evidence = torch.stack(
-                                [
-                                    output.evidence_confidence
-                                    for output in sampled_outputs
-                                ]
-                            ).mean(dim=0)
-                            trust = torch.stack(
-                                [output.trust_map for output in sampled_outputs]
-                            ).mean(dim=0)
+                            if model.trust_mode == "per_band":
+                                evidence = aggregated.evidence_confidence
+                                trust = aggregated.trust_map
+                            else:
+                                evidence = torch.stack(
+                                    [
+                                        output.evidence_confidence
+                                        for output in sampled_outputs
+                                    ]
+                                ).mean(dim=0)
+                                trust = torch.stack(
+                                    [output.trust_map for output in sampled_outputs]
+                                ).mean(dim=0)
                             prediction, _, _ = model.apply_uncertainty_abstention(
                                 prediction,
                                 base,
@@ -1218,6 +1433,7 @@ class Trainer:
             "residual_supervision": 0.0,
             "base_guard": 0.0,
             "spatial_base_guard": 0.0,
+            "local_excess_mse": 0.0,
             "trust_projection": 0.0,
             "edit_localization": 0.05,
             "edit_permission": 0.05,
@@ -1290,6 +1506,14 @@ class Trainer:
         if accumulation < 1:
             raise ValueError("training.gradient_accumulation must be at least 1")
         epochs = int(training["epochs"])
+        if self.max_optimizer_steps > self.optimizer_step:
+            updates_per_epoch = max(1, math.ceil(len(loader) / accumulation))
+            remaining_updates = self.max_optimizer_steps - self.optimizer_step
+            required_epochs = self.start_epoch + math.ceil(
+                remaining_updates / updates_per_epoch
+            )
+            epochs = max(epochs, required_epochs)
+            training["epochs"] = epochs
         output_dir = Path(training.get("output_dir", "runs/default"))
         if self.is_main:
             output_dir.mkdir(parents=True, exist_ok=True)
@@ -1378,6 +1602,17 @@ class Trainer:
             int(training.get("progress_updates_per_epoch", 2)),
         )
         use_tqdm = progress_mode == "tqdm" and self.is_main
+        if (
+            self.max_optimizer_steps > 0
+            and self.optimizer_step >= self.max_optimizer_steps
+        ):
+            if self.is_main:
+                print(
+                    f"[{self.stage}] already complete: optimizer_steps="
+                    f"{self.optimizer_step}/{self.max_optimizer_steps}",
+                    flush=True,
+                )
+            return
         if self.start_epoch >= epochs:
             if self.is_main:
                 checkpoint = latest_stage_checkpoint(output_dir, self.stage)
@@ -1400,6 +1635,8 @@ class Trainer:
             if isinstance(loader.sampler, DistributedSampler):
                 loader.sampler.set_epoch(epoch)
             metrics: defaultdict[str, float] = defaultdict(float)
+            completed_batches = 0
+            reached_max_optimizer_steps = False
             debug_exports = 0
             self.model.train()
             if self.text_encoder is not None:
@@ -1520,9 +1757,21 @@ class Trainer:
                         self.scaler.unscale_(self.discriminator_optimizer)
                         self.scaler.step(self.discriminator_optimizer)
                     self.scaler.update()
+                    self.optimizer_step += 1
+                    if self.ema is not None:
+                        self.ema.update(self.model)
+                    if (
+                        self.lr_scheduler is not None
+                        and self.lr_scheduler_step_per_update
+                    ):
+                        self.lr_scheduler.step()
                     self.optimizer.zero_grad(set_to_none=True)
                     if adversarial_enabled:
                         self.discriminator_optimizer.zero_grad(set_to_none=True)
+                    reached_max_optimizer_steps = (
+                        self.max_optimizer_steps > 0
+                        and self.optimizer_step >= self.max_optimizer_steps
+                    )
                 if diagnostics is not None:
                     if self.stage != "diffusion":
                         if self.stage == "base":
@@ -1578,6 +1827,7 @@ class Trainer:
                     metrics[name] += float(value.detach())
                 metrics["total"] += float(generator_loss.detach())
                 completed = step + 1
+                completed_batches = completed
                 if use_tqdm:
                     batch_progress.set_postfix(
                         loss=f"{float(generator_loss.detach()):.4f}",
@@ -1602,16 +1852,19 @@ class Trainer:
                         f"epoch_eta={self._duration(batch_eta)}",
                         flush=True,
                     )
+                if reached_max_optimizer_steps:
+                    break
             reduced_metrics = self._reduce_metrics(metrics)
             validation_metrics = {}
             if (
                 len(validation_loader.dataset) > 0
                 and (epoch + 1) % validate_every == 0
             ):
-                validation_metrics = self._validate(validation_loader, epoch)
-            stop_training = False
+                with self._evaluation_parameters():
+                    validation_metrics = self._validate(validation_loader, epoch)
+            stop_training = reached_max_optimizer_steps
             if self.is_main:
-                denominator = max(len(loader), 1)
+                denominator = max(completed_batches, 1)
                 epoch_metrics = {
                     key: value / denominator for key, value in reduced_metrics.items()
                 }
@@ -1699,7 +1952,7 @@ class Trainer:
                         early_bad_epochs = 0
                     else:
                         early_bad_epochs += 1
-                    stop_training = (
+                    stop_training = stop_training or (
                         early_stopping_patience > 0
                         and epoch + 1 >= early_stopping_min_epochs
                         and early_bad_epochs >= early_stopping_patience
@@ -1717,7 +1970,11 @@ class Trainer:
                     training.get("lr_scheduler_metric", checkpoint_metric)
                 )
                 scheduler_value = epoch_metrics.get(scheduler_metric)
-                if self.lr_scheduler is not None and scheduler_value is not None:
+                if (
+                    self.lr_scheduler is not None
+                    and not self.lr_scheduler_step_per_update
+                    and scheduler_value is not None
+                ):
                     self.lr_scheduler.step(float(scheduler_value))
                 if use_tqdm:
                     epoch_progress.set_postfix(
@@ -1745,6 +2002,8 @@ class Trainer:
                         ).state_dict(),
                         "discriminator_optimizer": self.discriminator_optimizer.state_dict(),
                         "scaler": self.scaler.state_dict(),
+                        "ema": self.ema.state_dict() if self.ema is not None else None,
+                        "optimizer_step": self.optimizer_step,
                         "lr_scheduler": (
                             self.lr_scheduler.state_dict()
                             if self.lr_scheduler is not None
@@ -1804,19 +2063,31 @@ class Trainer:
                             f" early_stop={early_bad_epochs}/"
                             f"{early_stopping_patience}"
                         )
+                    if reached_max_optimizer_steps:
+                        summary += (
+                            f" optimizer_steps={self.optimizer_step}/"
+                            f"{self.max_optimizer_steps}"
+                        )
                     summary += (
                         f" elapsed={self._duration(time.monotonic() - stage_started)} "
                         f"stage_eta={self._duration(stage_eta)}"
                     )
                     print(summary, flush=True)
                 if stop_training:
-                    print(
-                        f"[{self.stage}] early stopping after epoch {epoch + 1}: "
-                        f"{early_metric_used} did not improve by "
-                        f"{early_stopping_min_delta:g} for "
-                        f"{early_bad_epochs} validation checks",
-                        flush=True,
-                    )
+                    if reached_max_optimizer_steps:
+                        print(
+                            f"[{self.stage}] reached max optimizer steps: "
+                            f"{self.optimizer_step}/{self.max_optimizer_steps}",
+                            flush=True,
+                        )
+                    else:
+                        print(
+                            f"[{self.stage}] early stopping after epoch {epoch + 1}: "
+                            f"{early_metric_used} did not improve by "
+                            f"{early_stopping_min_delta:g} for "
+                            f"{early_bad_epochs} validation checks",
+                            flush=True,
+                        )
             if self.distributed:
                 stop_tensor = torch.tensor(
                     int(stop_training),

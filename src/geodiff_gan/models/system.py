@@ -6,7 +6,12 @@ from typing import TYPE_CHECKING, Any, Literal
 import torch
 from torch import nn
 
-from .base import FidelitySwinIRBase, SwinIRBase
+from .base import (
+    FidelityRDNBase,
+    FidelitySwinIRBase,
+    FidelitySwinIRV2Base,
+    SwinIRBase,
+)
 from .blocks import high_pass
 from .degradation import back_project, default_degradation, sensor_degrade
 from .diffusion import ConditionalDiffusionUNet, DiffusionBatch, DiffusionScheduler
@@ -38,6 +43,7 @@ class GeoDiffOutput:
     raw_edit_residual: torch.Tensor
     evidence_residual: torch.Tensor
     trust_map: torch.Tensor
+    trust_content: torch.Tensor
     ungated_sr: torch.Tensor
     pretrust_sr: torch.Tensor
     sr_anchor: torch.Tensor
@@ -64,6 +70,13 @@ class GeoDiffGAN(nn.Module):
         base_architecture: str = "swinir",
         base_group_size: int = 4,
         base_radiometric_calibration: bool = True,
+        base_spatial_radiometric_calibration: bool = False,
+        base_rdn_blocks: int = 20,
+        base_rdn_layers: int = 6,
+        base_rdn_growth: int = 32,
+        base_swin_groups: int = 6,
+        base_swin_blocks_per_group: int = 6,
+        base_mlp_ratio: float = 2.0,
         latent_channels: int = 4,
         vae_channels: int = 64,
         vae_upsample_mode: str = "pixelshuffle",
@@ -87,6 +100,7 @@ class GeoDiffGAN(nn.Module):
         trust_blocks: int = 2,
         trust_initial_scale: float = 0.25,
         trust_maximum_scale: float = 1.0,
+        trust_mode: str = "scalar",
         abstention_confidence_floor: float = 0.0,
         uncertainty_scale: float = 0.0025,
         use_back_projection: bool = True,
@@ -143,9 +157,48 @@ class GeoDiffGAN(nn.Module):
                 output_channels=output_channels,
                 radiometric_calibration=base_radiometric_calibration,
             )
+        elif base_architecture == "fidelity_rdn":
+            if base_upsample_mode != "resize_conv":
+                raise ValueError(
+                    "fidelity_rdn requires base_upsample_mode='resize_conv'"
+                )
+            self.base = FidelityRDNBase(
+                in_channels=self.base_input_channels,
+                channels=base_embed_dim,
+                blocks=base_rdn_blocks,
+                layers=base_rdn_layers,
+                growth_channels=base_rdn_growth,
+                scale=scale,
+                output_channels=output_channels,
+                radiometric_calibration=base_radiometric_calibration,
+                spatial_radiometric_calibration=(
+                    base_spatial_radiometric_calibration
+                ),
+            )
+        elif base_architecture == "fidelity_swinir_v2":
+            if base_upsample_mode != "resize_conv":
+                raise ValueError(
+                    "fidelity_swinir_v2 requires base_upsample_mode='resize_conv'"
+                )
+            self.base = FidelitySwinIRV2Base(
+                in_channels=self.base_input_channels,
+                embed_dim=base_embed_dim,
+                groups=base_swin_groups,
+                blocks_per_group=base_swin_blocks_per_group,
+                window_size=window_size,
+                heads=base_heads,
+                mlp_ratio=base_mlp_ratio,
+                scale=scale,
+                output_channels=output_channels,
+                radiometric_calibration=base_radiometric_calibration,
+                spatial_radiometric_calibration=(
+                    base_spatial_radiometric_calibration
+                ),
+            )
         else:
             raise ValueError(
-                "base_architecture must be 'swinir' or 'fidelity_swinir'"
+                "base_architecture must be one of: swinir, fidelity_swinir, "
+                "fidelity_rdn, fidelity_swinir_v2"
             )
         self.base_architecture = base_architecture
         self.vae = ResidualVAE(
@@ -181,6 +234,9 @@ class GeoDiffGAN(nn.Module):
         )
         self.use_base_referenced_trust = use_base_referenced_trust
         self.trust_maximum_scale = float(trust_maximum_scale)
+        if trust_mode not in ("scalar", "per_band"):
+            raise ValueError("trust_mode must be 'scalar' or 'per_band'")
+        self.trust_mode = trust_mode
         self.trust_controller = (
             BaseReferencedTrustController(
                 content_channels=mapper_channels,
@@ -189,6 +245,8 @@ class GeoDiffGAN(nn.Module):
                 initial_scale=trust_initial_scale,
                 maximum_scale=trust_maximum_scale,
                 blocks=trust_blocks,
+                mode=trust_mode,
+                output_channels=output_channels,
             )
             if use_base_referenced_trust
             else nn.Identity()
@@ -212,6 +270,17 @@ class GeoDiffGAN(nn.Module):
             base_radiometric_calibration=model.get(
                 "base_radiometric_calibration", True
             ),
+            base_spatial_radiometric_calibration=model.get(
+                "base_spatial_radiometric_calibration", False
+            ),
+            base_rdn_blocks=model.get("base_rdn_blocks", 20),
+            base_rdn_layers=model.get("base_rdn_layers", 6),
+            base_rdn_growth=model.get("base_rdn_growth", 32),
+            base_swin_groups=model.get("base_swin_groups", 6),
+            base_swin_blocks_per_group=model.get(
+                "base_swin_blocks_per_group", 6
+            ),
+            base_mlp_ratio=model.get("base_mlp_ratio", 2.0),
             latent_channels=model.get("latent_channels", 4),
             vae_channels=model.get("vae_channels", 64),
             vae_upsample_mode=model.get("vae_upsample_mode", "pixelshuffle"),
@@ -244,6 +313,7 @@ class GeoDiffGAN(nn.Module):
             trust_blocks=model.get("trust_blocks", 2),
             trust_initial_scale=model.get("trust_initial_scale", 0.25),
             trust_maximum_scale=model.get("trust_maximum_scale", 1.0),
+            trust_mode=model.get("trust_mode", "scalar"),
             abstention_confidence_floor=model.get(
                 "abstention_confidence_floor", 0.0
             ),
@@ -337,6 +407,8 @@ class GeoDiffGAN(nn.Module):
             blend_strength = torch.ones_like(evidence)
         effective = self._effective_confidence(blend_strength)
         abstained = base + effective * (image - base)
+        if confidence.shape[1] != 1:
+            confidence = confidence.mean(dim=1, keepdim=True)
         return abstained.clamp(0, 1), confidence, 1 - confidence
 
     @staticmethod
@@ -360,6 +432,9 @@ class GeoDiffGAN(nn.Module):
         mapped: MapperOutput,
         lr_features: list[torch.Tensor],
         base: torch.Tensor,
+        consistency_lr: torch.Tensor | None = None,
+        degradation: torch.Tensor | None = None,
+        sample_variance: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Apply high-pass, evidence and base-referenced trust constraints."""
         detail_residual = high_pass(raw_detail)
@@ -369,6 +444,17 @@ class GeoDiffGAN(nn.Module):
         evidence_residual = detail_residual * self._effective_confidence(
             evidence_hr
         )
+        consistency_error = None
+        if consistency_lr is not None and degradation is not None:
+            candidate = (base + evidence_residual).clamp(0, 1)
+            candidate_lr = sensor_degrade(
+                candidate,
+                degradation,
+                scale=self.scale,
+                add_noise=False,
+                severity=self.degradation_severity,
+            )
+            consistency_error = candidate_lr - consistency_lr
         if self.use_base_referenced_trust:
             trust_map = self.trust_controller(
                 mapped.content,
@@ -376,6 +462,8 @@ class GeoDiffGAN(nn.Module):
                 mapped.evidence_confidence,
                 base,
                 evidence_residual,
+                consistency_error=consistency_error,
+                sample_variance=sample_variance,
             )
         else:
             trust_map = torch.ones_like(evidence_hr)
@@ -406,6 +494,148 @@ class GeoDiffGAN(nn.Module):
             degradation,
             mode_values,
             lr_features[1],
+        )
+
+    @torch.no_grad()
+    def sample_latent(
+        self,
+        lr: torch.Tensor,
+        context: torch.Tensor,
+        degradation: torch.Tensor | None = None,
+        mode: Mode = "sr",
+        sample_steps: int = 20,
+        guidance_scale: float = 1.0,
+        null_context: torch.Tensor | None = None,
+        generator: torch.Generator | None = None,
+        base: torch.Tensor | None = None,
+        lr_features: list[torch.Tensor] | None = None,
+        conditioning_prepared: bool = False,
+        debug_callback: Any | None = None,
+        debug_interval: int = 0,
+    ) -> torch.Tensor:
+        """Sample only the residual latent while keeping diffusion frozen."""
+        degradation = (
+            default_degradation(lr.shape[0], lr.device, lr.dtype)
+            if degradation is None
+            else degradation
+        )
+        if not conditioning_prepared:
+            context, degradation = self.apply_ablation_inputs(context, degradation)
+        if null_context is not None and not self.use_text_conditioning:
+            null_context = torch.zeros_like(null_context)
+        base = self.predict_base(lr) if base is None else base
+        lr_features = self.lr_encoder(lr) if lr_features is None else lr_features
+        latent_height = base.shape[-2] // self.vae.downsample_factor
+        latent_width = base.shape[-1] // self.vae.downsample_factor
+        mode_values = self.mode_tensor(mode, lr.shape[0], lr.device)
+        return self.scheduler.ddim_sample(
+            self.diffusion,
+            (lr.shape[0], self.latent_channels, latent_height, latent_width),
+            context,
+            degradation,
+            mode_values,
+            lr_features[1],
+            sample_steps=sample_steps,
+            guidance_scale=guidance_scale,
+            null_context=null_context,
+            generator=generator,
+            debug_callback=debug_callback,
+            debug_interval=debug_interval,
+        )
+
+    def aggregate_sr_outputs(
+        self,
+        outputs: list[GeoDiffOutput],
+        lr_features: list[torch.Tensor],
+        projection_lr: torch.Tensor,
+        degradation: torch.Tensor,
+        back_projection_steps: int = 0,
+    ) -> GeoDiffOutput:
+        """Fuse sampled proposals once using their mean and spatial variance."""
+        if not outputs:
+            raise ValueError("aggregate_sr_outputs requires at least one proposal")
+        if back_projection_steps < 0:
+            raise ValueError("back_projection_steps must be non-negative")
+        base = outputs[0].base
+        evidence = torch.stack(
+            [value.evidence_confidence for value in outputs]
+        ).mean(0)
+        content = torch.stack([value.trust_content for value in outputs]).mean(0)
+        candidate_residual = torch.stack(
+            [value.evidence_residual for value in outputs]
+        ).mean(0)
+        candidate_images = torch.stack(
+            [(base + value.evidence_residual).clamp(0, 1) for value in outputs]
+        )
+        sample_variance = candidate_images.var(0, unbiased=False).mean(
+            dim=1,
+            keepdim=True,
+        )
+        candidate_lr = sensor_degrade(
+            (base + candidate_residual).clamp(0, 1),
+            degradation,
+            scale=self.scale,
+            add_noise=False,
+            severity=self.degradation_severity,
+        )
+        consistency_error = candidate_lr - projection_lr
+        if self.use_base_referenced_trust:
+            trust_map = self.trust_controller(
+                content,
+                lr_features[1],
+                evidence,
+                base,
+                candidate_residual,
+                consistency_error=consistency_error,
+                sample_variance=sample_variance,
+            )
+        else:
+            trust_map = torch.ones_like(evidence)
+        trusted_residual = candidate_residual * trust_map
+        estimate = (base + trusted_residual).clamp(0, 1)
+        image = back_project(
+            estimate,
+            projection_lr,
+            degradation,
+            scale=self.scale,
+            iterations=(back_projection_steps if self.use_back_projection else 0),
+            step_size=0.5,
+            severity=self.degradation_severity,
+        )
+        raw_detail = torch.stack(
+            [value.raw_detail_residual for value in outputs]
+        ).mean(0)
+        raw_edit = torch.stack([value.raw_edit_residual for value in outputs]).mean(0)
+        ungated = (base + high_pass(raw_detail)).clamp(0, 1)
+        pretrust = (base + candidate_residual).clamp(0, 1)
+        normalized_trust = (
+            trust_map / max(self.trust_maximum_scale, 1e-8)
+        ).clamp(0, 1)
+        metadata = [dict(value) for value in outputs[0].metadata]
+        for value in metadata:
+            value["ensemble_samples"] = len(outputs)
+            value["trust_mode"] = self.trust_mode
+        return GeoDiffOutput(
+            image=image,
+            base=base,
+            residual=trusted_residual,
+            latent=torch.stack([value.latent for value in outputs]).mean(0),
+            evidence_confidence=evidence,
+            edit_permission=torch.stack(
+                [value.edit_permission for value in outputs]
+            ).mean(0),
+            abstention_map=1
+            - (self._resize_policy(evidence, base.shape[-2:]) * normalized_trust)
+            .mean(dim=1, keepdim=True),
+            raw_detail_residual=raw_detail,
+            raw_edit_residual=raw_edit,
+            evidence_residual=candidate_residual,
+            trust_map=trust_map,
+            trust_content=content,
+            ungated_sr=ungated,
+            pretrust_sr=pretrust,
+            sr_anchor=estimate,
+            metadata=metadata,
         )
 
     def decode_latent(
@@ -451,7 +681,14 @@ class GeoDiffGAN(nn.Module):
         raw_detail = decoded.detail_residual
         raw_edit = decoded.edit_residual
         edit_hr = self._resize_policy(mapped.edit_permission, base.shape[-2:])
-        fusion = self.fuse_sr_detail(raw_detail, mapped, lr_features, base)
+        fusion = self.fuse_sr_detail(
+            raw_detail,
+            mapped,
+            lr_features,
+            base,
+            consistency_lr=consistency_lr,
+            degradation=degradation,
+        )
         detail_residual = fusion["detail_residual"]
         evidence_hr = fusion["evidence_hr"]
         evidence_residual = fusion["evidence_residual"]
@@ -542,7 +779,7 @@ class GeoDiffGAN(nn.Module):
             ).clamp(0, 1)
             diagnostics.capture(
                 "output.abstention_map",
-                1 - evidence_hr * normalized_trust,
+                1 - (evidence_hr * normalized_trust).mean(dim=1, keepdim=True),
                 visual="heatmap",
             )
         if mode == "sr":
@@ -662,11 +899,13 @@ class GeoDiffGAN(nn.Module):
             latent=latent,
             evidence_confidence=mapped.evidence_confidence,
             edit_permission=mapped.edit_permission,
-            abstention_map=1 - evidence_hr * normalized_trust,
+            abstention_map=1
+            - (evidence_hr * normalized_trust).mean(dim=1, keepdim=True),
             raw_detail_residual=raw_detail,
             raw_edit_residual=raw_edit,
             evidence_residual=evidence_residual,
             trust_map=trust_map,
+            trust_content=mapped.content,
             ungated_sr=ungated_sr,
             pretrust_sr=pretrust_sr,
             sr_anchor=sr_anchor,
@@ -701,21 +940,21 @@ class GeoDiffGAN(nn.Module):
             null_context = torch.zeros_like(null_context)
         base = self.predict_base(lr) if base is None else base
         lr_features = self.lr_encoder(lr) if lr_features is None else lr_features
-        latent_height = base.shape[-2] // self.vae.downsample_factor
-        latent_width = base.shape[-1] // self.vae.downsample_factor
-        mode_values = self.mode_tensor(mode, lr.shape[0], lr.device)
-        latent = self.scheduler.ddim_sample(
-            self.diffusion,
-            (lr.shape[0], self.latent_channels, latent_height, latent_width),
+        latent = self.sample_latent(
+            lr,
             context,
             degradation,
-            mode_values,
-            lr_features[1],
+            mode=mode,
             sample_steps=sample_steps,
             guidance_scale=guidance_scale,
             null_context=null_context,
             generator=generator,
-            debug_callback=diagnostics.diffusion_step if diagnostics is not None else None,
+            base=base,
+            lr_features=lr_features,
+            conditioning_prepared=True,
+            debug_callback=(
+                diagnostics.diffusion_step if diagnostics is not None else None
+            ),
             debug_interval=diffusion_debug_interval,
         )
         return self.decode_latent(
