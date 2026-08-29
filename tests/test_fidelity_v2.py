@@ -355,6 +355,62 @@ class FidelityV2Tests(unittest.TestCase):
             history = (output / "training_history.jsonl").read_text().splitlines()
             self.assertEqual(len(history), 2)
 
+    def test_wall_time_budget_stops_after_a_complete_optimizer_step(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            patch = root / "patch.npz"
+            np.savez_compressed(
+                patch,
+                hr=np.random.default_rng(9).random((3, 64, 64)).astype(np.float32),
+            )
+            manifest = root / "manifest.jsonl"
+            write_manifest(
+                manifest,
+                [
+                    ManifestRecord(
+                        patch=str(patch),
+                        tile_id="WALL_BUDGET",
+                        split="train",
+                        row=index,
+                        col=0,
+                        valid_fraction=1.0,
+                    )
+                    for index in range(4)
+                ],
+            )
+            config = load_config(
+                ROOT / "configs/smoke.yaml",
+                ROOT / "configs/default.yaml",
+            )
+            output = root / "run"
+            config["data"].update({"manifest": str(manifest), "captions": None})
+            config["model"]["use_text_conditioning"] = False
+            config["training"].update(
+                {
+                    "stage": "base",
+                    "output_dir": str(output),
+                    "epochs": 1,
+                    "max_optimizer_steps": 100,
+                    "max_wall_time_minutes": 1e-9,
+                    "batch_size": 1,
+                    "gradient_accumulation": 1,
+                    "num_workers": 0,
+                    "init_checkpoint": None,
+                    "resume": None,
+                    "auto_resume": False,
+                    "progress_mode": "quiet",
+                    "validate_every": 100,
+                    "lr_scheduler_type": "cosine_warmup",
+                    "warmup_steps": 1,
+                }
+            )
+            Trainer(config).train()
+            checkpoint = output / "base_epoch_0000.pt"
+            self.assertTrue(checkpoint.exists())
+            payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+            self.assertEqual(payload["extra"]["optimizer_step"], 1)
+            self.assertTrue(payload["extra"]["early_stopping"]["stopped"])
+
     def test_sampled_joint_freezes_base_and_diffusion_but_updates_heads(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

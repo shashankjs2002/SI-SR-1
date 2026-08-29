@@ -75,6 +75,21 @@ class FidelityV2NotebookTests(unittest.TestCase):
         self.assertEqual(config["data"]["input_mode"], "paired")
         self.assertEqual(model["scale"], 3)
 
+    def test_default_profile_is_bounded_for_one_kaggle_session(self) -> None:
+        required = (
+            'EXECUTION_PROFILE = "kaggle_5h"',
+            '"architecture_race": False',
+            '"full_frame_epochs": 0',
+            '"final_refit": False',
+            '"base32": 105',
+            '"diffusion": 60',
+            'max_wall_time_minutes',
+            'AUTO_DISCOVER_ATTACHED_RDN = True',
+        )
+        for text in required:
+            with self.subTest(text=text):
+                self.assertIn(text, self.source)
+
 
 if __name__ == "__main__":
     unittest.main()

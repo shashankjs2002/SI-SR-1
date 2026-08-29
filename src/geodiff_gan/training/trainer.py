@@ -1601,6 +1601,11 @@ class Trainer:
             0,
             int(training.get("progress_updates_per_epoch", 2)),
         )
+        max_wall_time_minutes = max(
+            0.0,
+            float(training.get("max_wall_time_minutes", 0.0)),
+        )
+        max_wall_time_seconds = max_wall_time_minutes * 60.0
         use_tqdm = progress_mode == "tqdm" and self.is_main
         if (
             self.max_optimizer_steps > 0
@@ -1637,6 +1642,7 @@ class Trainer:
             metrics: defaultdict[str, float] = defaultdict(float)
             completed_batches = 0
             reached_max_optimizer_steps = False
+            reached_max_wall_time = False
             debug_exports = 0
             self.model.train()
             if self.text_encoder is not None:
@@ -1772,6 +1778,11 @@ class Trainer:
                         self.max_optimizer_steps > 0
                         and self.optimizer_step >= self.max_optimizer_steps
                     )
+                    reached_max_wall_time = (
+                        max_wall_time_seconds > 0
+                        and time.monotonic() - stage_started
+                        >= max_wall_time_seconds
+                    )
                 if diagnostics is not None:
                     if self.stage != "diffusion":
                         if self.stage == "base":
@@ -1852,17 +1863,21 @@ class Trainer:
                         f"epoch_eta={self._duration(batch_eta)}",
                         flush=True,
                     )
-                if reached_max_optimizer_steps:
+                if reached_max_optimizer_steps or reached_max_wall_time:
                     break
             reduced_metrics = self._reduce_metrics(metrics)
             validation_metrics = {}
             if (
                 len(validation_loader.dataset) > 0
-                and (epoch + 1) % validate_every == 0
+                and (
+                    (epoch + 1) % validate_every == 0
+                    or reached_max_optimizer_steps
+                    or reached_max_wall_time
+                )
             ):
                 with self._evaluation_parameters():
                     validation_metrics = self._validate(validation_loader, epoch)
-            stop_training = reached_max_optimizer_steps
+            stop_training = reached_max_optimizer_steps or reached_max_wall_time
             if self.is_main:
                 denominator = max(completed_batches, 1)
                 epoch_metrics = {
@@ -2068,6 +2083,10 @@ class Trainer:
                             f" optimizer_steps={self.optimizer_step}/"
                             f"{self.max_optimizer_steps}"
                         )
+                    if reached_max_wall_time:
+                        summary += (
+                            f" wall_time_limit={max_wall_time_minutes:g}m"
+                        )
                     summary += (
                         f" elapsed={self._duration(time.monotonic() - stage_started)} "
                         f"stage_eta={self._duration(stage_eta)}"
@@ -2078,6 +2097,13 @@ class Trainer:
                         print(
                             f"[{self.stage}] reached max optimizer steps: "
                             f"{self.optimizer_step}/{self.max_optimizer_steps}",
+                            flush=True,
+                        )
+                    elif reached_max_wall_time:
+                        print(
+                            f"[{self.stage}] reached wall-time budget: "
+                            f"{max_wall_time_minutes:g} minutes; "
+                            f"optimizer_steps={self.optimizer_step}",
                             flush=True,
                         )
                     else:

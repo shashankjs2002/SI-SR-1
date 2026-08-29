@@ -40,6 +40,12 @@ then calibrates per-band trust over sampled diffusion residuals. It contains no
 PixelShuffle, GAN loss, natural-image perceptual loss, or test-time target
 calibration. The official 100-pair test is opened only after the validation
 gates pass. A 35 dB result is a target, not a guaranteed outcome.
+
+The default `kaggle_5h` execution profile is a bounded experiment, not the
+full publication schedule. It uses RDN directly, stops every stage at a hard
+wall-clock budget, and does not duplicate the complete pipeline in an all-data
+refit. Switch to `publication` only when resumable multi-session storage is
+available.
 """
     ),
     markdown("## 0. Protocol and controls"),
@@ -47,12 +53,14 @@ gates pass. A 35 dB result is a target, not a guaranteed outcome.
         r"""
 from pathlib import Path
 from collections import Counter
-import copy, hashlib, json, math, os, shutil, stat, subprocess, sys, time
+import copy, hashlib, inspect, json, math, os, shutil, stat, subprocess, sys, time
 
 REPOSITORY_URL = "https://github.com/shashankjs2002/SI-SR-1.git"
 REPOSITORY_BRANCH = "SR-3x"
 REPOSITORY_DIR = Path("/kaggle/working/geodiff-gan-sr3x-fidelity-v2")
-PROTOCOL_ID = "oli2msi_fullframe_clip03_fidelity_trust_v2"
+EXECUTION_PROFILE = "kaggle_5h"  # kaggle_5h | publication | smoke
+PROFILE_SUFFIX = "" if EXECUTION_PROFILE == "publication" else f"_{EXECUTION_PROFILE}"
+PROTOCOL_ID = "oli2msi_fullframe_clip03_fidelity_trust_v2" + PROFILE_SUFFIX
 WORK_ROOT = Path("/kaggle/working") / PROTOCOL_ID
 PATCH_ROOT, CONFIG_ROOT = WORK_ROOT / "patches", WORK_ROOT / "configs"
 RUN_ROOT, EVAL_ROOT = WORK_ROOT / "runs", WORK_ROOT / "evaluation"
@@ -65,29 +73,53 @@ BASELINE_BUNDLE = WORK_ROOT / "baseline_v1_read_only"
 OLI2MSI_DATA_ROOT = None
 V1_BASE_CHECKPOINT_OVERRIDE = None
 V1_CONFIG_OVERRIDE = None
+ATTACHED_RDN_CHECKPOINT = None  # Optional .pt under /kaggle/input.
+AUTO_DISCOVER_ATTACHED_RDN = True
 REPORTED_V1_VALIDATION_BASE_PSNR = 35.819096
-FAST_DEV_RUN = False
-RUN_FINAL_REFIT = True
-RUN_FINAL_TEST = True
 FORCE_REEVALUATE = False
 
 EXPECTED_TRAIN, EXPECTED_TEST = 5225, 100
 VALIDATION_PERCENT, RANDOM_SEED = 10, 42
 LR_SIZE, SCALE, HR_SIZE = 160, 3, 480
 REFLECTANCE_MAX, MINIMUM_VALID_FRACTION = 0.3, 0.99
-UPDATES = {
-    "race": 20 if FAST_DEV_RUN else 25_000,
-    "base32": 30 if FAST_DEV_RUN else 150_000,
-    "base64": 20 if FAST_DEV_RUN else 40_000,
-    "spatial": 10 if FAST_DEV_RUN else 10_000,
-    "vae": 20 if FAST_DEV_RUN else 60_000,
-    "diffusion": 30 if FAST_DEV_RUN else 150_000,
-    "proposal": 20 if FAST_DEV_RUN else 30_000,
-    "trust": 10 if FAST_DEV_RUN else 10_000,
+PROFILES = {
+    "kaggle_5h": {
+        "updates": {"race": 0, "base32": 18_000, "base64": 1_500, "spatial": 0, "vae": 600, "diffusion": 1_200, "proposal": 1_200, "trust": 1_200},
+        "minutes": {"race": 0, "base32": 105, "base64": 35, "spatial": 0, "vae": 30, "diffusion": 60, "proposal": 40, "trust": 45},
+        "architecture_race": False, "spatial_training": False,
+        "full_frame_epochs": 0, "train_validation_limit": 64,
+        "final_refit": False, "final_test": True,
+        "final_samples": 4, "final_steps": 20,
+    },
+    "publication": {
+        "updates": {"race": 25_000, "base32": 150_000, "base64": 40_000, "spatial": 10_000, "vae": 60_000, "diffusion": 150_000, "proposal": 30_000, "trust": 10_000},
+        "minutes": {name: 0 for name in ("race", "base32", "base64", "spatial", "vae", "diffusion", "proposal", "trust")},
+        "architecture_race": True, "spatial_training": True,
+        "full_frame_epochs": 8, "train_validation_limit": None,
+        "final_refit": True, "final_test": True,
+        "final_samples": 4, "final_steps": 20,
+    },
+    "smoke": {
+        "updates": {"race": 20, "base32": 30, "base64": 20, "spatial": 10, "vae": 20, "diffusion": 30, "proposal": 20, "trust": 10},
+        "minutes": {name: 0 for name in ("race", "base32", "base64", "spatial", "vae", "diffusion", "proposal", "trust")},
+        "architecture_race": True, "spatial_training": True,
+        "full_frame_epochs": 1, "train_validation_limit": 8,
+        "final_refit": False, "final_test": True,
+        "final_samples": 2, "final_steps": 2,
+    },
 }
-FULL_FRAME_EPOCHS = 1 if FAST_DEV_RUN else 8
+if EXECUTION_PROFILE not in PROFILES:
+    raise ValueError(f"Unknown execution profile: {EXECUTION_PROFILE}")
+PROFILE = PROFILES[EXECUTION_PROFILE]
+FAST_DEV_RUN = EXECUTION_PROFILE == "smoke"
+UPDATES, STAGE_MINUTES = PROFILE["updates"], PROFILE["minutes"]
+RUN_ARCHITECTURE_RACE = PROFILE["architecture_race"]
+RUN_SPATIAL_TRAINING = PROFILE["spatial_training"]
+FULL_FRAME_EPOCHS = PROFILE["full_frame_epochs"]
+TRAIN_VALIDATION_LIMIT = PROFILE["train_validation_limit"]
+RUN_FINAL_REFIT, RUN_FINAL_TEST = PROFILE["final_refit"], PROFILE["final_test"]
 VAL_LIMIT = 8 if FAST_DEV_RUN else None
-FINAL_SAMPLES, FINAL_STEPS = (2, 2) if FAST_DEV_RUN else (4, 20)
+FINAL_SAMPLES, FINAL_STEPS = PROFILE["final_samples"], PROFILE["final_steps"]
 
 for directory in (WORK_ROOT, PATCH_ROOT, CONFIG_ROOT, RUN_ROOT, EVAL_ROOT, ARTIFACT_ROOT):
     directory.mkdir(parents=True, exist_ok=True)
@@ -114,7 +146,11 @@ def save_state(**values):
     temporary.write_text(json.dumps(current, indent=2)); temporary.replace(STATE_PATH)
     return current
 
-print(PROTOCOL_ID, WORK_ROOT, "publication=", not FAST_DEV_RUN)
+print(PROTOCOL_ID, WORK_ROOT, "profile=", EXECUTION_PROFILE)
+print("Training budget (minutes):", STAGE_MINUTES, "total=", sum(STAGE_MINUTES.values()))
+if EXECUTION_PROFILE == "kaggle_5h":
+    print("Fresh /kaggle/working storage detected by design. Attach an earlier notebook output as a Kaggle input to reuse its RDN checkpoint.")
+save_state(execution_profile=EXECUTION_PROFILE, stage_minutes=STAGE_MINUTES, update_caps=UPDATES)
 """
     ),
     markdown("## 1. Install and verify SR-3x"),
@@ -137,6 +173,7 @@ sys.path.insert(0, str(REPOSITORY_DIR / "src")); os.chdir(REPOSITORY_DIR)
 import numpy as np, pandas as pd, matplotlib.pyplot as plt, rasterio, torch, yaml
 from torch import nn
 from geodiff_gan.models.system import GeoDiffGAN
+from geodiff_gan.training.trainer import Trainer
 
 branch = subprocess.check_output(["git", "branch", "--show-current"], cwd=REPOSITORY_DIR, text=True).strip()
 commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPOSITORY_DIR, text=True).strip()
@@ -151,7 +188,10 @@ if offenders:
     raise RuntimeError(f"PixelShuffle found: {offenders}")
 del probe
 print(branch, commit, torch.__version__, torch.cuda.get_device_name(0))
-save_state(repository_commit=commit, repository_branch=branch)
+wall_time_supported = "max_wall_time_minutes" in inspect.getsource(Trainer.train)
+if EXECUTION_PROFILE == "kaggle_5h" and not wall_time_supported:
+    print("WARNING: this remote branch predates hard wall-time stopping. Optimizer-step caps still bound the run, but commit/push the current SR-3x changes for exact time limits.")
+save_state(repository_commit=commit, repository_branch=branch, wall_time_supported=wall_time_supported)
 """
     ),
     markdown("## 2. Preserve V1 artifacts"),
@@ -334,69 +374,79 @@ ablation = pd.DataFrame(ablation); ablation.to_csv(ARTIFACT_ROOT / "ablations.cs
 display(ablation[["label", "psnr", "base_psnr", "psnr_delta_vs_base", "ssim", "fraction_beating_base_psnr", "edge_f1", "ergas", "sam_degrees"]])
 """
     ),
-    markdown("## 24. Refit the locked pipeline on all 5,225 training pairs"),
+    markdown("## 24. Select the final checkpoint; optionally refit on all training pairs"),
     code(
         r"""
 from dataclasses import replace as dataclass_replace
 s = state()
-if not s.get("acceptance", {}).get("passed"): raise RuntimeError("Validation gates failed; test remains locked")
-if not RUN_FINAL_REFIT: raise RuntimeError("Set RUN_FINAL_REFIT=True")
-refit_records = [dataclass_replace(record, split="train") if record.split == "val" else record for record in records]; write_manifest(REFIT_MANIFEST, refit_records)
-counts = Counter(record.split for record in refit_records)
-if counts["train"] != len(train_pairs) + len(val_pairs) or counts["test"] != len(test_pairs): raise RuntimeError(counts)
-
-def refit(label, stage, parent, crop, updates, batch, accumulation, lr, objective, modules=None, epochs=500, sample_steps=None, trust_samples=None):
-    overrides = None
-    if sample_steps:
-        overrides = {
-            "joint_latent_source": "sampled",
-            "joint_sample_steps": sample_steps,
-            "trust_samples": trust_samples,
-        }
-    path = locked_config(
-        label, stage, parent=parent, manifest=REFIT_MANIFEST,
-        model=s["winner_model"], crop=crop, max_steps=updates, epochs=epochs,
-        batch=batch, accumulation=accumulation, lr=lr, objective=objective,
-        modules=modules, validate_every=1, validation_limit=None,
-        training_overrides=overrides,
+if not s.get("acceptance", {}).get("passed"):
+    final_config, final_checkpoint = Path(s["dev_trust_config"]), Path(s["dev_trust"])
+    save_state(
+        test_locked=True, refit_skipped=True,
+        refit_reason="validation acceptance gates failed",
+        final_config=str(final_config), final_checkpoint=str(final_checkpoint),
+        final_checkpoint_sha256=checkpoint_sha256(final_checkpoint),
     )
-    return path, train(label, path, stage, best=False)
+    print("Validation gates failed. Test remains locked, but validation artifacts will still be plotted and bundled.")
+elif not RUN_FINAL_REFIT:
+    final_config, final_checkpoint = Path(s["dev_trust_config"]), Path(s["dev_trust"])
+    save_state(
+        refit_skipped=True,
+        refit_reason=f"disabled by {EXECUTION_PROFILE} time budget",
+        final_config=str(final_config), final_checkpoint=str(final_checkpoint),
+        final_checkpoint_sha256=checkpoint_sha256(final_checkpoint),
+    )
+    print("All-data refit skipped; using the validation-selected development checkpoint:", final_checkpoint)
+else:
+    refit_records = [dataclass_replace(record, split="train") if record.split == "val" else record for record in records]; write_manifest(REFIT_MANIFEST, refit_records)
+    counts = Counter(record.split for record in refit_records)
+    if counts["train"] != len(train_pairs) + len(val_pairs) or counts["test"] != len(test_pairs): raise RuntimeError(counts)
 
-_, b32 = refit("refit_base32", "base", None, 32, UPDATES["base32"], 4, 4, 1e-4, BASE_WARM)
-_, b64 = refit("refit_base64", "base", b32, 64, UPDATES["base64"], 1, 16, 5e-5, BASE_WARM)
-_, base = refit("refit_base_full", "base", b64, None, 0, 1, 8, 1e-5, BASE_FULL, epochs=FULL_FRAME_EPOCHS)
-if s["spatial_head_enabled"]: _, base = refit("refit_base_spatial", "base", base, 64, UPDATES["spatial"], 1, 16, 1e-5, BASE_FULL)
-_, vae = refit("refit_vae", "vae", base, 64, UPDATES["vae"], 2, 8, 1e-4, VAE_LOSS, ["vae", "lr_encoder", "mapper", "decoder"])
-_, diffusion = refit("refit_diffusion", "diffusion", vae, 64, UPDATES["diffusion"], 2, 8, 1e-4, DIFFUSION_LOSS, ["diffusion"])
-_, proposal = refit("refit_proposal", "joint", diffusion, 64, UPDATES["proposal"], 1, 8, 2e-5, PROPOSAL_LOSS, ["lr_encoder", "mapper", "decoder"], sample_steps=8, trust_samples=1)
-final_config, final_checkpoint = refit("refit_trust", "joint", proposal, 64, UPDATES["trust"], 1, 8, 1e-5, TRUST_LOSS, ["trust_controller"], sample_steps=20, trust_samples=2)
-refit_checkpoints = {
-    "base32": str(b32), "base64": str(b64), "base": str(base),
-    "vae": str(vae), "diffusion": str(diffusion), "proposal": str(proposal),
-    "trust": str(final_checkpoint),
-}
-save_state(
-    refit_manifest_sha256=sha256(REFIT_MANIFEST),
-    refit_checkpoints=refit_checkpoints,
-    refit_checkpoint_sha256={
-        key: checkpoint_sha256(path) for key, path in refit_checkpoints.items()
-    },
-    final_config=str(final_config), final_checkpoint=str(final_checkpoint),
-    final_checkpoint_sha256=checkpoint_sha256(final_checkpoint),
-)
-print(final_checkpoint)
+    def refit(label, stage, parent, crop, updates, batch, accumulation, lr, objective, modules=None, epochs=1, sample_steps=None, trust_samples=None):
+        overrides = None
+        if sample_steps:
+            overrides = {"joint_latent_source": "sampled", "joint_sample_steps": sample_steps, "trust_samples": trust_samples}
+        path = locked_config(
+            label, stage, parent=parent, manifest=REFIT_MANIFEST,
+            model=s["winner_model"], crop=crop, max_steps=updates, epochs=epochs,
+            batch=batch, accumulation=accumulation, lr=lr, objective=objective,
+            modules=modules, validate_every=1, validation_limit=None,
+            max_wall_minutes=0,
+            training_overrides=overrides,
+        )
+        return path, train(label, path, stage, best=False)
+
+    _, b32 = refit("refit_base32", "base", None, 32, UPDATES["base32"], 4, 4, 1e-4, BASE_WARM)
+    _, b64 = refit("refit_base64", "base", b32, 64, UPDATES["base64"], 1, 16, 5e-5, BASE_WARM)
+    _, base = refit("refit_base_full", "base", b64, None, 0, 1, 8, 1e-5, BASE_FULL, epochs=FULL_FRAME_EPOCHS)
+    if s["spatial_head_enabled"]: _, base = refit("refit_base_spatial", "base", base, 64, UPDATES["spatial"], 1, 16, 1e-5, BASE_FULL)
+    _, vae = refit("refit_vae", "vae", base, 64, UPDATES["vae"], 2, 8, 1e-4, VAE_LOSS, ["vae", "lr_encoder", "mapper", "decoder"])
+    _, diffusion = refit("refit_diffusion", "diffusion", vae, 64, UPDATES["diffusion"], 2, 8, 1e-4, DIFFUSION_LOSS, ["diffusion"])
+    _, proposal = refit("refit_proposal", "joint", diffusion, 64, UPDATES["proposal"], 1, 8, 2e-5, PROPOSAL_LOSS, ["lr_encoder", "mapper", "decoder"], sample_steps=8, trust_samples=1)
+    final_config, final_checkpoint = refit("refit_trust", "joint", proposal, 64, UPDATES["trust"], 1, 8, 1e-5, TRUST_LOSS, ["trust_controller"], sample_steps=20, trust_samples=2)
+    refit_checkpoints = {"base32": str(b32), "base64": str(b64), "base": str(base), "vae": str(vae), "diffusion": str(diffusion), "proposal": str(proposal), "trust": str(final_checkpoint)}
+    save_state(
+        refit_manifest_sha256=sha256(REFIT_MANIFEST), refit_checkpoints=refit_checkpoints,
+        refit_checkpoint_sha256={key: checkpoint_sha256(path) for key, path in refit_checkpoints.items()},
+        final_config=str(final_config), final_checkpoint=str(final_checkpoint),
+        final_checkpoint_sha256=checkpoint_sha256(final_checkpoint),
+    )
+    print(final_checkpoint)
 """
     ),
     markdown("## 25. One-time official 100-pair test"),
     code(
         r"""
 s = state()
-if not RUN_FINAL_TEST or not s.get("acceptance", {}).get("passed"): raise RuntimeError("Test remains locked")
-if "final_checkpoint" not in s: raise RuntimeError("Complete refit first")
-if not FAST_DEV_RUN and split_counts["test"] != 100: raise RuntimeError("All 100 test pairs are required")
-test = evaluate("official_test_locked", s["final_config"], s["final_checkpoint"], "test", 4, 20, 1.0, 8 if FAST_DEV_RUN else 100)
-criteria = {"psnr_35": test["psnr"] >= 35, "gain_005": test["psnr_delta_vs_base"] >= 0.05, "ssim_non_degradation": test["ssim"] >= test["base_ssim"], "count": test["count"] == (8 if FAST_DEV_RUN else 100)}
-report = {"metrics": test, "criteria": criteria, "passed": all(criteria.values())}; (ARTIFACT_ROOT / "official_test.json").write_text(json.dumps(report, indent=2)); display(pd.DataFrame([{**test, **criteria}])); save_state(final_test=report)
+if not RUN_FINAL_TEST or not s.get("acceptance", {}).get("passed"):
+    test = None
+    print("Official test skipped because the validation gates did not pass or RUN_FINAL_TEST=False.")
+else:
+    if "final_checkpoint" not in s: raise RuntimeError("No final checkpoint was selected")
+    if not FAST_DEV_RUN and split_counts["test"] != 100: raise RuntimeError("All 100 test pairs are required")
+    test = evaluate("official_test_locked", s["final_config"], s["final_checkpoint"], "test", 4, 20, 1.0, 8 if FAST_DEV_RUN else 100)
+    criteria = {"psnr_35": test["psnr"] >= 35, "gain_005": test["psnr_delta_vs_base"] >= 0.05, "ssim_non_degradation": test["ssim"] >= test["base_ssim"], "count": test["count"] == (8 if FAST_DEV_RUN else 100)}
+    report = {"metrics": test, "criteria": criteria, "passed": all(criteria.values())}; (ARTIFACT_ROOT / "official_test.json").write_text(json.dumps(report, indent=2)); display(pd.DataFrame([{**test, **criteria}])); save_state(final_test=report)
 """
     ),
     markdown("## 26. PSNR, SSIM, and paired-delta plots"),
@@ -449,7 +499,7 @@ checkpoint_paths = {
         "winner_race_checkpoint", "dev_base32", "dev_base64", "dev_base_final",
         "dev_vae", "dev_diffusion", "dev_proposal", "dev_trust",
         "final_checkpoint",
-    ) if key in s
+    ) if s.get(key)
 }
 checkpoint_paths.update({
     f"refit_{key}": Path(path)
@@ -470,34 +520,50 @@ inventory = [{"path": str(path.relative_to(bundle)), "bytes": path.stat().st_siz
 
 Always report the achieved number, the full-frame `160 -> 480` protocol, all
 100 official test pairs, four samples, 20 diffusion steps, residual scale 1.0,
-and every failed gate. Do not present cropped `32 -> 96` paper results as if
-they used this stricter full-frame protocol.
+the execution profile, whether all-data refit was skipped, and every failed
+gate. Do not present cropped `32 -> 96` paper results as if they used this
+stricter full-frame protocol. A validation-only result is not a test result.
 """
     ),
 ]
 
 cells += [
-    markdown("## 12. Winner: 150,000 aligned 32 -> 96 updates"),
+    markdown("## 12. Train the selected base on aligned 32 -> 96 crops"),
     code(
         r"""
-s = state(); model, parent = s["winner_model"], Path(s["winner_race_checkpoint"])
-BASE32_CONFIG = locked_config("dev_base32", "base", parent=parent, model=model, crop=32, max_steps=UPDATES["base32"], batch=4, accumulation=4, lr=1e-4, objective=BASE_WARM)
-DEV_BASE32 = train("dev_base32", BASE32_CONFIG, "base"); save_state(dev_base32=str(DEV_BASE32))
-display(checkpoint_metrics(DEV_BASE32))
+s = state(); model = s["winner_model"]; parent = s.get("winner_race_checkpoint")
+BASE32_CONFIG = locked_config("dev_base32", "base", parent=parent, model=model, crop=32, max_steps=UPDATES["base32"], batch=4, accumulation=4, lr=1e-4, objective=BASE_WARM, max_wall_minutes=STAGE_MINUTES["base32"])
+if parent and int(s.get("attached_rdn_maturity", 0)) >= 2:
+    DEV_BASE32 = Path(parent)
+    print("Reusing attached crop-32-or-later RDN checkpoint:", DEV_BASE32)
+else:
+    DEV_BASE32 = train("dev_base32", BASE32_CONFIG, "base")
+save_state(dev_base32=str(DEV_BASE32)); display(checkpoint_metrics(DEV_BASE32))
 """
     ),
-    markdown("## 13. Winner: 40,000 aligned 64 -> 192 updates"),
+    markdown("## 13. Refine the base on aligned 64 -> 192 crops"),
     code(
         r"""
-s = state(); BASE64_CONFIG = locked_config("dev_base64", "base", parent=s["dev_base32"], model=s["winner_model"], crop=64, max_steps=UPDATES["base64"], batch=1, accumulation=16, lr=5e-5, objective=BASE_WARM)
-DEV_BASE64 = train("dev_base64", BASE64_CONFIG, "base"); save_state(dev_base64=str(DEV_BASE64)); display(checkpoint_metrics(DEV_BASE64))
+s = state(); BASE64_CONFIG = locked_config("dev_base64", "base", parent=s["dev_base32"], model=s["winner_model"], crop=64, max_steps=UPDATES["base64"], batch=1, accumulation=16, lr=5e-5, objective=BASE_WARM, max_wall_minutes=STAGE_MINUTES["base64"])
+if s.get("winner_race_checkpoint") and int(s.get("attached_rdn_maturity", 0)) >= 3:
+    DEV_BASE64 = Path(s["winner_race_checkpoint"])
+    print("Reusing attached crop-64-or-later RDN checkpoint:", DEV_BASE64)
+else:
+    DEV_BASE64 = train("dev_base64", BASE64_CONFIG, "base")
+save_state(dev_base64=str(DEV_BASE64)); display(checkpoint_metrics(DEV_BASE64))
 """
     ),
-    markdown("## 14. Winner: eight full-frame pure-MSE epochs"),
+    markdown("## 14. Optional full-frame pure-MSE fine-tuning"),
     code(
         r"""
-s = state(); BASE_FULL_CONFIG = locked_config("dev_base_full", "base", parent=s["dev_base64"], model=s["winner_model"], crop=None, max_steps=0, epochs=FULL_FRAME_EPOCHS, batch=1, accumulation=8, lr=1e-5, objective=BASE_FULL, validate_every=1)
-DEV_BASE_FULL = train("dev_base_full", BASE_FULL_CONFIG, "base"); save_state(dev_base_full=str(DEV_BASE_FULL), dev_base_config=str(BASE_FULL_CONFIG)); display(checkpoint_metrics(DEV_BASE_FULL))
+s = state()
+if FULL_FRAME_EPOCHS > 0:
+    BASE_FULL_CONFIG = locked_config("dev_base_full", "base", parent=s["dev_base64"], model=s["winner_model"], crop=None, max_steps=0, epochs=FULL_FRAME_EPOCHS, batch=1, accumulation=8, lr=1e-5, objective=BASE_FULL, validate_every=1)
+    DEV_BASE_FULL = train("dev_base_full", BASE_FULL_CONFIG, "base"); display(checkpoint_metrics(DEV_BASE_FULL))
+else:
+    BASE_FULL_CONFIG, DEV_BASE_FULL = BASE64_CONFIG, DEV_BASE64
+    print("Full-frame training skipped by the time budget; full-frame validation is still mandatory.")
+save_state(dev_base_full=str(DEV_BASE_FULL), dev_base_config=str(BASE_FULL_CONFIG))
 """
     ),
     markdown("## 15. Validation-only radiometric ceilings"),
@@ -525,25 +591,28 @@ s = state(); radiometric = radiometric_scan(s["dev_base_config"], s["dev_base_fu
     code(
         r"""
 s = state(); base_path, base_config, model = s["dev_base_full"], s["dev_base_config"], dict(s["winner_model"])
-if s["spatial_head_enabled"]:
+if s["spatial_head_enabled"] and RUN_SPATIAL_TRAINING:
     model["base_spatial_radiometric_calibration"] = True
-    path = locked_config("dev_base_spatial", "base", parent=base_path, model=model, crop=64, max_steps=UPDATES["spatial"], batch=1, accumulation=16, lr=1e-5, objective=BASE_FULL, validate_every=2)
+    path = locked_config("dev_base_spatial", "base", parent=base_path, model=model, crop=64, max_steps=UPDATES["spatial"], batch=1, accumulation=16, lr=1e-5, objective=BASE_FULL, validate_every=2, max_wall_minutes=STAGE_MINUTES["spatial"])
     base_path, base_config = str(train("dev_base_spatial", path, "base")), str(path)
-else: print("Spatial head disabled: validation oracle gain < 0.20 dB")
+elif s["spatial_head_enabled"]:
+    print("Spatial head has oracle support but is deferred by the 5-hour profile.")
+else:
+    print("Spatial head disabled: validation oracle gain < 0.20 dB")
 save_state(winner_model=model, dev_base_final=base_path, dev_base_final_config=base_config)
 """
     ),
     markdown("## 17. Retrain residual VAE and deterministic proposal heads"),
     code(
         r"""
-s = state(); VAE_CONFIG = locked_config("dev_vae", "vae", parent=s["dev_base_final"], model=s["winner_model"], crop=64, max_steps=UPDATES["vae"], batch=2, accumulation=8, lr=1e-4, objective=VAE_LOSS, modules=["vae", "lr_encoder", "mapper", "decoder"])
+s = state(); VAE_CONFIG = locked_config("dev_vae", "vae", parent=s["dev_base_final"], model=s["winner_model"], crop=64, max_steps=UPDATES["vae"], batch=2, accumulation=8, lr=1e-4, objective=VAE_LOSS, modules=["vae", "lr_encoder", "mapper", "decoder"], max_wall_minutes=STAGE_MINUTES["vae"])
 DEV_VAE = train("dev_vae", VAE_CONFIG, "vae"); save_state(dev_vae=str(DEV_VAE)); display(checkpoint_metrics(DEV_VAE))
 """
     ),
     markdown("## 18. Retrain diffusion for the new base residual"),
     code(
         r"""
-s = state(); DIFFUSION_CONFIG = locked_config("dev_diffusion", "diffusion", parent=s["dev_vae"], model=s["winner_model"], crop=64, max_steps=UPDATES["diffusion"], batch=2, accumulation=8, lr=1e-4, objective=DIFFUSION_LOSS, modules=["diffusion"])
+s = state(); DIFFUSION_CONFIG = locked_config("dev_diffusion", "diffusion", parent=s["dev_vae"], model=s["winner_model"], crop=64, max_steps=UPDATES["diffusion"], batch=2, accumulation=8, lr=1e-4, objective=DIFFUSION_LOSS, modules=["diffusion"], max_wall_minutes=STAGE_MINUTES["diffusion"])
 DEV_DIFFUSION = train("dev_diffusion", DIFFUSION_CONFIG, "diffusion"); save_state(dev_diffusion=str(DEV_DIFFUSION)); display(checkpoint_metrics(DEV_DIFFUSION))
 """
     ),
@@ -554,7 +623,7 @@ s = state(); PROPOSAL_CONFIG = locked_config(
     "dev_proposal", "joint", parent=s["dev_diffusion"], model=s["winner_model"],
     crop=64, max_steps=UPDATES["proposal"], batch=1, accumulation=8, lr=2e-5,
     objective=PROPOSAL_LOSS, modules=["lr_encoder", "mapper", "decoder"],
-    validate_every=2, training_overrides={
+    validate_every=2, max_wall_minutes=STAGE_MINUTES["proposal"], training_overrides={
         "joint_latent_source": "sampled", "joint_sample_steps": 8,
         "trust_samples": 1, "validation_sample_steps": 20,
         "validation_samples": 2,
@@ -570,6 +639,7 @@ s = state(); TRUST_CONFIG = locked_config(
     "dev_trust", "joint", parent=s["dev_proposal"], model=s["winner_model"],
     crop=64, max_steps=UPDATES["trust"], batch=1, accumulation=8, lr=1e-5,
     objective=TRUST_LOSS, modules=["trust_controller"], validate_every=1,
+    max_wall_minutes=STAGE_MINUTES["trust"],
     training_overrides={
         "joint_latent_source": "sampled", "joint_sample_steps": 20,
         "trust_samples": 2, "validation_sample_steps": 20,
@@ -602,9 +672,10 @@ SWIN = {"base_architecture": "fidelity_swinir_v2", "base_embed_dim": 120, "base_
 
 def locked_config(
     label, stage, parent=None, manifest=MANIFEST, model=None, crop=32,
-    max_steps=0, epochs=500, batch=4, accumulation=4, lr=1e-4,
+    max_steps=0, epochs=1, batch=4, accumulation=4, lr=1e-4,
     objective=None, modules=None, validate_every=5,
-    validation_limit=VAL_LIMIT, training_overrides=None,
+    validation_limit=TRAIN_VALIDATION_LIMIT, max_wall_minutes=0,
+    training_overrides=None,
 ):
     config = copy.deepcopy(TEMPLATE); config["data"].update({"manifest": str(manifest), "paired_lr_crop_size": crop})
     if model: config["model"].update(model)
@@ -612,6 +683,7 @@ def locked_config(
     training.update({
         "stage": stage, "output_dir": str(RUN_ROOT / label), "init_checkpoint": str(parent) if parent else None,
         "resume": None, "auto_resume": True, "epochs": epochs, "max_optimizer_steps": max_steps,
+        "max_wall_time_minutes": max_wall_minutes,
         "batch_size": batch, "gradient_accumulation": accumulation, "learning_rate": lr, "weight_decay": 0,
         "loss_weights": objective or BASE_WARM, "validate_every": validate_every,
         "validation_limit": validation_limit,
@@ -675,18 +747,22 @@ if old_checkpoint and old_checkpoint.exists() and old_config and old_config.exis
 print(previous_base_psnr, provenance); save_state(previous_base_validation_psnr=previous_base_psnr, baseline_provenance=provenance)
 """
     ),
-    markdown("## 8. Lock the equal 25,000-update proxy race"),
+    markdown("## 8. Configure architecture selection"),
     code(
         r"""
-RDN_RACE_CONFIG = locked_config("race_rdn", "base", model=RDN, crop=32, max_steps=UPDATES["race"], batch=4, accumulation=4, objective=BASE_WARM)
-SWIN_RACE_CONFIG = locked_config("race_swin", "base", model=SWIN, crop=32, max_steps=UPDATES["race"], batch=4, accumulation=4, objective=BASE_WARM)
-print(RDN_RACE_CONFIG, SWIN_RACE_CONFIG)
+if RUN_ARCHITECTURE_RACE:
+    RDN_RACE_CONFIG = locked_config("race_rdn", "base", model=RDN, crop=32, max_steps=UPDATES["race"], batch=4, accumulation=4, objective=BASE_WARM, max_wall_minutes=STAGE_MINUTES["race"])
+    SWIN_RACE_CONFIG = locked_config("race_swin", "base", model=SWIN, crop=32, max_steps=UPDATES["race"], batch=4, accumulation=4, objective=BASE_WARM, max_wall_minutes=STAGE_MINUTES["race"])
+    print(RDN_RACE_CONFIG, SWIN_RACE_CONFIG)
+else:
+    RDN_RACE_CONFIG = SWIN_RACE_CONFIG = None
+    print("Architecture race skipped by", EXECUTION_PROFILE, "; using FidelityRDN. SwinIR remains available in the publication profile.")
 """
     ),
     markdown("## 9. Run or resume RDN"),
-    code("RDN_RACE = train('race_rdn', RDN_RACE_CONFIG, 'base')\ndisplay(checkpoint_metrics(RDN_RACE))"),
+    code("""if RUN_ARCHITECTURE_RACE:\n    RDN_RACE = train('race_rdn', RDN_RACE_CONFIG, 'base')\n    display(checkpoint_metrics(RDN_RACE))\nelse:\n    RDN_RACE = None\n    print('RDN will be trained directly in the bounded base stage.')"""),
     markdown("## 10. Run or resume SwinIR-v2"),
-    code("SWIN_RACE = train('race_swin', SWIN_RACE_CONFIG, 'base')\ndisplay(checkpoint_metrics(SWIN_RACE))"),
+    code("""if RUN_ARCHITECTURE_RACE:\n    SWIN_RACE = train('race_swin', SWIN_RACE_CONFIG, 'base')\n    display(checkpoint_metrics(SWIN_RACE))\nelse:\n    SWIN_RACE = None\n    print('SwinIR-v2 skipped: its measured runtime does not fit the 5-6 hour session.')"""),
     markdown("## 11. Select by PSNR, SSIM, then measured memory"),
     code(
         r"""
@@ -695,17 +771,68 @@ def peak_memory(config_path, path):
     model = GeoDiffGAN.from_config(config).cuda().eval(); load_checkpoint(path, model, strict=False, prefer_ema=True)
     with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16): model.predict_base(torch.zeros(1, 3, 160, 160, device="cuda"))
     torch.cuda.synchronize(); value = torch.cuda.max_memory_allocated() / 1024**2; del model; torch.cuda.empty_cache(); return value
-rows = []
-for name, config, path, definition in (("fidelity_rdn", RDN_RACE_CONFIG, RDN_RACE, RDN), ("fidelity_swinir_v2", SWIN_RACE_CONFIG, SWIN_RACE, SWIN)):
-    metric = checkpoint_metrics(path); rows.append({"architecture": name, "val_psnr": metric["val_psnr"], "val_ssim": metric["val_ssim"], "memory_mib": peak_memory(config, path), "checkpoint": str(path), "definition": definition})
-race = pd.DataFrame(rows).sort_values("val_psnr", ascending=False).reset_index(drop=True)
-if abs(race.loc[0, "val_psnr"] - race.loc[1, "val_psnr"]) <= 0.03: race = race.sort_values(["val_ssim", "memory_mib"], ascending=[False, True]).reset_index(drop=True)
-display(race.drop(columns="definition")); winner = race.iloc[0]
-race_records = json.loads(race.drop(columns="definition").to_json(orient="records"))
+def compatible_attached_rdn(path):
+    try:
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+        model = payload.get("config", {}).get("model", {})
+        return payload.get("stage") == "base" and model.get("base_architecture") == "fidelity_rdn" and int(model.get("scale", 0)) == 3
+    except Exception:
+        return False
+
+def rdn_checkpoint_maturity(path):
+    label = str(path).lower()
+    return next((rank for token, rank in (("dev_base_final", 5), ("dev_base_spatial", 5), ("dev_base_full", 4), ("dev_base64", 3), ("dev_base32", 2), ("race_rdn", 1)) if token in label), 0)
+
+def discover_attached_rdn():
+    if ATTACHED_RDN_CHECKPOINT:
+        path = Path(ATTACHED_RDN_CHECKPOINT)
+        if not path.exists() or not compatible_attached_rdn(path):
+            raise RuntimeError(f"ATTACHED_RDN_CHECKPOINT is missing or incompatible: {path}")
+        return path
+    if not AUTO_DISCOVER_ATTACHED_RDN:
+        return None
+    extracted_root = WORK_ROOT / "attached_checkpoint_bundles"
+    for archive in sorted(Path("/kaggle/input").glob("**/fidelity_trust_v2_bundle_*.zip")):
+        destination = extracted_root / archive.stem
+        if not destination.exists():
+            destination.mkdir(parents=True)
+            shutil.unpack_archive(str(archive), str(destination))
+            print("Extracted attached V2 bundle:", archive)
+    candidates = []
+    for root in (Path("/kaggle/input"), extracted_root):
+        for pattern in ("**/dev_base*.pt", "**/race_rdn*.pt", "**/base_best.pt"):
+            candidates.extend(root.glob(pattern))
+    compatible = []
+    for path in sorted(set(candidates)):
+        if compatible_attached_rdn(path):
+            payload = torch.load(path, map_location="cpu", weights_only=False)
+            maturity = rdn_checkpoint_maturity(path)
+            compatible.append((maturity, int(payload.get("extra", {}).get("optimizer_step", 0)), int(payload.get("epoch", -1)), path))
+    return max(compatible, default=(0, 0, -1, None), key=lambda item: (item[0], item[1], item[2]))[3]
+
+if RUN_ARCHITECTURE_RACE:
+    rows = []
+    for name, config, path, definition in (("fidelity_rdn", RDN_RACE_CONFIG, RDN_RACE, RDN), ("fidelity_swinir_v2", SWIN_RACE_CONFIG, SWIN_RACE, SWIN)):
+        metric = checkpoint_metrics(path); rows.append({"architecture": name, "val_psnr": metric["val_psnr"], "val_ssim": metric["val_ssim"], "memory_mib": peak_memory(config, path), "checkpoint": str(path), "definition": definition})
+    race = pd.DataFrame(rows).sort_values("val_psnr", ascending=False).reset_index(drop=True)
+    if abs(race.loc[0, "val_psnr"] - race.loc[1, "val_psnr"]) <= 0.03: race = race.sort_values(["val_ssim", "memory_mib"], ascending=[False, True]).reset_index(drop=True)
+    display(race.drop(columns="definition")); winner = race.iloc[0]
+    race_records = json.loads(race.drop(columns="definition").to_json(orient="records"))
+    winner_architecture, winner_model, winner_checkpoint = str(winner["architecture"]), dict(winner["definition"]), str(winner["checkpoint"])
+    winner_maturity = 1
+else:
+    attached = discover_attached_rdn()
+    winner_architecture = "fidelity_rdn"
+    winner_model = dict(torch.load(attached, map_location="cpu", weights_only=False)["config"]["model"]) if attached else dict(RDN)
+    winner_checkpoint = str(attached) if attached else None
+    winner_maturity = rdn_checkpoint_maturity(attached) if attached else 0
+    race_records = [{"architecture": winner_architecture, "selection": "fixed by 5-hour budget", "checkpoint": winner_checkpoint}]
+    print("Attached RDN warm start:" if attached else "No attached RDN found; starting RDN from bicubic identity.", attached or "")
 save_state(
-    winner_architecture=str(winner["architecture"]),
-    winner_model=dict(winner["definition"]),
-    winner_race_checkpoint=str(winner["checkpoint"]),
+    winner_architecture=winner_architecture,
+    winner_model=winner_model,
+    winner_race_checkpoint=winner_checkpoint,
+    attached_rdn_maturity=winner_maturity,
     race=race_records,
 )
 """
