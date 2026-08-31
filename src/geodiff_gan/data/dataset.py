@@ -37,6 +37,7 @@ class SentinelPatchDataset(Dataset):
         radiometric_calibration: str | Path | None = None,
         output_channels: int = 3,
         input_mode: str = "synthetic",
+        paired_lr_crop_size: int | None = None,
     ) -> None:
         self.records = load_manifest(manifest, split=split)
         self.scale = scale
@@ -67,6 +68,9 @@ class SentinelPatchDataset(Dataset):
         if input_mode not in ("synthetic", "paired"):
             raise ValueError("input_mode must be 'synthetic' or 'paired'")
         self.input_mode = input_mode
+        self.paired_lr_crop_size = paired_lr_crop_size if split == "train" else None
+        if paired_lr_crop_size is not None and (input_mode != "paired" or paired_lr_crop_size < 1):
+            raise ValueError("paired_lr_crop_size requires paired data and a positive size")
         self.caption_field = caption_field
         if caption_sampling not in ("fixed", "random"):
             raise ValueError("caption_sampling must be 'fixed' or 'random'")
@@ -313,6 +317,21 @@ class SentinelPatchDataset(Dataset):
                     f"shape {tuple(valid_mask_lr.shape[-2:])}, expected "
                     f"{tuple(lr_value.shape[-2:])}"
                 )
+            if self.paired_lr_crop_size is not None:
+                size = self.paired_lr_crop_size
+                h, w = lr_value.shape[-2:]
+                if size > min(h, w):
+                    raise ValueError(f"Crop {size} exceeds LR shape {(h, w)}")
+                row = int(torch.randint(h - size + 1, ()).item())
+                col = int(torch.randint(w - size + 1, ()).item())
+                lr_slice = (..., slice(row, row + size), slice(col, col + size))
+                hr_slice = (..., slice(row * self.scale, (row + size) * self.scale),
+                            slice(col * self.scale, (col + size) * self.scale))
+                lr_value, raw_lr_value, clean_lr_value = (
+                    value[lr_slice] for value in (lr_value, raw_lr_value, clean_lr_value)
+                )
+                valid_mask_lr = valid_mask_lr[lr_slice]
+                hr, valid_mask = hr[hr_slice], valid_mask[hr_slice]
             lr = lr_value.unsqueeze(0)
             clean_lr = clean_lr_value.unsqueeze(0)
             degradation = stored_degradation.reshape(1, -1)

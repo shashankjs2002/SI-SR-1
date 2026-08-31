@@ -45,6 +45,7 @@ from ..models.blocks import high_pass
 from ..models.degradation import sensor_degrade
 from ..models.discriminators import MultiScaleDiscriminator, WaveletDiscriminator
 from ..models.system import GeoDiffGAN
+from ..models.moe import MixtureDiffusionUNet, router_objectives
 from ..metrics import basic_metrics
 from ..text import PromptBatch, TextEncoder, augment_prompts, build_text_encoder
 from .checkpoint import (
@@ -57,6 +58,20 @@ from .checkpoint import (
     unwrap,
 )
 from .stages import STAGES, configure_stage_trainability
+
+
+class _LimitedLoader:
+    """Short checkpoint intervals without materializing batches or fixing crop positions."""
+    def __init__(self, loader: DataLoader, limit: int):
+        self.loader = loader
+        self.dataset, self.sampler = loader.dataset, loader.sampler
+        self.limit = min(len(loader), limit)
+
+    def __len__(self):
+        return self.limit
+
+    def __iter__(self):
+        return islice(self.loader, self.limit)
 
 
 class Trainer:
@@ -107,6 +122,9 @@ class Trainer:
                     f"model context dimension {self.model.context_dim}"
                 )
         self._configure_stage()
+        if training.get("joint_latent_source", "noisy_target") == "sampled" and self.stage == "joint":
+            if any(p.requires_grad for p in self.model.diffusion.parameters()):
+                raise ValueError("Sampled joint refinement requires frozen diffusion; train router in the diffusion stage")
         self.model.diffusion.gradient_checkpointing = bool(
             config["training"].get("gradient_checkpointing", True)
         )
@@ -353,6 +371,7 @@ class Trainer:
             radiometric_calibration=data.get("radiometric_calibration"),
             output_channels=self.config["model"].get("output_channels", 3),
             input_mode=data.get("input_mode", "synthetic"),
+            paired_lr_crop_size=data.get("paired_lr_crop_size") if is_train else None,
         )
         sampler = (
             DistributedSampler(dataset, shuffle=split == "train")
@@ -361,13 +380,14 @@ class Trainer:
         )
         return DataLoader(
             dataset,
-            batch_size=int(self.config["training"]["batch_size"]),
+            batch_size=int(self.config["training"].get("validation_batch_size", self.config["training"]["batch_size"]) if not is_train else self.config["training"]["batch_size"]),
             shuffle=sampler is None and split == "train",
             sampler=sampler,
             num_workers=int(self.config["training"].get("num_workers", 4)),
             pin_memory=self.device.type == "cuda",
-            persistent_workers=int(self.config["training"].get("num_workers", 4)) > 0,
-            drop_last=split == "train",
+            persistent_workers=(int(self.config["training"].get("num_workers", 4)) > 0
+                                and bool(self.config["training"].get("persistent_workers", True))),
+            drop_last=False,
         )
 
     def _contexts(
@@ -616,14 +636,43 @@ class Trainer:
             latent, _, _ = model.vae.encode(target_residual, sample=False)
         diffusion_batch = model.prepare_diffusion_batch(latent)
         mode = "edit" if self.stage == "edit" else "sr"
-        velocity = model.predict_velocity(
-            diffusion_batch.noisy,
-            diffusion_batch.timesteps,
-            context,
-            degradation,
-            mode,
-            lr_features,
-        )
+        routing_context = model.routing_context(lr, base)
+        if isinstance(model.diffusion, MixtureDiffusionUNet):
+            prepared_context, prepared_degradation = model.apply_ablation_inputs(context, degradation)
+            velocity, candidates, route = model.diffusion.forward_with_routing(
+                diffusion_batch.noisy, diffusion_batch.timesteps, prepared_context,
+                prepared_degradation, model.mode_tensor(mode, hr.shape[0], hr.device),
+                lr_features[1], routing_context,
+            )
+            if self.stage == "diffusion":
+                candidate_mse = base_mse = None
+                if model.diffusion.routing_mode == "reliability":
+                    with torch.no_grad():
+                        denominator = (valid_mask.sum((1, 2, 3)) * hr.shape[1]).clamp_min(1)
+                        base_mse = ((base.float() - hr.float()).square() * valid_mask).sum((1, 2, 3)) / denominator
+                        errors = []
+                        for candidate in candidates.unbind(1):
+                            clean_candidate = model.scheduler.predict_clean(diffusion_batch.noisy, candidate, diffusion_batch.timesteps)
+                            proposal = model.decode_latent(
+                                clean_candidate, lr, context, degradation, "sr", base=base,
+                                back_projection_steps=0, lr_features=lr_features,
+                                apply_router_acceptance=False,
+                            ).image
+                            errors.append(((proposal.float() - hr.float()).square() * valid_mask).sum((1, 2, 3)) / denominator)
+                        candidate_mse = torch.stack(errors, 1)
+                losses.update(router_objectives(
+                    route, candidates, diffusion_batch.target_velocity, valid_mask,
+                    candidate_mse, base_mse,
+                    temperature=float(self.config["training"].get("router_temperature", 1e-4)),
+                ))
+                for expert in range(model.diffusion.num_experts):
+                    losses[f"stat_expert_{expert}_usage"] = route["selected"][:, expert].float().mean().detach()
+                losses["stat_router_acceptance"] = route["acceptance"].mean().detach()
+        else:
+            velocity = model.predict_velocity(
+                diffusion_batch.noisy, diffusion_batch.timesteps, context,
+                degradation, mode, lr_features,
+            )
         if diagnostics is not None:
             diagnostics.capture("diffusion.clean_latent", latent, visual="features")
             diagnostics.capture("diffusion.noisy_latent", diffusion_batch.noisy, visual="features")
@@ -667,6 +716,14 @@ class Trainer:
         clean = model.scheduler.predict_clean(
             diffusion_batch.noisy, velocity, diffusion_batch.timesteps
         )
+        if self.stage == "joint" and self.config["training"].get("joint_latent_source") == "sampled":
+            prepared_context, prepared_degradation = model.apply_ablation_inputs(context, degradation)
+            clean = model.scheduler.ddim_sample(
+                model.diffusion, tuple(latent.shape), prepared_context, prepared_degradation,
+                model.mode_tensor(mode, hr.shape[0], hr.device), lr_features[1].detach(),
+                sample_steps=int(self.config["training"].get("joint_sample_steps", 8)),
+                routing_context=routing_context,
+            )
         output = model.decode_latent(
             clean,
             lr,
@@ -851,7 +908,7 @@ class Trainer:
         if self.text_encoder is not None:
             self.text_encoder.eval()
         totals: defaultdict[str, float] = defaultdict(float)
-        seed = int(self.config.get("seed", 42)) + 10_000 + epoch
+        seed = int(training.get("validation_seed", int(self.config.get("seed", 42)) + 10_000))
         cuda_devices = (
             [self.device.index or 0] if self.device.type == "cuda" else []
         )
@@ -1074,10 +1131,15 @@ class Trainer:
             "edit_permission": 0.05,
             "prompt_alignment": 0.05,
             "adversarial": 0.01,
+            "expert_denoising": 0.1,
+            "router_balance": 0.01,
+            "router_quality": 0.05,
+            "router_ranking": 0.05,
         }
         return sum(
             losses[name] * float(weights.get(name, default_weights.get(name, 1.0)))
             for name in losses
+            if not name.startswith("stat_")
         )
 
     @contextmanager
@@ -1124,6 +1186,11 @@ class Trainer:
 
     def train(self) -> None:
         loader = self._loader("train")
+        configured_batches = self.config["training"].get("max_batches_per_epoch")
+        if configured_batches is not None:
+            if int(configured_batches) < 1:
+                raise ValueError("max_batches_per_epoch must be positive")
+            loader = _LimitedLoader(loader, int(configured_batches))
         if len(loader.dataset) == 0:
             raise ValueError(
                 "The training split contains no patches. Check SAFE prefix rules "
@@ -1234,6 +1301,13 @@ class Trainer:
                 )
             return
         stage_started = time.monotonic()
+        previous_elapsed = float(self.resume_extra.get("stage_elapsed_seconds", 0.0))
+        total_batches = int(self.resume_extra.get("total_train_batches", 0))
+        total_step_attempts = int(self.resume_extra.get("total_optimizer_step_attempts", 0))
+        stage_seconds = float(training.get("max_stage_seconds", 0.0))
+        if self.resume_extra.get("early_stopping", {}).get("stopped") or (stage_seconds > 0 and previous_elapsed >= stage_seconds):
+            print(f"[{self.stage}] saved stopping criterion already met; keeping best checkpoint", flush=True)
+            return
         completed_epoch_durations: list[float] = []
         epoch_progress = tqdm(
             range(self.start_epoch, epochs),
@@ -1243,11 +1317,21 @@ class Trainer:
         )
         for epoch in epoch_progress:
             epoch_started = time.monotonic()
+            if training.get("reseed_each_epoch", False):
+                epoch_seed = int(self.config.get("seed", 42)) + 1009 * epoch + self.local_rank
+                torch.manual_seed(epoch_seed)
+                random.seed(epoch_seed)
+                np.random.seed(epoch_seed % (2 ** 32))
             if isinstance(loader.sampler, DistributedSampler):
                 loader.sampler.set_epoch(epoch)
             metrics: defaultdict[str, float] = defaultdict(float)
             debug_exports = 0
             self.model.train()
+            for module in self.model.children():
+                if not any(parameter.requires_grad for parameter in module.parameters()):
+                    module.eval()
+            if isinstance(self.model.diffusion, MixtureDiffusionUNet):
+                self.model.diffusion.routing_warmup = epoch < int(training.get("router_warmup_epochs", 1))
             if self.text_encoder is not None:
                 self.text_encoder.eval()
             self.optimizer.zero_grad(set_to_none=True)
@@ -1462,6 +1546,11 @@ class Trainer:
                     key: value / denominator for key, value in reduced_metrics.items()
                 }
                 epoch_metrics.update(validation_metrics)
+                total_batches += len(loader)
+                total_step_attempts += math.ceil(len(loader) / accumulation)
+                epoch_metrics["train_batches"] = len(loader)
+                epoch_metrics["optimizer_step_attempts"] = math.ceil(len(loader) / accumulation)
+                epoch_metrics["epoch_seconds"] = time.monotonic() - epoch_started
                 checkpoint_path = output_dir / f"{self.stage}_epoch_{epoch:04d}.pt"
                 selection_metric = checkpoint_metric
                 selection_value = epoch_metrics.get(selection_metric)
@@ -1545,6 +1634,9 @@ class Trainer:
                     "min_delta": early_stopping_min_delta,
                     "stopped": stop_training,
                 }
+                elapsed_total = previous_elapsed + time.monotonic() - stage_started
+                if stage_seconds > 0 and elapsed_total >= stage_seconds:
+                    stop_training = True
                 scheduler_metric = str(
                     training.get("lr_scheduler_metric", checkpoint_metric)
                 )
@@ -1568,6 +1660,10 @@ class Trainer:
                     self.stage,
                     self.config,
                     extra={
+                        "stage_elapsed_seconds": elapsed_total,
+                        "total_train_batches": total_batches,
+                        "total_optimizer_step_attempts": total_step_attempts,
+                        "budget_exhausted": stage_seconds > 0 and elapsed_total >= stage_seconds,
                         "metrics": epoch_metrics,
                         "checkpoint_selection": checkpoint_selection,
                         "early_stopping": early_stopping_state,
@@ -1637,7 +1733,7 @@ class Trainer:
                     print(summary, flush=True)
                 if stop_training:
                     print(
-                        f"[{self.stage}] early stopping after epoch {epoch + 1}: "
+                        f"[{self.stage}] {'time budget reached' if stage_seconds > 0 and elapsed_total >= stage_seconds else 'early stopping'} after epoch {epoch + 1}: "
                         f"{early_stopping_metric} did not improve by "
                         f"{early_stopping_min_delta:g} for "
                         f"{early_bad_epochs} validation checks",

@@ -73,15 +73,17 @@ class DiffusionScheduler(nn.Module):
         ]
         | None = None,
         debug_interval: int = 0,
+        routing_context: torch.Tensor | None = None,
     ) -> torch.Tensor:
         device = context.device
         latent = torch.randn(shape, device=device, generator=generator)
         sequence = torch.linspace(self.steps - 1, 0, sample_steps, device=device).long()
         for index, step in enumerate(sequence):
             t = torch.full((shape[0],), int(step.item()), device=device, dtype=torch.long)
-            velocity = model(latent, t, context, degradation, mode, lr_condition)
+            routing = {"routing_context": routing_context} if routing_context is not None else {}
+            velocity = model(latent, t, context, degradation, mode, lr_condition, **routing)
             if guidance_scale != 1.0 and null_context is not None:
-                null_velocity = model(latent, t, null_context, degradation, mode, lr_condition)
+                null_velocity = model(latent, t, null_context, degradation, mode, lr_condition, **routing)
                 velocity = null_velocity + guidance_scale * (velocity - null_velocity)
             clean = self.predict_clean(latent, velocity, t)
             if debug_callback is not None and (
@@ -135,8 +137,11 @@ class ConditionalDiffusionUNet(nn.Module):
         degradation_dim: int = 4,
         lr_condition_channels: int = 64,
         attention_levels: tuple[int, ...] = (1, 2),
+        upsample_mode: str = "pixelshuffle",
     ) -> None:
         super().__init__()
+        if upsample_mode not in ("pixelshuffle", "resize_conv"):
+            raise ValueError("diffusion upsample_mode must be pixelshuffle or resize_conv")
         condition_dim = widths[0] * 4
         self.time = nn.Sequential(
             SinusoidalEmbedding(widths[0]),
@@ -180,6 +185,10 @@ class ConditionalDiffusionUNet(nn.Module):
                     nn.Conv2d(current, widths[index] * 4, 3, padding=1),
                     nn.PixelShuffle(2),
                 )
+                if upsample_mode == "pixelshuffle" else nn.Sequential(
+                    nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+                    nn.Conv2d(current, widths[index], 3, padding=1),
+                )
             )
             current = widths[index]
             self.up_levels.append(
@@ -197,7 +206,7 @@ class ConditionalDiffusionUNet(nn.Module):
             nn.Conv2d(current, latent_channels, 3, padding=1),
         )
 
-    def forward(
+    def forward_features(
         self,
         latent: torch.Tensor,
         t: torch.Tensor,
@@ -233,7 +242,10 @@ class ConditionalDiffusionUNet(nn.Module):
                 x = checkpoint(level, merged, condition, context, use_reentrant=False)
             else:
                 x = level(merged, condition, context)
-        return self.output(x)
+        return x
+
+    def forward(self, latent, t, context, degradation, mode, lr_condition):
+        return self.output(self.forward_features(latent, t, context, degradation, mode, lr_condition))
 
 
 @dataclass

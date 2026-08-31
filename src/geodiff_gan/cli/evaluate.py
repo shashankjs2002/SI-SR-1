@@ -402,6 +402,8 @@ def main() -> None:
                 "ssim_delta_vs_base": values["ssim"] - base_values["ssim"],
                 "l1_improvement_vs_base": base_values["l1"] - values["l1"],
                 "output_beats_base_psnr": values["psnr"] > base_values["psnr"],
+                "expert_weights": outputs[0].metadata[0].get("expert_weights", []),
+                "router_acceptance": outputs[0].metadata[0].get("router_acceptance", 1.0),
             }
         )
         patch_name = "__".join(
@@ -424,6 +426,8 @@ def main() -> None:
             decoder_residual=decoder_residual[0].detach().cpu().numpy(),
             net_addition=net_addition[0].detach().cpu().numpy(),
             source_patch=str(patch_path),
+            expert_weights=np.asarray(outputs[0].metadata[0].get("expert_weights", []), dtype=np.float32),
+            router_acceptance=np.asarray(outputs[0].metadata[0].get("router_acceptance", 1.0), dtype=np.float32),
         )
         count += 1
         if args.progress == "compact":

@@ -12,6 +12,8 @@ from .degradation import back_project, default_degradation, sensor_degrade
 from .diffusion import ConditionalDiffusionUNet, DiffusionBatch, DiffusionScheduler
 from .generator import GeoMapper, LREncoder, ResidualSRDecoder
 from .vae import ResidualVAE
+from .residual_base import ResidualSwinBase
+from .moe import MixtureDiffusionUNet
 
 if TYPE_CHECKING:
     from ..diagnostics import DiagnosticRecorder
@@ -54,6 +56,7 @@ class GeoDiffGAN(nn.Module):
         base_upsample_mode: str = "pixelshuffle",
         latent_channels: int = 4,
         vae_channels: int = 64,
+        vae_upsample_mode: str = "pixelshuffle",
         lr_channels: int = 64,
         diffusion_widths: tuple[int, ...] = (128, 256, 384, 512),
         context_dim: int = 768,
@@ -72,6 +75,13 @@ class GeoDiffGAN(nn.Module):
         uncertainty_scale: float = 0.0025,
         use_back_projection: bool = True,
         degradation_severity: str = "mild",
+        base_architecture: str = "swinir",
+        base_groups: int = 2,
+        diffusion_upsample_mode: str = "pixelshuffle",
+        diffusion_experts: int = 0,
+        diffusion_top_k: int = 1,
+        routing_mode: str = "generic",
+        expert_channels: int = 24,
     ) -> None:
         super().__init__()
         self.scale = scale
@@ -97,7 +107,12 @@ class GeoDiffGAN(nn.Module):
         self.uncertainty_scale = float(uncertainty_scale)
         self.use_back_projection = use_back_projection
         self.degradation_severity = degradation_severity
-        self.base = SwinIRBase(
+        if base_architecture not in ("swinir", "residual_swin"):
+            raise ValueError("base_architecture must be swinir or residual_swin")
+        if diffusion_experts < 0:
+            raise ValueError("diffusion_experts must be non-negative")
+        base_class = ResidualSwinBase if base_architecture == "residual_swin" else SwinIRBase
+        self.base = base_class(
             in_channels=self.base_input_channels,
             embed_dim=base_embed_dim,
             depth=base_depth,
@@ -105,16 +120,21 @@ class GeoDiffGAN(nn.Module):
             window_size=window_size,
             scale=scale,
             output_channels=output_channels,
-            upsample_mode=base_upsample_mode,
+            **({"groups": base_groups} if base_architecture == "residual_swin" else {"upsample_mode": base_upsample_mode}),
         )
-        self.vae = ResidualVAE(latent_channels=latent_channels, base_channels=vae_channels)
+        self.vae = ResidualVAE(latent_channels=latent_channels, base_channels=vae_channels, upsample_mode=vae_upsample_mode)
         self.lr_encoder = LREncoder(in_channels=input_channels, channels=lr_channels)
-        self.diffusion = ConditionalDiffusionUNet(
+        diffusion_class = MixtureDiffusionUNet if diffusion_experts else ConditionalDiffusionUNet
+        self.diffusion = diffusion_class(
             latent_channels=latent_channels,
             widths=diffusion_widths,
             context_dim=context_dim,
             degradation_dim=degradation_dim,
             lr_condition_channels=lr_channels * 2,
+            upsample_mode=diffusion_upsample_mode,
+            **({"num_experts": diffusion_experts, "top_k": diffusion_top_k,
+                "routing_mode": routing_mode, "expert_channels": expert_channels,
+                "evidence_channels": input_channels + 2 * output_channels} if diffusion_experts else {}),
         )
         self.scheduler = DiffusionScheduler(diffusion_steps)
         self.mapper = GeoMapper(
@@ -139,6 +159,13 @@ class GeoDiffGAN(nn.Module):
         model = config.get("model", config)
         return cls(
             scale=model.get("scale", 4),
+            base_architecture=model.get("base_architecture", "swinir"),
+            base_groups=model.get("base_groups", 2),
+            diffusion_upsample_mode=model.get("diffusion_upsample_mode", "pixelshuffle"),
+            diffusion_experts=model.get("diffusion_experts", 0),
+            diffusion_top_k=model.get("diffusion_top_k", 1),
+            routing_mode=model.get("routing_mode", "generic"),
+            expert_channels=model.get("expert_channels", 24),
             input_channels=model.get("input_channels", 3),
             base_input_channels=model.get("base_input_channels"),
             output_channels=model.get("output_channels", 3),
@@ -149,6 +176,7 @@ class GeoDiffGAN(nn.Module):
             base_upsample_mode=model.get("base_upsample_mode", "pixelshuffle"),
             latent_channels=model.get("latent_channels", 4),
             vae_channels=model.get("vae_channels", 64),
+            vae_upsample_mode=model.get("vae_upsample_mode", "pixelshuffle"),
             lr_channels=model.get("lr_channels", 64),
             diffusion_widths=tuple(model.get("diffusion_widths", [128, 256, 384, 512])),
             context_dim=model.get("context_dim", 768),
@@ -197,6 +225,13 @@ class GeoDiffGAN(nn.Module):
     def predict_base(self, lr: torch.Tensor) -> torch.Tensor:
         """Run the conservative base without leaking auxiliary spectral channels."""
         return self.base(self.base_lr(lr))
+
+    def routing_context(self, lr: torch.Tensor, base: torch.Tensor) -> torch.Tensor | None:
+        if not isinstance(self.diffusion, MixtureDiffusionUNet):
+            return None
+        base_lr = torch.nn.functional.interpolate(base, size=lr.shape[-2:], mode="area")
+        energy = torch.nn.functional.interpolate(high_pass(base).abs(), size=lr.shape[-2:], mode="area")
+        return torch.cat((lr, energy, base_lr - self.output_lr(lr)), 1).detach()
 
     def apply_ablation_inputs(
         self, context: torch.Tensor, degradation: torch.Tensor
@@ -274,6 +309,7 @@ class GeoDiffGAN(nn.Module):
         degradation: torch.Tensor,
         mode: Mode,
         lr_features: list[torch.Tensor],
+        routing_context: torch.Tensor | None = None,
     ) -> torch.Tensor:
         mode_values = self.mode_tensor(mode, noisy_latent.shape[0], noisy_latent.device)
         context, degradation = self.apply_ablation_inputs(context, degradation)
@@ -284,6 +320,7 @@ class GeoDiffGAN(nn.Module):
             degradation,
             mode_values,
             lr_features[1],
+            **({"routing_context": routing_context} if routing_context is not None else {}),
         )
 
     def decode_latent(
@@ -299,6 +336,7 @@ class GeoDiffGAN(nn.Module):
         projection_lr: torch.Tensor | None = None,
         conditioning_prepared: bool = False,
         lr_features: list[torch.Tensor] | None = None,
+        apply_router_acceptance: bool = True,
     ) -> GeoDiffOutput:
         base = self.predict_base(lr) if base is None else base
         consistency_lr = self.output_lr(lr) if projection_lr is None else projection_lr
@@ -333,6 +371,10 @@ class GeoDiffGAN(nn.Module):
         )
         edit_hr = self._resize_policy(mapped.edit_permission, base.shape[-2:])
         effective_evidence = self._effective_confidence(evidence_hr)
+        route = None
+        if isinstance(self.diffusion, MixtureDiffusionUNet) and apply_router_acceptance:
+            route = self.diffusion.routing(lr_features[1], torch.zeros(lr.shape[0], device=lr.device, dtype=torch.long), self.routing_context(lr, base))
+            effective_evidence = effective_evidence * route["acceptance"][:, None, None, None]
         detail_residual = high_pass(raw_detail)
         evidence_residual = detail_residual * effective_evidence
         edit_residual = raw_edit * edit_hr
@@ -506,6 +548,9 @@ class GeoDiffGAN(nn.Module):
                     ),
                 }
             )
+            if route is not None:
+                metadata[-1]["expert_weights"] = route["weights"][index].detach().cpu().tolist()
+                metadata[-1]["router_acceptance"] = float(route["acceptance"][index].detach())
         return GeoDiffOutput(
             image=image,
             base=base,
@@ -565,6 +610,7 @@ class GeoDiffGAN(nn.Module):
             generator=generator,
             debug_callback=diagnostics.diffusion_step if diagnostics is not None else None,
             debug_interval=diffusion_debug_interval,
+            routing_context=self.routing_context(lr, base),
         )
         return self.decode_latent(
             latent,
