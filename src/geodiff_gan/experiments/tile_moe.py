@@ -152,7 +152,19 @@ def assert_base_lineage(parent, child):
         raise RuntimeError("Frozen base lineage changed. Do not compare this run with the shared base.")
 
 
-def run_stage(repository, config, root, stage, *, parent=None, epochs=6, minutes=30, fast=False):
+def run_stage(
+    repository,
+    config,
+    root,
+    stage,
+    *,
+    parent=None,
+    epochs=6,
+    minutes=30,
+    fast=False,
+    learning_rate=None,
+    max_batches_per_epoch=None,
+):
     repository, root = Path(repository), Path(root)
     config = copy.deepcopy(config)
     train = config["training"]
@@ -160,7 +172,15 @@ def run_stage(repository, config, root, stage, *, parent=None, epochs=6, minutes
                  output_dir=str(root / "runs" / stage),
                  init_checkpoint=str(parent) if parent else None, resume=None,
                  max_stage_seconds=60 if fast else minutes * 60,
-                 learning_rate=1e-5 if stage == "joint" else 1e-4)
+                 learning_rate=(
+                     float(learning_rate)
+                     if learning_rate is not None
+                     else (1e-5 if stage == "joint" else 1e-4)
+                 ))
+    if max_batches_per_epoch is not None:
+        train["max_batches_per_epoch"] = (
+            2 if fast else int(max_batches_per_epoch)
+        )
     if stage == "diffusion":
         train.update(checkpoint_metric="val_loss_diffusion", checkpoint_mode="min",
                      early_stopping_metric="val_loss_diffusion", early_stopping_mode="min",
