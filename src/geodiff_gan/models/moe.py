@@ -100,18 +100,48 @@ class MixtureDiffusionUNet(ConditionalDiffusionUNet):
         return shared + correction
 
 
-def router_objectives(route, candidates, target_velocity, valid_mask, candidate_mse=None,
-                      base_mse=None, temperature=1e-4):
-    """Labels are detached training-only HR comparisons; no labels enter router.forward."""
-    mask = F.interpolate(valid_mask.float(), size=target_velocity.shape[-2:], mode="area")[:, None]
+def router_objectives(
+    route,
+    candidates,
+    target_velocity,
+    valid_mask,
+    candidate_mse=None,
+    base_mse=None,
+    temperature=1e-4,
+    specialization_temperature=1.0,
+    expert_uniform_floor=0.05,
+):
+    """Train distinct experts and route using detached, training-only oracle labels."""
+    if specialization_temperature <= 0:
+        raise ValueError("specialization_temperature must be positive")
+    if not 0 <= expert_uniform_floor <= 1:
+        raise ValueError("expert_uniform_floor must be in [0, 1]")
+    mask = F.interpolate(
+        valid_mask.float(), size=target_velocity.shape[-2:], mode="area"
+    )[:, None]
     squared = (candidates.float() - target_velocity[:, None].float()).square()
-    expert_loss = (squared * mask).sum() / (mask.sum() * squared.shape[1] * squared.shape[2]).clamp_min(1)
+    denominator = (mask.sum((2, 3, 4)) * squared.shape[2]).clamp_min(1)
+    per_expert = (squared * mask).sum((2, 3, 4)) / denominator
+    valid = (valid_mask.flatten(1).sum(1) > 0).float()
+
+    # Relative normalization keeps the oracle useful across diffusion timesteps.
+    centered = per_expert.detach() - per_expert.detach().mean(1, keepdim=True)
+    relative_scale = centered.square().mean(1, keepdim=True).sqrt().clamp_min(1e-6)
+    oracle = (-centered / (relative_scale * specialization_temperature)).softmax(1)
+    oracle = oracle * (1 - expert_uniform_floor) + expert_uniform_floor / oracle.shape[1]
+    expert_loss = ((per_expert * oracle).sum(1) * valid).sum() / valid.sum().clamp_min(1)
+
+    log_probabilities = route["logits"].float().log_softmax(1)
+    specialization = (-(oracle * log_probabilities).sum(1) * valid).sum() / valid.sum().clamp_min(1)
     importance = route["probabilities"].mean(0)
-    usage = route["selected"].mean(0) / route["selected"].sum(1).mean()
-    balance = importance.numel() * (importance * usage.detach()).sum()
-    losses = {"expert_denoising": expert_loss, "router_balance": balance}
+    # Unlike hard top-k usage, this remains informative during dense warm-up.
+    balance = importance.numel() * importance.square().sum()
+    losses = {
+        "expert_denoising": expert_loss,
+        "router_specialization": specialization,
+        "router_balance": balance,
+    }
     if candidate_mse is not None:
-        valid = (valid_mask.flatten(1).sum(1) > 0).float()
         gains = (base_mse[:, None] - candidate_mse).detach()
         targets = torch.sigmoid(gains / max(float(temperature), 1e-8))
         quality = F.binary_cross_entropy_with_logits(route["quality_logits"].float(), targets, reduction="none").mean(1)

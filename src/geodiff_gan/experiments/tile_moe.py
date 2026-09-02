@@ -124,10 +124,15 @@ def experiment_config(repository, profile, manifest, output, *, experts=2, top_k
                  validation_limit=2 if fast else 16, validation_seed=10042,
                  validation_sample_steps=2 if fast else 8, validation_samples=1,
                  early_stopping_patience=3, early_stopping_min_epochs=3,
-                 router_warmup_epochs=1, router_temperature=1e-4)
+                 progress_mode="compact", progress_updates_per_epoch=1,
+                 router_warmup_epochs=5, router_temperature=1e-4,
+                 router_specialization_temperature=1.0,
+                 router_expert_uniform_floor=0.05,
+                 router_quality_during_diffusion=False)
     losses = train["loss_weights"]
     losses.update(perceptual=0.0, adversarial=0.0, gradient=0.0, wavelet=0.0,
                   expert_denoising=0.1, router_balance=0.01,
+                  router_specialization=0.05,
                   router_quality=0.05, router_ranking=0.05)
     if profile == "rgb_standard":
         losses.update(mse=0.0, multiscale_mse=0.0, ssim=0.2, gradient=0.1,
@@ -164,6 +169,8 @@ def run_stage(
     fast=False,
     learning_rate=None,
     max_batches_per_epoch=None,
+    minimum_optimizer_steps=None,
+    validate_every=None,
 ):
     repository, root = Path(repository), Path(root)
     config = copy.deepcopy(config)
@@ -181,15 +188,31 @@ def run_stage(
         train["max_batches_per_epoch"] = (
             2 if fast else int(max_batches_per_epoch)
         )
+    if minimum_optimizer_steps is not None:
+        train["minimum_optimizer_steps"] = (
+            0 if fast else int(minimum_optimizer_steps)
+        )
+    if validate_every is not None:
+        train["validate_every"] = 1 if fast else int(validate_every)
     if stage == "diffusion":
         train.update(checkpoint_metric="val_loss_diffusion", checkpoint_mode="min",
                      early_stopping_metric="val_loss_diffusion", early_stopping_mode="min",
                      lr_scheduler_metric="val_loss_diffusion", lr_scheduler_mode="min")
         train["loss_weights"]["diffusion"] = 1.0
     if stage == "joint" and config["experiment"]["new_architecture"]:
-        # Keep the router's LR features stable. The final decoder sees actual DDIM samples.
+        # DDIM remains no-grad; a separate one-step objective refines only the
+        # lightweight expert/router parameters alongside mapper and decoder.
         train.update(trainable_modules=["mapper", "decoder"], joint_latent_source="sampled",
                      joint_sample_steps=2 if fast else 8)
+        if config["model"].get("diffusion_experts", 0) > 0:
+            train.update(
+                trainable_parameter_prefixes=[
+                    "diffusion.router",
+                    "diffusion.experts",
+                ],
+                module_learning_rate_multipliers={"diffusion": 0.25},
+                joint_router_refinement=True,
+            )
         train["loss_weights"]["diffusion"] = 0.0
     elif stage == "joint" and config["experiment"]["profile"] in ("rgb_harmonized_fidelity", "multispectral_guided_fidelity"):
         train["trainable_modules"] = ["lr_encoder", "mapper", "decoder"]

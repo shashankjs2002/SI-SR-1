@@ -120,6 +120,35 @@ class TileMoETest(unittest.TestCase):
         losses = router_objectives(route, candidates, candidates[:, 0].detach(), torch.zeros(1, 1, 32, 32), **kwargs)
         self.assertEqual(float(losses["router_quality"].detach()), 0)
 
+    def test_specialization_oracle_separates_experts(self):
+        logits = torch.zeros(1, 2, requires_grad=True)
+        route = {
+            "logits": logits,
+            "quality_logits": torch.zeros_like(logits),
+            "probabilities": logits.softmax(1),
+            "selected": torch.ones_like(logits),
+        }
+        candidates = torch.stack((
+            torch.full((1, 4, 4, 4), 0.1),
+            torch.full((1, 4, 4, 4), 1.0),
+        ), 1).requires_grad_()
+        target = torch.zeros(1, 4, 4, 4)
+        losses = router_objectives(
+            route,
+            candidates,
+            target,
+            torch.ones(1, 1, 32, 32),
+            specialization_temperature=0.5,
+            expert_uniform_floor=0.05,
+        )
+        (losses["expert_denoising"] + losses["router_specialization"]).backward()
+        self.assertLess(float(logits.grad[0, 0]), 0)
+        self.assertGreater(float(logits.grad[0, 1]), 0)
+        self.assertGreater(
+            float(candidates.grad[:, 0].abs().mean()),
+            float(candidates.grad[:, 1].abs().mean()),
+        )
+
     def test_train_router_and_sampled_refinement_freezes_base(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -143,6 +172,25 @@ class TileMoETest(unittest.TestCase):
             trainer._weighted_loss(losses).backward()
             self.assertTrue(all(p.grad is None for p in trainer.model.diffusion.parameters()))
             self.assertTrue(any(p.grad is not None for p in trainer.model.decoder.parameters()))
+            config["training"].update(
+                trainable_parameter_prefixes=[
+                    "diffusion.router",
+                    "diffusion.experts",
+                ],
+                joint_router_refinement=True,
+            )
+            trainer = Trainer(config)
+            _, losses = trainer._forward_stage(batch)
+            trainer._weighted_loss(losses).backward()
+            self.assertTrue(any(
+                p.grad is not None and p.grad.abs().sum() > 0
+                for p in trainer.model.diffusion.router.parameters()
+            ))
+            self.assertTrue(any(
+                p.grad is not None and p.grad.abs().sum() > 0
+                for p in trainer.model.diffusion.experts.parameters()
+            ))
+            self.assertTrue(all(p.grad is None for p in trainer.model.base.parameters()))
             trainer.train()
             checkpoint = root / "diffusion" / "joint_best.pt"
             payload = torch.load(checkpoint, weights_only=False)
@@ -180,6 +228,46 @@ class TileMoETest(unittest.TestCase):
                          'within-tile-spatial', 'RUN_TEST_EVALUATION = False',
                          'run_new("generic_moe")', 'run_new("reliability_moe")'):
             self.assertIn(required, all_text)
+
+    def test_oli2msi_strong_base_notebook_protocol(self):
+        path = ROOT / "kaggle/GeoDiff_GAN_Kaggle_OLI2MSI_Strong_Base_MoE_3x.ipynb"
+        notebook = json.loads(path.read_text(encoding="utf-8"))
+        texts = []
+        for cell in notebook["cells"]:
+            source = "".join(cell["source"])
+            texts.append(source)
+            if cell["cell_type"] == "code":
+                ast.parse(source)
+                self.assertIsNone(cell["execution_count"])
+                self.assertEqual(cell["outputs"], [])
+        all_text = "\n".join(texts)
+        for required in (
+            'DATA_PROTOCOL_ID = "oli2msi_official_full160_clip03_uint8grid_v1"',
+            "LR_FRAME_SIZE, SCALE = 160, 3",
+            "QUANTIZE_TO_UINT8_GRID = True",
+            "RUN_TEST_EVALUATION = False",
+            'run_new("single_expert")',
+            'run_new("generic_moe")',
+            'run_new("reliability_moe")',
+            'best_phase["validation_psnr"]',
+            'KNOWN_OLI2MSI_ROOT = Path(',
+            'def discover_layout(roots):',
+            '"train_lr": ("train_lr", "train-lr", "trainlr", "lr_train")',
+            '"dataset root, any split folder, or one LR/HR folder."',
+            'NUM_EXPERTS = 2',
+            'TOP_K = 1',
+            'progress_mode="compact"',
+            'minimum_optimizer_steps=MINIMUM_OPTIMIZER_STEPS[stage]',
+            'router_warmup_epochs=5',
+        ):
+            self.assertIn(required, all_text)
+        for forbidden in (
+            "prepare_landsat_sentinel",
+            "SENTINEL_INPUT",
+            "LANDSAT_INPUT",
+            "MAX_DAY_GAP",
+        ):
+            self.assertNotIn(forbidden, all_text)
 
     def test_balanced_manifest_keeps_splits_and_interleaves_tiles(self):
         with tempfile.TemporaryDirectory() as directory:

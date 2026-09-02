@@ -123,8 +123,23 @@ class Trainer:
                 )
         self._configure_stage()
         if training.get("joint_latent_source", "noisy_target") == "sampled" and self.stage == "joint":
-            if any(p.requires_grad for p in self.model.diffusion.parameters()):
-                raise ValueError("Sampled joint refinement requires frozen diffusion; train router in the diffusion stage")
+            trainable_diffusion = [
+                name
+                for name, parameter in self.model.diffusion.named_parameters()
+                if parameter.requires_grad
+            ]
+            allowed = bool(training.get("joint_router_refinement", False)) and all(
+                name == "router"
+                or name.startswith("router.")
+                or name == "experts"
+                or name.startswith("experts.")
+                for name in trainable_diffusion
+            )
+            if trainable_diffusion and not allowed:
+                raise ValueError(
+                    "Sampled joint refinement may train only diffusion.router and "
+                    "diffusion.experts when joint_router_refinement is enabled"
+                )
         self.model.diffusion.gradient_checkpointing = bool(
             config["training"].get("gradient_checkpointing", True)
         )
@@ -264,23 +279,50 @@ class Trainer:
 
     def _configure_stage(self) -> None:
         trainable_modules = self.config["training"].get("trainable_modules")
-        if trainable_modules is None:
+        trainable_prefixes = self.config["training"].get(
+            "trainable_parameter_prefixes"
+        )
+        if trainable_modules is None and trainable_prefixes is None:
             configure_stage_trainability(self.model, self.stage)
             return
-        if not isinstance(trainable_modules, list) or not all(
-            isinstance(name, str) for name in trainable_modules
-        ):
-            raise ValueError("training.trainable_modules must be a list of module names")
         self.model.requires_grad_(False)
         available = dict(self.model.named_children())
-        unknown = sorted(set(trainable_modules) - set(available))
-        if unknown:
-            raise ValueError(
-                "training.trainable_modules contains unknown modules: "
-                + ", ".join(unknown)
-            )
-        for name in trainable_modules:
-            available[name].requires_grad_(True)
+        if trainable_modules is not None:
+            if not isinstance(trainable_modules, list) or not all(
+                isinstance(name, str) for name in trainable_modules
+            ):
+                raise ValueError(
+                    "training.trainable_modules must be a list of module names"
+                )
+            unknown = sorted(set(trainable_modules) - set(available))
+            if unknown:
+                raise ValueError(
+                    "training.trainable_modules contains unknown modules: "
+                    + ", ".join(unknown)
+                )
+            for name in trainable_modules:
+                available[name].requires_grad_(True)
+        if trainable_prefixes is not None:
+            if not isinstance(trainable_prefixes, list) or not all(
+                isinstance(prefix, str) and prefix
+                for prefix in trainable_prefixes
+            ):
+                raise ValueError(
+                    "training.trainable_parameter_prefixes must be a list of "
+                    "non-empty parameter prefixes"
+                )
+            matched = {prefix: 0 for prefix in trainable_prefixes}
+            for name, parameter in self.model.named_parameters():
+                for prefix in trainable_prefixes:
+                    if name == prefix or name.startswith(prefix + "."):
+                        parameter.requires_grad_(True)
+                        matched[prefix] += 1
+            unknown = [prefix for prefix, count in matched.items() if count == 0]
+            if unknown:
+                raise ValueError(
+                    "training.trainable_parameter_prefixes matched no parameters: "
+                    + ", ".join(unknown)
+                )
 
     def _optimizer_parameter_groups(self) -> list[dict[str, Any]]:
         """Build optional per-module learning-rate groups for delicate joint tuning."""
@@ -644,9 +686,28 @@ class Trainer:
                 prepared_degradation, model.mode_tensor(mode, hr.shape[0], hr.device),
                 lr_features[1], routing_context,
             )
-            if self.stage == "diffusion":
+            supervise_router = self.stage == "diffusion" or (
+                self.stage == "joint"
+                and bool(
+                    self.config["training"].get(
+                        "joint_router_refinement", False
+                    )
+                )
+            )
+            if supervise_router:
                 candidate_mse = base_mse = None
-                if model.diffusion.routing_mode == "reliability":
+                supervise_image_quality = (
+                    model.diffusion.routing_mode == "reliability"
+                    and (
+                        self.stage == "joint"
+                        or bool(
+                            self.config["training"].get(
+                                "router_quality_during_diffusion", False
+                            )
+                        )
+                    )
+                )
+                if supervise_image_quality:
                     with torch.no_grad():
                         denominator = (valid_mask.sum((1, 2, 3)) * hr.shape[1]).clamp_min(1)
                         base_mse = ((base.float() - hr.float()).square() * valid_mask).sum((1, 2, 3)) / denominator
@@ -664,6 +725,16 @@ class Trainer:
                     route, candidates, diffusion_batch.target_velocity, valid_mask,
                     candidate_mse, base_mse,
                     temperature=float(self.config["training"].get("router_temperature", 1e-4)),
+                    specialization_temperature=float(
+                        self.config["training"].get(
+                            "router_specialization_temperature", 1.0
+                        )
+                    ),
+                    expert_uniform_floor=float(
+                        self.config["training"].get(
+                            "router_expert_uniform_floor", 0.05
+                        )
+                    ),
                 ))
                 for expert in range(model.diffusion.num_experts):
                     losses[f"stat_expert_{expert}_usage"] = route["selected"][:, expert].float().mean().detach()
@@ -1132,6 +1203,7 @@ class Trainer:
             "prompt_alignment": 0.05,
             "adversarial": 0.01,
             "expert_denoising": 0.1,
+            "router_specialization": 0.05,
             "router_balance": 0.01,
             "router_quality": 0.05,
             "router_ranking": 0.05,
@@ -1256,6 +1328,10 @@ class Trainer:
         early_stopping_min_delta = max(
             0.0,
             float(training.get("early_stopping_min_delta", 0.0)),
+        )
+        minimum_optimizer_steps = max(
+            0,
+            int(training.get("minimum_optimizer_steps", 0)),
         )
         early_stopping_metric = str(
             training.get("early_stopping_metric", checkpoint_metric)
@@ -1623,6 +1699,7 @@ class Trainer:
                     stop_training = (
                         early_stopping_patience > 0
                         and epoch + 1 >= early_stopping_min_epochs
+                        and total_step_attempts >= minimum_optimizer_steps
                         and early_bad_epochs >= early_stopping_patience
                     )
                 early_stopping_state = {
@@ -1633,6 +1710,10 @@ class Trainer:
                     "patience": early_stopping_patience,
                     "min_delta": early_stopping_min_delta,
                     "stopped": stop_training,
+                    "minimum_optimizer_steps": minimum_optimizer_steps,
+                    "minimum_optimizer_steps_met": (
+                        total_step_attempts >= minimum_optimizer_steps
+                    ),
                 }
                 elapsed_total = previous_elapsed + time.monotonic() - stage_started
                 if stage_seconds > 0 and elapsed_total >= stage_seconds:
@@ -1663,6 +1744,10 @@ class Trainer:
                         "stage_elapsed_seconds": elapsed_total,
                         "total_train_batches": total_batches,
                         "total_optimizer_step_attempts": total_step_attempts,
+                        "minimum_optimizer_steps": minimum_optimizer_steps,
+                        "minimum_optimizer_steps_met": (
+                            total_step_attempts >= minimum_optimizer_steps
+                        ),
                         "budget_exhausted": stage_seconds > 0 and elapsed_total >= stage_seconds,
                         "metrics": epoch_metrics,
                         "checkpoint_selection": checkpoint_selection,
@@ -1726,19 +1811,32 @@ class Trainer:
                             f" early_stop={early_bad_epochs}/"
                             f"{early_stopping_patience}"
                         )
+                    if minimum_optimizer_steps > 0:
+                        summary += (
+                            f" steps={total_step_attempts}/"
+                            f"{minimum_optimizer_steps}"
+                        )
                     summary += (
                         f" elapsed={self._duration(time.monotonic() - stage_started)} "
                         f"stage_eta={self._duration(stage_eta)}"
                     )
                     print(summary, flush=True)
                 if stop_training:
-                    print(
-                        f"[{self.stage}] {'time budget reached' if stage_seconds > 0 and elapsed_total >= stage_seconds else 'early stopping'} after epoch {epoch + 1}: "
-                        f"{early_stopping_metric} did not improve by "
-                        f"{early_stopping_min_delta:g} for "
-                        f"{early_bad_epochs} validation checks",
-                        flush=True,
-                    )
+                    if stage_seconds > 0 and elapsed_total >= stage_seconds:
+                        print(
+                            f"[{self.stage}] time budget reached after epoch "
+                            f"{epoch + 1}; optimizer_steps={total_step_attempts}/"
+                            f"{minimum_optimizer_steps}",
+                            flush=True,
+                        )
+                    else:
+                        print(
+                            f"[{self.stage}] early stopping after epoch "
+                            f"{epoch + 1}: {early_stopping_metric} did not "
+                            f"improve by {early_stopping_min_delta:g} for "
+                            f"{early_bad_epochs} validation checks",
+                            flush=True,
+                        )
             if self.distributed:
                 stop_tensor = torch.tensor(
                     int(stop_training),
