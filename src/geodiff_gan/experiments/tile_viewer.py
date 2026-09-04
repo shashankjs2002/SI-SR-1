@@ -14,6 +14,20 @@ class SavedTileResults:
         self.manifest = Path(state["manifest"])
         self.records = [json.loads(line) for line in self.manifest.read_text(encoding="utf-8").splitlines() if line.strip()]
         self.models = state["results"]
+        protocols = {
+            str(record.get("source", "")).casefold()
+            for record in self.records
+        }
+        normalized_oli2msi = any(
+            "oli2msi" in protocol and "clip03" in protocol
+            for protocol in protocols
+        )
+        self.display_max = float(
+            state.get("display_max", 1.0 if normalized_oli2msi else 0.3)
+        )
+        self.display_gamma = float(
+            state.get("display_gamma", 1.0 if normalized_oli2msi else 1 / 1.4)
+        )
 
     def select(self, split, tile="All"):
         return [r for r in self.records if r["split"] == split and (tile == "All" or r["tile_id"] == tile)]
@@ -24,7 +38,7 @@ class SavedTileResults:
         return "__".join((record["tile_id"], path.parent.name, path.stem)) + "_uncertainty.npz"
 
     def panels(self, index=0, split="test", names=None, show_base=False, tile="All",
-               display_max=0.3, errors=False):
+               display_max=None, errors=False):
         records = self.select(split, tile)
         if not 0 <= int(index) < len(records):
             raise IndexError(f"Index {index} outside {split}/{tile}: 0..{len(records) - 1}")
@@ -32,8 +46,18 @@ class SavedTileResults:
         with np.load(record["patch"]) as patch:
             lr, hr = patch["lr"].copy(), patch["hr"].copy()
             valid = patch["valid_mask_hr"][0].astype(bool)
+        effective_display_max = (
+            self.display_max if display_max is None else float(display_max)
+        )
         panels = [(lr, f"Landsat original 30 m | {lr.shape[-1]} x {lr.shape[-2]}")]
-        details = {"record": record, "display": "Fixed common reflectance stretch; metrics use unchanged arrays", "models": {}}
+        details = {
+            "record": record,
+            "display": (
+                f"Display only: clip to 0..{effective_display_max:g}, gamma="
+                f"{self.display_gamma:g}; metrics use unchanged arrays"
+            ),
+            "models": {},
+        }
         for name in (list(self.models) if names is None else names):
             root = Path(self.models[name]["root"]) / "evaluation" / split / "model"
             path = root / self.cache_name(record)
@@ -61,9 +85,12 @@ class SavedTileResults:
         panels.append((hr, f"Sentinel target 10 m | {hr.shape[-1]} x {hr.shape[-2]}"))
         return panels, details
 
-    @staticmethod
-    def display(image, maximum=0.3):
-        return (np.clip(image.transpose(1, 2, 0) / max(float(maximum), 1e-6), 0, 1) ** (1 / 1.4) * 255).astype(np.uint8)
+    def display(self, image, maximum=None):
+        maximum = self.display_max if maximum is None else float(maximum)
+        stretched = np.clip(
+            image.transpose(1, 2, 0) / max(maximum, 1e-6), 0, 1
+        )
+        return (stretched ** self.display_gamma * 255).round().astype(np.uint8)
 
 
 def build_app(root):
@@ -91,7 +118,10 @@ def build_app(root):
         names = gr.CheckboxGroup(list(viewer.models), value=list(viewer.models), label="Models (empty = dataset only)")
         with gr.Row():
             base = gr.Checkbox(False, label="Show deterministic bases and base PSNR")
-            maximum = gr.Slider(0.1, 1.0, value=0.3, step=0.05, label="Display white point (all panels)")
+            maximum = gr.Slider(
+                0.1, 1.0, value=viewer.display_max, step=0.05,
+                label="Display white point (all panels)",
+            )
             back = gr.Button("< Back")
             forward = gr.Button("Next >")
             refresh = gr.Button("Show")

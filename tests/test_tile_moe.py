@@ -254,11 +254,14 @@ class TileMoETest(unittest.TestCase):
             'def discover_layout(roots):',
             '"train_lr": ("train_lr", "train-lr", "trainlr", "lr_train")',
             '"dataset root, any split folder, or one LR/HR folder."',
-            'NUM_EXPERTS = 2',
-            'TOP_K = 1',
+            'NUM_EXPERTS = 5',
+            'TOP_K = 2',
+            'BATCH_SIZE = 4',
             'progress_mode="compact"',
-            'minimum_optimizer_steps=MINIMUM_OPTIMIZER_STEPS[stage]',
-            'router_warmup_epochs=5',
+            'full_dataset_epochs=True',
+            'router_warmup_epochs=2',
+            '"display_max": 1.0, "display_gamma": 1.0',
+            'show_errors=False, display_max=None',
         ):
             self.assertIn(required, all_text)
         for forbidden in (
@@ -266,6 +269,11 @@ class TileMoETest(unittest.TestCase):
             "SENTINEL_INPUT",
             "LANDSAT_INPUT",
             "MAX_DAY_GAP",
+            "SHARED_MINUTES",
+            "PER_EXPERIMENT_MINUTES",
+            "MINIMUM_OPTIMIZER_STEPS",
+            'minutes=phase["minutes"]',
+            'max_batches_per_epoch=phase["max_batches"]',
         ):
             self.assertNotIn(forbidden, all_text)
 
@@ -331,6 +339,28 @@ class TileMoETest(unittest.TestCase):
             self.assertTrue(0 <= info["models"]["model"]["router_acceptance"] <= 1)
             self.assertEqual(panels[0][0].shape[-1], 40)
             self.assertEqual(panels[-1][0].shape[-1], 120)
+
+    def test_oli2msi_saved_viewer_does_not_apply_clip03_twice(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = self.fixture(root)
+            rows = [json.loads(line) for line in manifest.read_text().splitlines()]
+            for row in rows:
+                row["source"] = "oli2msi_official_full160_clip03_uint8grid_v1"
+            manifest.write_text(
+                "".join(json.dumps(row) + "\n" for row in rows),
+                encoding="utf-8",
+            )
+            (root / "suite_state.json").write_text(json.dumps({
+                "manifest": str(manifest),
+                "results": {},
+            }), encoding="utf-8")
+            viewer = SavedTileResults(root)
+            self.assertEqual(viewer.display_max, 1.0)
+            self.assertEqual(viewer.display_gamma, 1.0)
+            image = np.full((3, 2, 2), 0.5, dtype=np.float32)
+            rendered = viewer.display(image)
+            self.assertTrue(np.all(rendered == 128))
 
 
 if __name__ == "__main__":

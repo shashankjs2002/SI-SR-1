@@ -82,7 +82,8 @@ def balanced_manifest(source, destination, seed=42):
 
 
 def experiment_config(repository, profile, manifest, output, *, experts=2, top_k=1,
-                      crop_size=32, calibration=None, multispectral=False, fast=False):
+                      crop_size=32, calibration=None, multispectral=False, fast=False,
+                      full_dataset_epochs=False):
     if profile not in (*LEGACY_PROFILES, *NEW_PROFILES):
         raise ValueError(f"Unknown experiment: {profile}")
     if not isinstance(experts, int) or not isinstance(top_k, int) or not 1 <= top_k <= experts:
@@ -120,7 +121,6 @@ def experiment_config(repository, profile, manifest, output, *, experts=2, top_k
                  num_workers=2, persistent_workers=False, reseed_each_epoch=True,
                  weight_decay=0.0, gradient_checkpointing=False,
                  auto_resume=True, init_checkpoint=None, resume=None,
-                 max_batches_per_epoch=2 if fast else 120,
                  validation_limit=2 if fast else 16, validation_seed=10042,
                  validation_sample_steps=2 if fast else 8, validation_samples=1,
                  early_stopping_patience=3, early_stopping_min_epochs=3,
@@ -129,6 +129,12 @@ def experiment_config(repository, profile, manifest, output, *, experts=2, top_k
                  router_specialization_temperature=1.0,
                  router_expert_uniform_floor=0.05,
                  router_quality_during_diffusion=False)
+    if fast:
+        train["max_batches_per_epoch"] = 2
+    elif full_dataset_epochs:
+        train.pop("max_batches_per_epoch", None)
+    else:
+        train["max_batches_per_epoch"] = 120
     losses = train["loss_weights"]
     losses.update(perceptual=0.0, adversarial=0.0, gradient=0.0, wavelet=0.0,
                   expert_denoising=0.1, router_balance=0.01,
@@ -165,7 +171,7 @@ def run_stage(
     *,
     parent=None,
     epochs=6,
-    minutes=30,
+    minutes=None,
     fast=False,
     learning_rate=None,
     max_batches_per_epoch=None,
@@ -178,12 +184,17 @@ def run_stage(
     train.update(stage=stage, epochs=1 if fast else epochs,
                  output_dir=str(root / "runs" / stage),
                  init_checkpoint=str(parent) if parent else None, resume=None,
-                 max_stage_seconds=60 if fast else minutes * 60,
                  learning_rate=(
                      float(learning_rate)
                      if learning_rate is not None
                      else (1e-5 if stage == "joint" else 1e-4)
                  ))
+    if fast:
+        train["max_stage_seconds"] = 60
+    elif minutes is None:
+        train.pop("max_stage_seconds", None)
+    else:
+        train["max_stage_seconds"] = float(minutes) * 60
     if max_batches_per_epoch is not None:
         train["max_batches_per_epoch"] = (
             2 if fast else int(max_batches_per_epoch)

@@ -86,9 +86,9 @@ def build():
     The notebook compares the final frozen base with a one-expert control, generic
     MoE, and reliability-supervised MoE. It uses fixed OLI2MSI radiometry,
     resize-convolution, no PixelShuffle, no captions, no synthetic LR, no GAN loss,
-    and no natural-image perceptual loss. Training uses compact one-line progress,
-    minimum optimizer-step budgets, and full validation at controlled intervals.
-    Run the smoke profile first, then
+    and no natural-image perceptual loss. Training uses compact one-line progress
+    and complete dataset epochs. The only training controls are batch size and the
+    epoch counts. Run the smoke profile first, then
     use a new suite root with `FAST_DEV_RUN=False`.
 
     Attach the official OLI2MSI data and `geodiff_oli2msi_strong_base_source.zip` as
@@ -114,8 +114,8 @@ def build():
     REPOSITORY_DIR = Path("/kaggle/working/geodiff-3x-continued-oli2msi")
     SOURCE_ARCHIVE = None
     SUITE_ROOT = Path(
-        "/kaggle/working/geodiff-oli2msi-moe-v2-smoke"
-        if FAST_DEV_RUN else "/kaggle/working/geodiff-oli2msi-moe-v2"
+        "/kaggle/working/geodiff-oli2msi-moe-simple-v3-smoke"
+        if FAST_DEV_RUN else "/kaggle/working/geodiff-oli2msi-moe-simple-v3"
     )
     KNOWN_OLI2MSI_ROOT = Path(
         "/kaggle/input/datasets/twilight2002/oli2msi-thesis/"
@@ -137,24 +137,29 @@ def build():
     MAX_VALIDATION_SOURCE_PAIRS = 16 if FAST_DEV_RUN else None
     MAX_TEST_SOURCE_PAIRS = 16 if FAST_DEV_RUN else None
 
-    NUM_EXPERTS = 2
-    TOP_K = 1
+    NUM_EXPERTS = 5
+    TOP_K = 2
+    BATCH_SIZE = 4
+    EPOCHS = {
+        "base_crop32": 10,
+        "base_crop64": 4,
+        "base_crop128": 2,
+        "vae": 3,
+        "diffusion": 5,
+        "joint": 3,
+    }
+
     INCLUDE_MULTISPECTRAL = False
     NEW_MULTISPECTRAL = False
     TRAIN_LR_CROP = 64
     BASE_PHASES = (
-        {"name": "crop32", "crop": 32, "epochs": 30, "minutes": 45,
-         "learning_rate": 1e-4, "max_batches": 400, "minimum_steps": 3000},
-        {"name": "crop64", "crop": 64, "epochs": 24, "minutes": 35,
-         "learning_rate": 5e-5, "max_batches": 180, "minimum_steps": 1000},
-        {"name": "crop128", "crop": 128, "epochs": 16, "minutes": 20,
-         "learning_rate": 1e-5, "max_batches": 60, "minimum_steps": 250},
+        {"name": "crop32", "crop": 32, "epochs": EPOCHS["base_crop32"],
+         "learning_rate": 1e-4},
+        {"name": "crop64", "crop": 64, "epochs": EPOCHS["base_crop64"],
+         "learning_rate": 5e-5},
+        {"name": "crop128", "crop": 128, "epochs": EPOCHS["base_crop128"],
+         "learning_rate": 1e-5},
     )
-    EPOCHS = {"base": 12, "vae": 16, "diffusion": 24, "joint": 16}
-    SHARED_MINUTES = {"base": 40, "vae": 30}
-    PER_EXPERIMENT_MINUTES = {"diffusion": 30, "joint": 25}
-    MINIMUM_OPTIMIZER_STEPS = {"vae": 600, "diffusion": 900, "joint": 500}
-    VALIDATE_EVERY = {"base": 1, "vae": 2, "diffusion": 4, "joint": 2}
     RUN_EARLIER = {name: False for name in (
         "rgb_standard", "rgb_fidelity", "multispectral_fidelity",
         "rgb_harmonized_fidelity", "multispectral_guided_fidelity")}
@@ -190,11 +195,9 @@ def build():
         print("+", " ".join(command), flush=True)
         return subprocess.run(command, cwd=cwd, env=environment, check=True)
 
-    main_minutes = sum(phase["minutes"] for phase in BASE_PHASES)
-    main_minutes += SHARED_MINUTES["vae"] + 3 * sum(PER_EXPERIMENT_MINUTES.values())
     print("Suite:", SUITE_ROOT)
     print("Protocol:", LR_FRAME_SIZE, "->", HR_FRAME_SIZE, "at", SCALE, "x")
-    print("Nominal main-study training budget:", main_minutes, "minutes")
+    print("Training controls:", {"batch_size": BATCH_SIZE, "epochs": EPOCHS})
     """)
 
     install_md = find(cells, "## 2. Install the matching source", "markdown")
@@ -593,6 +596,11 @@ def build():
         'validation_limit=None if not FAST_DEV_RUN else 2,',
         'validation_limit=RESIDUAL_VALIDATION_LIMIT,',
     )
+    registry_source = registry_source.replace(
+        'multispectral=NEW_MULTISPECTRAL, fast=FAST_DEV_RUN,',
+        'multispectral=NEW_MULTISPECTRAL, fast=FAST_DEV_RUN, '
+        'full_dataset_epochs=True,',
+    )
     old_limit = (
         '    configured = config["training"].get("validation_limit")\n'
         '    tile_count = len({r.tile_id for r in records})\n'
@@ -609,19 +617,29 @@ def build():
         raise RuntimeError("Could not replace tile-specific validation rule")
     registry_source = registry_source.replace(old_limit, new_limit)
     registry_source = registry_source.replace(
+        '"source_sha256": source_digest}',
+        '"source_sha256": source_digest,\n'
+        '             "display_max": 1.0, "display_gamma": 1.0}',
+    )
+    registry_source = registry_source.replace(
         "batch_size=2, gradient_accumulation=8, weight_decay=0.0,",
-        "batch_size=2, gradient_accumulation=2, weight_decay=0.0,",
+        "batch_size=BATCH_SIZE, gradient_accumulation=1, weight_decay=0.0,",
     )
     registry_source = registry_source.replace(
         "early_stopping_patience=6, early_stopping_min_epochs=8,",
         "early_stopping_patience=6, early_stopping_min_epochs=8,\n"
         "            progress_mode=\"compact\", progress_updates_per_epoch=1,\n"
-        "            router_warmup_epochs=5,",
+        "            router_warmup_epochs=2,",
     )
     registry_source = registry_source.replace(
         'psnr_first_base=True,',
         'psnr_first_base=True, dataset_protocol=DATA_PROTOCOL_ID, '
         'full_frame_geometry=[LR_FRAME_SIZE, HR_FRAME_SIZE],',
+    )
+    earlier_start = registry_source.index("def run_earlier(profile):")
+    earlier_end = registry_source.index("\nprefix =", earlier_start)
+    registry_source = (
+        registry_source[:earlier_start] + registry_source[earlier_end + 1:]
     )
     set_code(cells[registry], registry_source)
 
@@ -638,11 +656,8 @@ def build():
         phase_config["training"]["validation_limit"] = BASE_VALIDATION_LIMIT
         config_path, checkpoint = run_stage(
             REPOSITORY_DIR, phase_config, phase_root, "base", parent=phase_parent,
-            epochs=phase["epochs"], minutes=phase["minutes"], fast=FAST_DEV_RUN,
+            epochs=phase["epochs"], fast=FAST_DEV_RUN,
             learning_rate=phase["learning_rate"],
-            max_batches_per_epoch=phase["max_batches"],
-            minimum_optimizer_steps=phase["minimum_steps"],
-            validate_every=VALIDATE_EVERY["base"],
         )
         payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
         metrics = payload.get("extra", {}).get("metrics", {})
@@ -678,15 +693,11 @@ def build():
     residual_source = value(cells[residual_train])
     residual_source = residual_source.replace(
         'parent=BASE_CHECKPOINT, epochs=EPOCHS["vae"], minutes=SHARED_MINUTES["vae"], fast=FAST_DEV_RUN)',
-        'parent=BASE_CHECKPOINT, epochs=EPOCHS["vae"], minutes=SHARED_MINUTES["vae"], '
-        'fast=FAST_DEV_RUN, minimum_optimizer_steps=MINIMUM_OPTIMIZER_STEPS["vae"], '
-        'validate_every=VALIDATE_EVERY["vae"])',
+        'parent=BASE_CHECKPOINT, epochs=EPOCHS["vae"], fast=FAST_DEV_RUN)',
     )
     residual_source = residual_source.replace(
         'epochs=EPOCHS[stage], minutes=PER_EXPERIMENT_MINUTES[stage], fast=FAST_DEV_RUN)',
-        'epochs=EPOCHS[stage], minutes=PER_EXPERIMENT_MINUTES[stage], '
-        'fast=FAST_DEV_RUN, minimum_optimizer_steps=MINIMUM_OPTIMIZER_STEPS[stage], '
-        'validate_every=VALIDATE_EVERY[stage])',
+        'epochs=EPOCHS[stage], fast=FAST_DEV_RUN)',
     )
     set_code(cells[residual_train], residual_source)
 
@@ -713,53 +724,12 @@ validation_table = append_bicubic(
     )
     set_code(cells[evaluate], evaluate_source)
 
-    routing = find(cells, "history_rows = []", "code")
-    set_code(cells[routing], """
-    history_rows = []
-    from geodiff_gan.training.checkpoint import latest_stage_checkpoint
-    for name, item in RESULTS.items():
-        root = Path(item["root"])
-        path = root / "evaluation/val/model/per_patch_metrics.jsonl"
-        rows = [json.loads(line) for line in path.read_text().splitlines()]
-        routed = [row for row in rows if row.get("expert_weights")]
-        if routed:
-            weights = np.asarray([row["expert_weights"] for row in routed], dtype=np.float64)
-            acceptance = np.asarray([row["router_acceptance"] for row in routed])
-            entropy = -(weights * np.log(np.clip(weights, 1e-12, 1))).sum(1)
-            entropy /= np.log(weights.shape[1]) if weights.shape[1] > 1 else 1
-            fig, axes = plt.subplots(1, 2, figsize=(10, 3))
-            axes[0].bar(np.arange(weights.shape[1]), weights.mean(0))
-            axes[0].set(xlabel="Expert", ylabel="Mean routing weight",
-                        title=name + " (final timestep)", ylim=(0, 1))
-            axes[1].hist(acceptance, bins=15, range=(0, 1))
-            axes[1].set(xlabel="Residual acceptance", ylabel="Images")
-            fig.tight_layout(); fig.savefig(FIGURE_ROOT / f"{name}_routing.png", dpi=150); plt.show()
-            effective = (weights >= 0.05).mean(0)
-            print("Effective usage (weight >= 0.05):", effective.round(3).tolist())
-            print("Mean normalized routing entropy:", round(float(entropy.mean()), 4))
-        for done in root.glob("runs/*/completed.json"):
-            stage = done.parent.name
-            saved = json.loads(done.read_text())
-            payload = torch.load(saved["checkpoint"], map_location="cpu", weights_only=False)
-            last = torch.load(latest_stage_checkpoint(done.parent, stage), map_location="cpu", weights_only=False)
-            extra = last.get("extra", {})
-            history_rows.append({
-                "experiment": name,
-                "stage": stage,
-                "best_epoch": payload["epoch"] + 1,
-                "completed_epochs": last["epoch"] + 1,
-                "batches": extra.get("total_train_batches"),
-                "optimizer_step_attempts": extra.get("total_optimizer_step_attempts"),
-                "minimum_optimizer_steps": extra.get("minimum_optimizer_steps", 0),
-                "minimum_steps_met": extra.get("minimum_optimizer_steps_met", True),
-                "stage_minutes": extra.get("stage_elapsed_seconds", 0) / 60,
-                "best_metrics": payload["extra"]["metrics"],
-            })
-            del payload, last
-    (SUITE_ROOT / "training_selection.json").write_text(json.dumps(history_rows, indent=2))
-    display(pd.DataFrame(history_rows).drop(columns=["best_metrics"], errors="ignore"))
-    print("Training loss/usage histories:", list(EXPERIMENT_ROOT.glob("*/runs/*/training_history.jsonl")))
-    """)
+    comparison = find(cells, "def show_results", "code")
+    comparison_source = value(cells[comparison]).replace(
+        "display_max=0.3):",
+        "display_max=None):",
+    )
+    set_code(cells[comparison], comparison_source)
 
     routing = find(cells, "history_rows = []", "code")
     set_code(cells[routing], """
@@ -790,17 +760,11 @@ validation_table = append_bicubic(
             saved = json.loads(done.read_text())
             payload = torch.load(saved["checkpoint"], map_location="cpu", weights_only=False)
             last = torch.load(latest_stage_checkpoint(done.parent, stage), map_location="cpu", weights_only=False)
-            extra = last.get("extra", {})
             history_rows.append({
                 "experiment": name,
                 "stage": stage,
                 "best_epoch": payload["epoch"] + 1,
                 "completed_epochs": last["epoch"] + 1,
-                "batches": extra.get("total_train_batches"),
-                "optimizer_step_attempts": extra.get("total_optimizer_step_attempts"),
-                "minimum_optimizer_steps": extra.get("minimum_optimizer_steps", 0),
-                "minimum_steps_met": extra.get("minimum_optimizer_steps_met", True),
-                "stage_minutes": extra.get("stage_elapsed_seconds", 0) / 60,
                 "best_metrics": payload["extra"]["metrics"],
             })
             del payload, last
@@ -849,7 +813,7 @@ validation_table = append_bicubic(
                 'Path("/kaggle/working/geodiff-3x-continued-oli2msi")',
             ).replace(
                 'Path("/kaggle/working/geodiff-tiles-strong-base-v2")',
-                'Path("/kaggle/working/geodiff-oli2msi-moe-v2")',
+                'Path("/kaggle/working/geodiff-oli2msi-moe-simple-v3")',
             )
             set_code(cell, source)
 
