@@ -84,21 +84,23 @@ def build():
     used only during base training.
 
     The notebook compares the final frozen base with a one-expert control, generic
-    MoE, and reliability-supervised MoE. It uses fixed OLI2MSI radiometry,
-    resize-convolution, no PixelShuffle, no captions, no synthetic LR, no GAN loss,
-    and no natural-image perceptual loss. Training uses compact one-line progress
-    and complete dataset epochs. The only training controls are batch size and the
-    epoch counts. Run the smoke profile first, then
+    MoE, reliability-supervised MoE, and a separate balanced adversarial MoE.
+    The first three residual experiments retain the distortion-focused objective;
+    the balanced ablation adds spatial, spectral, and dual-discriminator losses
+    without changing their checkpoints. It uses fixed OLI2MSI radiometry,
+    resize-convolution, no PixelShuffle, no captions, and no synthetic LR.
+    Training uses compact one-line progress and complete dataset epochs. The only
+    training controls are batch size and the epoch counts. Run the smoke profile first, then
     use a new suite root with `FAST_DEV_RUN=False`.
 
     Attach the official OLI2MSI data and `geodiff_oli2msi_strong_base_source.zip` as
     private Kaggle datasets. A 35 dB result is a target, not a guarantee.
 
-    **MoE V2 change:** the full run uses two experts and trains both for the first
-    five epochs. It then switches to one-expert routing. Each expert receives a
-    different detached oracle target based on its relative velocity error, while
-    a differentiable balance term discourages collapse. Joint training refines
-    only the lightweight router/expert adapters; the shared diffusion trunk and
+    **MoE V2 change:** the full run uses five experts with top-2 routing and trains
+    all experts during a two-epoch warm-up. Each expert receives a different
+    detached oracle target based on its relative velocity error, while a
+    differentiable balance term discourages collapse. Joint training refines only
+    the lightweight router/expert adapters; the shared diffusion trunk and
     deterministic base remain frozen.
     """)
 
@@ -145,8 +147,8 @@ def build():
         "base_crop64": 4,
         "base_crop128": 2,
         "vae": 3,
-        "diffusion": 5,
-        "joint": 3,
+        "diffusion": 30,
+        "joint": 10,
     }
 
     INCLUDE_MULTISPECTRAL = False
@@ -701,6 +703,114 @@ def build():
     )
     set_code(cells[residual_train], residual_source)
 
+    reliability_run = find(cells, 'display(run_new("reliability_moe"))', "code")
+    cells[reliability_run + 1:reliability_run + 1] = [
+        markdown("""
+        ## 11D. Balanced spatial-spectral adversarial MoE
+
+        This is a new, isolated loss ablation. It reuses the same frozen base and
+        VAE, but trains a new reliability-routed diffusion model and a new joint
+        decoder. The diffusion stage balances velocity denoising, per-expert
+        denoising, specialization, routing balance, and reconstruction-derived
+        reliability labels. The joint stage reduces MSE/SSIM dominance and adds
+        Charbonnier, consistency, gradient, wavelet, radiometric, residual,
+        evidence, patch-GAN, and wavelet-GAN contributions.
+
+        The adversarial generator weight is deliberately small (`0.003`). Larger
+        values may improve visual sharpness while reducing PSNR or introducing
+        false texture. Model selection still uses validation PSNR, and the final
+        report must include the remote-sensing metrics and comparison with the
+        shared base.
+        """),
+        code("""
+        BALANCED_DIFFUSION_LOSSES = {
+            "diffusion": 1.0,
+            "expert_denoising": 0.30,
+            "router_specialization": 0.15,
+            "router_balance": 0.02,
+            "router_quality": 0.05,
+            "router_ranking": 0.05,
+        }
+
+        BALANCED_JOINT_LOSSES = {
+            # Distortion terms remain present, but no longer dominate the objective.
+            "charbonnier": 0.75,
+            "mse": 8.0,
+            "multiscale_mse": 2.0,
+            "ssim": 0.15,
+            # Domain-relevant spatial, spectral, and residual supervision.
+            "consistency": 0.10,
+            "gradient": 0.20,
+            "wavelet": 0.15,
+            "radiometric": 0.10,
+            "residual_supervision": 0.75,
+            "base_guard": 15.0,
+            "evidence_calibration": 0.05,
+            "evidence_improvement": 0.15,
+            # Patch and wavelet discriminators share this generator weight.
+            "adversarial": 0.003,
+            # Keep routing objectives active during joint refinement.
+            "expert_denoising": 0.10,
+            "router_specialization": 0.05,
+            "router_balance": 0.01,
+            "router_quality": 0.10,
+            "router_ranking": 0.10,
+            # LPIPS/AlexNet is not used as a remote-sensing training objective.
+            "perceptual": 0.0,
+        }
+
+        def run_balanced_adversarial_moe():
+            name = f"{prefix}_balanced_adversarial_moe"
+            root = EXPERIMENT_ROOT / name
+
+            # Reliability routing supplies reconstruction-derived expert labels.
+            diffusion_config = make_config("reliability_moe", root)
+            diffusion_config["experiment"].update(
+                profile="balanced_adversarial_moe",
+                parent_profile="reliability_moe",
+                objective="balanced_spatial_spectral_adversarial_v1",
+                diffusion_loss_weights=BALANCED_DIFFUSION_LOSSES,
+                joint_loss_weights=BALANCED_JOINT_LOSSES,
+            )
+            diffusion_config["training"].update(
+                router_quality_during_diffusion=True,
+                discriminator_learning_rate=2e-5,
+            )
+            diffusion_config["training"]["loss_weights"].update(
+                BALANCED_DIFFUSION_LOSSES
+            )
+
+            print("Balanced diffusion losses:")
+            display(pd.DataFrame.from_dict(
+                BALANCED_DIFFUSION_LOSSES, orient="index", columns=["weight"]
+            ))
+            diffusion_config_path, diffusion_checkpoint = run_stage(
+                REPOSITORY_DIR, diffusion_config, root, "diffusion",
+                parent=VAE_CHECKPOINT, epochs=EPOCHS["diffusion"],
+                fast=FAST_DEV_RUN,
+            )
+
+            joint_config = copy.deepcopy(diffusion_config)
+            joint_config["training"]["loss_weights"].update(
+                BALANCED_JOINT_LOSSES
+            )
+            print("Balanced joint losses:")
+            display(pd.DataFrame.from_dict(
+                BALANCED_JOINT_LOSSES, orient="index", columns=["weight"]
+            ))
+            joint_config_path, joint_checkpoint = run_stage(
+                REPOSITORY_DIR, joint_config, root, "joint",
+                parent=diffusion_checkpoint, epochs=EPOCHS["joint"],
+                fast=FAST_DEV_RUN,
+            )
+
+            register(name, root, joint_config_path, joint_checkpoint)
+            return RESULTS[name]
+
+        display(run_balanced_adversarial_moe())
+        """),
+    ]
+
     evaluate = find(cells, "def evaluate_result", "code")
     evaluate_source = value(cells[evaluate])
     evaluate_source = evaluate_source.replace(
@@ -730,6 +840,136 @@ validation_table = append_bicubic(
         "display_max=None):",
     )
     set_code(cells[comparison], comparison_source)
+
+    cells[comparison + 1:comparison + 1] = [
+        markdown("""
+        ## Test the balanced adversarial model on the official test set
+
+        Run this only after selecting the balanced model from validation. It
+        evaluates the requested number of official test pairs, saves aggregate
+        and per-image metrics, compares the same checkpoint's frozen base and
+        bicubic interpolation, and displays one indexed test example.
+        """),
+        code("""
+        def test_balanced_adversarial_model(
+            index=0,
+            limit=100,
+            samples=4,
+            steps=20,
+            show_base=True,
+        ):
+            name = f"{prefix}_balanced_adversarial_moe"
+            if name not in RESULTS:
+                raise KeyError(
+                    f"{name} is not registered. Run the balanced training cell first."
+                )
+
+            item = RESULTS[name]
+            evaluation_root = (
+                Path(item["root"])
+                / "evaluation"
+                / f"test_n{int(limit)}_s{int(samples)}_d{int(steps)}"
+            )
+            model_root = evaluation_root / "model"
+            metrics_path = model_root / "metrics.json"
+            baseline_path = evaluation_root / "baselines.json"
+            settings = {
+                "checkpoint_sha256": sha256(item["checkpoint"]),
+                "config_sha256": sha256(item["config"]),
+                "manifest_sha256": sha256(MANIFEST),
+                "split": "test",
+                "limit": int(limit),
+                "samples": int(samples),
+                "steps": int(steps),
+                "residual_scale": 1.0,
+            }
+            lock_json(evaluation_root / "evaluation_lock.json", settings)
+
+            if not metrics_path.exists():
+                run([
+                    sys.executable, "-m", "geodiff_gan.cli.evaluate",
+                    "--config", item["config"],
+                    "--checkpoint", item["checkpoint"],
+                    "--output", model_root,
+                    "--split", "test",
+                    "--samples", samples,
+                    "--steps", steps,
+                    "--residual-scale", 1.0,
+                    "--back-projection-steps", 0,
+                    "--limit", limit,
+                    "--no-text",
+                    "--device", "cuda",
+                    "--progress", "compact",
+                ], REPOSITORY_DIR)
+
+            if not baseline_path.exists():
+                run([
+                    sys.executable, "-m", "geodiff_gan.cli.baselines",
+                    "--config", item["config"],
+                    "--base-checkpoint", item["checkpoint"],
+                    "--output", baseline_path,
+                    "--split", "test",
+                    "--limit", limit,
+                    "--device", "cuda",
+                    "--progress", "quiet",
+                ], REPOSITORY_DIR)
+
+            model_metrics = json.loads(metrics_path.read_text())
+            baselines = json.loads(baseline_path.read_text())
+            table = pd.DataFrame([
+                {"method": "balanced_adversarial_moe", **model_metrics},
+                {"method": "frozen_base", **baselines["base"]},
+                {"method": "bicubic", **baselines["bicubic"]},
+            ])
+            columns = [
+                "method", "l1", "psnr", "ssim", "edge_f1", "ergas",
+                "sam_degrees", "uiqi", "scc", "redegradation_l1",
+            ]
+            summary_path = evaluation_root / "test_summary.csv"
+            table.to_csv(summary_path, index=False)
+            display(table[columns])
+
+            figure, axes = plt.subplots(2, 3, figsize=(14, 8))
+            for axis, metric in zip(
+                axes.flat,
+                ("psnr", "ssim", "edge_f1", "ergas", "sam_degrees", "scc"),
+            ):
+                table.plot.bar(
+                    x="method", y=metric, ax=axis, legend=False,
+                    color=["#1f5a85", "#68889d", "#a9b4ba"],
+                )
+                direction = "lower is better" if metric in ("ergas", "sam_degrees") else "higher is better"
+                axis.set_title(f"{metric} ({direction})")
+                axis.set_xlabel("")
+                axis.tick_params(axis="x", rotation=18)
+            figure.tight_layout()
+            figure_path = evaluation_root / "test_metrics.png"
+            figure.savefig(figure_path, dpi=180)
+            plt.show()
+
+            # Register this evaluation where SavedTileResults expects test output.
+            canonical_test = Path(item["root"]) / "evaluation" / "test" / "model"
+            if not canonical_test.exists():
+                canonical_test.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    canonical_test.symlink_to(model_root, target_is_directory=True)
+                except OSError:
+                    shutil.copytree(model_root, canonical_test)
+
+            show_results(
+                int(index), split="test", models=[name],
+                show_base=bool(show_base), show_errors=False,
+            )
+            print("Aggregate metrics:", summary_path)
+            print("Per-image metrics:", model_root / "per_patch_metrics.jsonl")
+            print("Plot:", figure_path)
+            return table
+
+        BALANCED_TEST_TABLE = test_balanced_adversarial_model(
+            index=0, limit=100, samples=4, steps=20, show_base=True
+        )
+        """),
+    ]
 
     routing = find(cells, "history_rows = []", "code")
     set_code(cells[routing], """

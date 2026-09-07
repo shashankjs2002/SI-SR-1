@@ -396,6 +396,12 @@ def main() -> None:
             {
                 "dataset_index": args.index if args.index is not None else index,
                 "patch": str(patch_path),
+                "tile_id": str(batch["tile_id"][0]),
+                "scene_class": str(batch.get("scene_class", ["unlabeled"])[0]),
+                "source_pair": "::".join((
+                    str(batch.get("sentinel_product", [""])[0]),
+                    str(batch.get("landsat_product", [""])[0]),
+                )),
                 **{f"output_{name}": value for name, value in values.items()},
                 **{f"base_{name}": value for name, value in base_values.items()},
                 "psnr_delta_vs_base": values["psnr"] - base_values["psnr"],

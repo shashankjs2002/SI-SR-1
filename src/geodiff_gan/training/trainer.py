@@ -16,7 +16,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data import DataLoader, DistributedSampler, WeightedRandomSampler
 from tqdm.auto import tqdm
 
 from ..data import SentinelPatchDataset
@@ -415,15 +415,32 @@ class Trainer:
             input_mode=data.get("input_mode", "synthetic"),
             paired_lr_crop_size=data.get("paired_lr_crop_size") if is_train else None,
         )
-        sampler = (
-            DistributedSampler(dataset, shuffle=split == "train")
-            if self.distributed and len(dataset) > 0
-            else None
-        )
+        sampler = None
+        balance_scene_classes = bool(data.get("balance_scene_classes", False))
+        if is_train and balance_scene_classes and len(dataset) > 0:
+            if self.distributed:
+                raise ValueError(
+                    "data.balance_scene_classes currently supports single-process "
+                    "training only"
+                )
+            counts: dict[str, int] = defaultdict(int)
+            for record in dataset.records:
+                counts[record.scene_class] += 1
+            weights = [1.0 / counts[record.scene_class] for record in dataset.records]
+            sampler = WeightedRandomSampler(
+                weights,
+                num_samples=len(weights),
+                replacement=True,
+                generator=torch.Generator().manual_seed(
+                    int(self.config.get("seed", 42))
+                ),
+            )
+        elif self.distributed and len(dataset) > 0:
+            sampler = DistributedSampler(dataset, shuffle=is_train)
         return DataLoader(
             dataset,
             batch_size=int(self.config["training"].get("validation_batch_size", self.config["training"]["batch_size"]) if not is_train else self.config["training"]["batch_size"]),
-            shuffle=sampler is None and split == "train",
+            shuffle=sampler is None and is_train,
             sampler=sampler,
             num_workers=int(self.config["training"].get("num_workers", 4)),
             pin_memory=self.device.type == "cuda",

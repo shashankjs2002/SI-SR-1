@@ -16,7 +16,7 @@ import yaml
 from torch.nn import functional as F
 
 from geodiff_gan.data.dataset import SentinelPatchDataset
-from geodiff_gan.data.manifest import ManifestRecord, write_manifest
+from geodiff_gan.data.manifest import ManifestRecord, load_manifest, write_manifest
 from geodiff_gan.experiments.tile_moe import experiment_config, lock_json, assert_base_lineage, balanced_manifest
 from geodiff_gan.models.moe import MixtureDiffusionUNet, router_objectives
 from geodiff_gan.models.residual_base import MaskedWindowBlock, ResidualSwinBase
@@ -212,6 +212,28 @@ class TileMoETest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 lock_json(path, {"experts": 4})
 
+    def test_balanced_adversarial_profile_and_class_sampler(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = self.fixture(root)
+            records = load_manifest(manifest)
+            records.extend([
+                ManifestRecord(
+                    record.patch, "tile_b", record.split, record.row, record.col,
+                    record.valid_fraction, scale=3, scene_class="urban",
+                )
+                for record in records
+            ])
+            records[0].scene_class = "forest"
+            write_manifest(manifest, records)
+            config = tiny_config(manifest, root / "balanced", "balanced_adversarial_moe")
+            config["data"]["balance_scene_classes"] = True
+            self.assertEqual(config["model"]["routing_mode"], "reliability")
+            self.assertGreater(config["training"]["loss_weights"]["adversarial"], 0)
+            trainer = Trainer(config)
+            loader = trainer._loader("train")
+            self.assertIsInstance(loader.sampler, torch.utils.data.WeightedRandomSampler)
+
     def test_notebook_ast_and_source_packaging(self):
         path = ROOT / "kaggle/GeoDiff_GAN_Kaggle_Tile_Residual_MoE_3x.ipynb"
         notebook = json.loads(path.read_text(encoding="utf-8"))
@@ -249,6 +271,16 @@ class TileMoETest(unittest.TestCase):
             'run_new("single_expert")',
             'run_new("generic_moe")',
             'run_new("reliability_moe")',
+            'run_balanced_adversarial_moe()',
+            '"adversarial": 0.003',
+            '"mse": 8.0',
+            '"ssim": 0.15',
+            'router_quality_during_diffusion=True',
+            '"diffusion": 30',
+            '"joint": 10',
+            'def test_balanced_adversarial_model(',
+            '"balanced_adversarial_moe", **model_metrics',
+            'limit=100, samples=4, steps=20',
             'best_phase["validation_psnr"]',
             'KNOWN_OLI2MSI_ROOT = Path(',
             'def discover_layout(roots):',
@@ -292,6 +324,24 @@ class TileMoETest(unittest.TestCase):
                 self.assertEqual({row["tile_id"] for row in first}, {"A", "B", "C"})
             self.assertEqual(destination, balanced_manifest(source, destination))
 
+    def test_balanced_manifest_interleaves_scene_classes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.jsonl"
+            rows = [
+                {"patch": f"{scene}/{index}.npz", "tile_id": scene,
+                 "scene_class": scene, "split": "test"}
+                for scene in ("urban", "forest") for index in range(4)
+            ]
+            source.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            ordered = [json.loads(line) for line in balanced_manifest(
+                source, root / "balanced.jsonl"
+            ).read_text().splitlines()]
+            self.assertEqual(
+                [row["scene_class"] for row in ordered[:2]],
+                ["forest", "urban"],
+            )
+
     def test_complete_miniature_pipeline_and_cached_viewer(self):
         with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()):
             root = Path(directory)
@@ -324,12 +374,24 @@ class TileMoETest(unittest.TestCase):
             metrics = json.loads((output / "metrics.json").read_text())
             self.assertEqual(metrics["count"], 1)
             self.assertTrue(np.isfinite(metrics["psnr"]))
+            per_patch = [
+                json.loads(line)
+                for line in (output / "per_patch_metrics.jsonl").read_text().splitlines()
+            ]
+            self.assertEqual(per_patch[0]["scene_class"], "unlabeled")
+            self.assertIn("source_pair", per_patch[0])
             with mock.patch.object(sys, "argv", ["baselines", "--config", str(config_path),
                 "--base-checkpoint", str(parent), "--output", str(root / "baseline.json"),
                 "--device", "cpu", "--split", "test", "--progress", "quiet"]):
                 baselines.main()
             baseline_metrics = json.loads((root / "baseline.json").read_text())
             self.assertAlmostEqual(baseline_metrics["base"]["psnr"], metrics["base_psnr"], places=4)
+            baseline_rows = [
+                json.loads(line)
+                for line in (root / "baseline_per_patch.jsonl").read_text().splitlines()
+            ]
+            self.assertEqual({row["method"] for row in baseline_rows}, {"bicubic", "base"})
+            self.assertTrue(all(row["scene_class"] == "unlabeled" for row in baseline_rows))
             (root / "suite_state.json").write_text(json.dumps({"manifest": str(manifest),
                 "results": {"model": {"root": str(root / "run")}}}))
             viewer = SavedTileResults(root)
@@ -339,6 +401,41 @@ class TileMoETest(unittest.TestCase):
             self.assertTrue(0 <= info["models"]["model"]["router_acceptance"] <= 1)
             self.assertEqual(panels[0][0].shape[-1], 40)
             self.assertEqual(panels[-1][0].shape[-1], 120)
+
+    def test_diverse_notebooks_are_clean_and_complete(self):
+        notebooks = {
+            ROOT / "colab/Landsat_Sentinel_Diverse_3x_Dataset_Preparation.ipynb": (
+                "MINIMUM_TEST_FRACTION = 0.10",
+                "export_portable_dataset",
+                "category_split_summary.csv",
+                "geodiff_diverse_landsat_sentinel_3x_",
+            ),
+            ROOT / "kaggle/GeoDiff_GAN_Kaggle_Diverse_Tile_MoE_3x.ipynb": (
+                "NUM_EXPERTS = 5",
+                "TOP_K = 2",
+                'train_residual_experiment("single_expert")',
+                'train_residual_experiment("generic_moe")',
+                'train_residual_experiment("reliability_moe")',
+                'train_residual_experiment("balanced_adversarial_moe")',
+                "validation_by_class.csv",
+                "test_by_class.csv",
+                "source_pair_ci_low",
+                "routing_by_class.csv",
+                "research_results.zip",
+            ),
+        }
+        for path, required in notebooks.items():
+            notebook = json.loads(path.read_text(encoding="utf-8"))
+            combined = ""
+            for cell in notebook["cells"]:
+                source = "".join(cell["source"])
+                combined += source
+                if cell["cell_type"] == "code":
+                    ast.parse(source)
+                    self.assertIsNone(cell["execution_count"])
+                    self.assertEqual(cell["outputs"], [])
+            for value in required:
+                self.assertIn(value, combined)
 
     def test_oli2msi_saved_viewer_does_not_apply_clip03_twice(self):
         with tempfile.TemporaryDirectory() as directory:

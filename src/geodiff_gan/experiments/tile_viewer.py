@@ -29,8 +29,17 @@ class SavedTileResults:
             state.get("display_gamma", 1.0 if normalized_oli2msi else 1 / 1.4)
         )
 
-    def select(self, split, tile="All"):
-        return [r for r in self.records if r["split"] == split and (tile == "All" or r["tile_id"] == tile)]
+    def select(self, split, tile="All", scene_class="All"):
+        return [
+            record
+            for record in self.records
+            if record["split"] == split
+            and (tile == "All" or record["tile_id"] == tile)
+            and (
+                scene_class == "All"
+                or record.get("scene_class", "unlabeled") == scene_class
+            )
+        ]
 
     @staticmethod
     def cache_name(record):
@@ -38,8 +47,8 @@ class SavedTileResults:
         return "__".join((record["tile_id"], path.parent.name, path.stem)) + "_uncertainty.npz"
 
     def panels(self, index=0, split="test", names=None, show_base=False, tile="All",
-               display_max=None, errors=False):
-        records = self.select(split, tile)
+               display_max=None, errors=False, scene_class="All"):
+        records = self.select(split, tile, scene_class)
         if not 0 <= int(index) < len(records):
             raise IndexError(f"Index {index} outside {split}/{tile}: 0..{len(records) - 1}")
         record = records[int(index)]
@@ -98,13 +107,20 @@ def build_app(root):
 
     viewer = SavedTileResults(root)
     tiles = ["All", *sorted({record["tile_id"] for record in viewer.records})]
+    scene_classes = [
+        "All",
+        *sorted({record.get("scene_class", "unlabeled") for record in viewer.records}),
+    ]
 
-    def render(index, split, tile, names, base, maximum):
-        records = viewer.select(split, tile)
+    def render(index, split, tile, scene_class, names, base, maximum):
+        records = viewer.select(split, tile, scene_class)
         if not records:
             return [], {"message": "No patches in this filter"}, 0
         index = min(max(0, int(index)), len(records) - 1)
-        panels, details = viewer.panels(index, split, names, base, tile, maximum)
+        panels, details = viewer.panels(
+            index, split, names, base, tile, maximum,
+            scene_class=scene_class,
+        )
         images = [(viewer.display(image, maximum), title) for image, title in panels]
         details["filtered_count"] = len(records)
         return images, details, index
@@ -114,6 +130,9 @@ def build_app(root):
         with gr.Row():
             split = gr.Dropdown(["train", "val", "test"], value="val", label="Split")
             tile = gr.Dropdown(tiles, value="All", label="Tile")
+            scene_class = gr.Dropdown(
+                scene_classes, value="All", label="Scene class"
+            )
             index = gr.Number(value=0, precision=0, minimum=0, label="Index within filter")
         names = gr.CheckboxGroup(list(viewer.models), value=list(viewer.models), label="Models (empty = dataset only)")
         with gr.Row():
@@ -127,13 +146,14 @@ def build_app(root):
             refresh = gr.Button("Show")
         gallery = gr.Gallery(label="Original LR / selected models / target", columns=3, height="80vh", object_fit="contain")
         info = gr.JSON(label="Metrics, routing weights and pair metadata")
-        inputs = [index, split, tile, names, base, maximum]
+        inputs = [index, split, tile, scene_class, names, base, maximum]
         outputs = [gallery, info, index]
         refresh.click(render, inputs, outputs)
         back.click(lambda i, *args: render(i - 1, *args), inputs, outputs)
         forward.click(lambda i, *args: render(i + 1, *args), inputs, outputs)
         split.change(lambda _, *args: render(0, *args), inputs, outputs)
         tile.change(lambda _, *args: render(0, *args), inputs, outputs)
+        scene_class.change(lambda _, *args: render(0, *args), inputs, outputs)
         names.change(render, inputs, outputs)
         base.change(render, inputs, outputs)
         app.load(render, inputs, outputs)

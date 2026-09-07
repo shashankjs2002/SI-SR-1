@@ -39,7 +39,7 @@ class SentinelPatchDataset(Dataset):
         input_mode: str = "synthetic",
         paired_lr_crop_size: int | None = None,
     ) -> None:
-        self.records = load_manifest(manifest, split=split)
+        self.records = load_manifest(manifest, split=split, resolve_paths=True)
         self.scale = scale
         self.augment = augment
         self.random_degradation = augment if random_degradation is None else random_degradation
@@ -393,4 +393,7 @@ class SentinelPatchDataset(Dataset):
             "caption": caption,
             "patch": record.patch,
             "tile_id": record.tile_id,
+            "scene_class": record.scene_class,
+            "sentinel_product": record.sentinel_product,
+            "landsat_product": record.landsat_product,
         }

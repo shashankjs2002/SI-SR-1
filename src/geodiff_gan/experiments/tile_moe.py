@@ -20,7 +20,13 @@ from ..training.checkpoint import best_stage_checkpoint, latest_stage_checkpoint
 
 LEGACY_PROFILES = ("rgb_standard", "rgb_fidelity", "multispectral_fidelity",
                    "rgb_harmonized_fidelity", "multispectral_guided_fidelity")
-NEW_PROFILES = ("residual_base", "single_expert", "generic_moe", "reliability_moe")
+NEW_PROFILES = (
+    "residual_base",
+    "single_expert",
+    "generic_moe",
+    "reliability_moe",
+)
+BALANCED_ADVERSARIAL_PROFILE = "balanced_adversarial_moe"
 
 
 def sha256(path):
@@ -56,7 +62,7 @@ def snapshot_manifest(source, destination):
 
 
 def balanced_manifest(source, destination, seed=42):
-    """Interleave tiles within each split so capped validation is not one city's prefix."""
+    """Interleave scene classes and tiles within each split for capped evaluation."""
     rows = [json.loads(line) for line in Path(source).read_text(encoding="utf-8").splitlines() if line.strip()]
     rng = random.Random(seed)
     ordered = []
@@ -64,13 +70,14 @@ def balanced_manifest(source, destination, seed=42):
         groups = {}
         for row in rows:
             if row["split"] == split:
-                groups.setdefault(row["tile_id"], []).append(row)
-        for tile in sorted(groups):
-            rng.shuffle(groups[tile])
+                stratum = (row.get("scene_class", "unlabeled"), row["tile_id"])
+                groups.setdefault(stratum, []).append(row)
+        for stratum in sorted(groups):
+            rng.shuffle(groups[stratum])
         for index in range(max(map(len, groups.values()))):
-            for tile in sorted(groups):
-                if index < len(groups[tile]):
-                    ordered.append(groups[tile][index])
+            for stratum in sorted(groups):
+                if index < len(groups[stratum]):
+                    ordered.append(groups[stratum][index])
     text = "".join(json.dumps(row, sort_keys=True) + "\n" for row in ordered)
     destination = Path(destination)
     if destination.exists() and destination.read_text(encoding="utf-8") != text:
@@ -84,7 +91,7 @@ def balanced_manifest(source, destination, seed=42):
 def experiment_config(repository, profile, manifest, output, *, experts=2, top_k=1,
                       crop_size=32, calibration=None, multispectral=False, fast=False,
                       full_dataset_epochs=False):
-    if profile not in (*LEGACY_PROFILES, *NEW_PROFILES):
+    if profile not in (*LEGACY_PROFILES, *NEW_PROFILES, BALANCED_ADVERSARIAL_PROFILE):
         raise ValueError(f"Unknown experiment: {profile}")
     if not isinstance(experts, int) or not isinstance(top_k, int) or not 1 <= top_k <= experts:
         raise ValueError("Set integer 1 <= TOP_K <= NUM_EXPERTS before training")
@@ -92,7 +99,7 @@ def experiment_config(repository, profile, manifest, output, *, experts=2, top_k
         raise ValueError("LR crop must be >=32 and divisible by 8")
     repository, output = Path(repository), Path(output)
     config = load_config(repository / "configs/landsat_sentinel_3x_small.yaml")
-    new = profile in NEW_PROFILES
+    new = profile in NEW_PROFILES or profile == BALANCED_ADVERSARIAL_PROFILE
     ms = multispectral if new else profile.startswith("multispectral")
     harmonized = profile in ("rgb_harmonized_fidelity", "multispectral_guided_fidelity")
     if harmonized and not calibration:
@@ -112,7 +119,11 @@ def experiment_config(repository, profile, manifest, output, *, experts=2, top_k
         vae_upsample_mode="resize_conv", diffusion_upsample_mode="resize_conv",
         diffusion_experts=0 if not new or profile == "residual_base" else (1 if profile == "single_expert" else experts),
         diffusion_top_k=1 if profile == "single_expert" else top_k,
-        routing_mode="reliability" if profile == "reliability_moe" else "generic",
+        routing_mode=(
+            "reliability"
+            if profile in ("reliability_moe", "balanced_adversarial_moe")
+            else "generic"
+        ),
         expert_channels=24, use_back_projection=False, use_text_conditioning=False,
         use_uncertainty_abstention=False,
     )
@@ -148,6 +159,32 @@ def experiment_config(repository, profile, manifest, output, *, experts=2, top_k
     if harmonized:
         losses.update(charbonnier=0.5, mse=100.0, radiometric=0.25,
                       residual_supervision=0.1, base_guard=200.0, diffusion=0.1)
+    if profile == "balanced_adversarial_moe":
+        train.update(
+            router_quality_during_diffusion=True,
+            discriminator_learning_rate=2e-5,
+        )
+        losses.update(
+            charbonnier=0.75,
+            mse=8.0,
+            multiscale_mse=2.0,
+            ssim=0.15,
+            consistency=0.10,
+            gradient=0.20,
+            wavelet=0.15,
+            radiometric=0.10,
+            residual_supervision=0.75,
+            base_guard=15.0,
+            evidence_calibration=0.05,
+            evidence_improvement=0.15,
+            adversarial=0.003,
+            expert_denoising=0.10,
+            router_specialization=0.05,
+            router_balance=0.01,
+            router_quality=0.10,
+            router_ranking=0.10,
+            perceptual=0.0,
+        )
     config["experiment"] = {"profile": profile, "manifest_sha256": sha256(manifest),
                             "new_architecture": new, "multispectral": ms,
                             "protocol": "real_landsat30_sentinel10_no_text_3x",

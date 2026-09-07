@@ -90,6 +90,7 @@ def main() -> None:
         "base": defaultdict(float),
     }
     count = 0
+    per_patch_rows = []
     total = min(len(loader), args.limit) if args.limit is not None else len(loader)
     print(f"[baselines] plan patches={total}", flush=True)
     use_tqdm = args.progress == "tqdm"
@@ -155,6 +156,20 @@ def main() -> None:
                 )
                 for metric, value in values.items():
                     totals[name][metric] += value
+                per_patch_rows.append({
+                    "method": name,
+                    "dataset_index": count,
+                    "patch": str(batch["patch"][0]),
+                    "tile_id": str(batch["tile_id"][0]),
+                    "scene_class": str(
+                        batch.get("scene_class", ["unlabeled"])[0]
+                    ),
+                    "source_pair": "::".join((
+                        str(batch.get("sentinel_product", [""])[0]),
+                        str(batch.get("landsat_product", [""])[0]),
+                    )),
+                    **values,
+                })
             count += 1
             progress.set_postfix(
                 bicubic_psnr=f"{totals['bicubic']['psnr'] / count:.2f}",
@@ -191,6 +206,10 @@ def main() -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2)
+    per_patch_path = output.with_name(output.stem + "_per_patch.jsonl")
+    with per_patch_path.open("w", encoding="utf-8") as handle:
+        for row in per_patch_rows:
+            handle.write(json.dumps(row, ensure_ascii=True) + "\n")
     print(f"[baselines] complete in {_duration(time.monotonic() - started)}", flush=True)
     print(summary, flush=True)
 

@@ -27,6 +27,7 @@ class ManifestRecord:
     scale: int = 4
     target_crs: str = ""
     target_transform: list[float] | None = None
+    scene_class: str = "unlabeled"
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=True)
@@ -117,6 +118,8 @@ def assign_within_tile_spatial_splits(
     patch_size: int,
     train_fraction: float = 0.8,
     validation_fraction: float = 0.1,
+    minimum_validation_fraction: float = 0.0,
+    minimum_test_fraction: float = 0.0,
     discard_split: str = "discard",
 ) -> dict[str, dict[str, object]]:
     """Assign every tile to leakage-safe spatial train/val/test regions.
@@ -138,6 +141,10 @@ def assign_within_tile_spatial_splits(
             "train_fraction and validation_fraction must leave positive "
             "train, validation, and test fractions"
         )
+    if not 0 <= minimum_validation_fraction < 1:
+        raise ValueError("minimum_validation_fraction must be in [0, 1)")
+    if not 0 <= minimum_test_fraction < 1:
+        raise ValueError("minimum_test_fraction must be in [0, 1)")
     grouped: dict[str, list[ManifestRecord]] = defaultdict(list)
     for record in records:
         grouped[record.tile_id].append(record)
@@ -178,6 +185,11 @@ def assign_within_tile_spatial_splits(
                     if any(counts[split] == 0 for split in fractions):
                         continue
                     retained = sum(counts[split] for split in fractions)
+                    if (
+                        counts["val"] / retained < minimum_validation_fraction
+                        or counts["test"] / retained < minimum_test_fraction
+                    ):
+                        continue
                     ratio_error = sum(
                         abs(counts[split] / retained - target)
                         for split, target in fractions.items()
@@ -298,10 +310,16 @@ def build_within_tile_spatial_folds(
     return manifests, reports
 
 
-def load_manifest(path: str | Path, split: str | None = None) -> list[ManifestRecord]:
+def load_manifest(
+    path: str | Path,
+    split: str | None = None,
+    *,
+    resolve_paths: bool = False,
+) -> list[ManifestRecord]:
+    manifest_path = Path(path)
     records = []
     record_fields = {field.name for field in fields(ManifestRecord)}
-    with Path(path).open("r", encoding="utf-8") as handle:
+    with manifest_path.open("r", encoding="utf-8") as handle:
         for line in handle:
             if not line.strip():
                 continue
@@ -309,6 +327,8 @@ def load_manifest(path: str | Path, split: str | None = None) -> list[ManifestRe
             record = ManifestRecord(
                 **{key: item for key, item in value.items() if key in record_fields}
             )
+            if resolve_paths and record.patch and not Path(record.patch).is_absolute():
+                record.patch = str((manifest_path.parent / record.patch).resolve())
             if split is None or record.split == split:
                 records.append(record)
     return records

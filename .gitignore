@@ -8,3 +8,4 @@ __pycache__/
 *.egg-info/
 tools/
 .codex_tmp/
+node_modules

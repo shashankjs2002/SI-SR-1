@@ -34,6 +34,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--landsat-input", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--manifest", required=True)
+    parser.add_argument("--quarantine")
     parser.add_argument("--state")
     parser.add_argument("--patch-size", type=int, default=384)
     parser.add_argument("--stride", type=int, default=288)
@@ -71,6 +72,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--train-fraction", type=float, default=0.8)
     parser.add_argument("--validation-fraction", type=float, default=0.1)
+    parser.add_argument("--minimum-validation-fraction", type=float, default=0.0)
+    parser.add_argument("--minimum-test-fraction", type=float, default=0.0)
     parser.add_argument(
         "--unmatched-split",
         choices=("hash", "train", "val", "test"),
@@ -99,6 +102,11 @@ def _settings(args: argparse.Namespace) -> dict[str, Any]:
         "minimum_valid_fraction": args.minimum_valid_fraction,
         "bandpass_adjustment": args.bandpass_adjustment,
         "include_multispectral": args.include_multispectral,
+        "split_strategy": args.split_strategy,
+        "train_fraction": args.train_fraction,
+        "validation_fraction": args.validation_fraction,
+        "minimum_validation_fraction": args.minimum_validation_fraction,
+        "minimum_test_fraction": args.minimum_test_fraction,
     }
 
 
@@ -132,6 +140,25 @@ def _write_state(
         encoding="utf-8",
     )
     temporary.replace(path)
+
+
+def _append_quarantine(path: Path | None, rows: list[dict[str, object]]) -> None:
+    if path is None or not rows:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    existing = set()
+    if path.exists():
+        existing = {
+            json.dumps(json.loads(line), sort_keys=True, ensure_ascii=True)
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        }
+    with path.open("a", encoding="utf-8") as handle:
+        for row in rows:
+            serialized = json.dumps(row, sort_keys=True, ensure_ascii=True)
+            if serialized not in existing:
+                handle.write(serialized + "\n")
+                existing.add(serialized)
 
 
 def _record_pair_id(record: ManifestRecord) -> str:
@@ -172,6 +199,8 @@ def _assign_splits(
             patch_size=args.patch_size,
             train_fraction=args.train_fraction,
             validation_fraction=args.validation_fraction,
+            minimum_validation_fraction=args.minimum_validation_fraction,
+            minimum_test_fraction=args.minimum_test_fraction,
         )
     for record in records:
         record.split = split_for_product(
@@ -213,6 +242,10 @@ def main() -> None:
         raise SystemExit(
             "--train-fraction + --validation-fraction must be below 1"
         )
+    if not 0 <= args.minimum_validation_fraction < 1:
+        raise SystemExit("--minimum-validation-fraction must be in [0, 1)")
+    if not 0 <= args.minimum_test_fraction < 1:
+        raise SystemExit("--minimum-test-fraction must be in [0, 1)")
     if args.max_pairs is not None and args.max_pairs < 1:
         raise SystemExit("--max-pairs must be at least 1")
     if args.split_strategy == "within-tile-spatial" and (
@@ -225,6 +258,7 @@ def main() -> None:
         )
 
     manifest_path = Path(args.manifest)
+    quarantine_path = Path(args.quarantine) if args.quarantine else None
     state_path = _state_path(manifest_path, args.state)
     settings = _settings(args)
     sentinel_products = discover_safe_products(args.sentinel_input)
@@ -250,6 +284,11 @@ def main() -> None:
         _print_pair(pair)
     for product in unmatched:
         print(f"  no pair: {product.name}", flush=True)
+    _append_quarantine(
+        quarantine_path,
+        [{"reason": "no_compatible_landsat_pair", "sentinel_product": product.name}
+         for product in unmatched],
+    )
 
     records = [] if args.rebuild or not manifest_path.exists() else load_manifest(manifest_path)
     completed_pairs = {
@@ -261,6 +300,14 @@ def main() -> None:
             saved_settings = dict(state.get("settings", {}))
             # State files created before multispectral support are RGB-only.
             saved_settings.setdefault("include_multispectral", False)
+            for key in (
+                "split_strategy",
+                "train_fraction",
+                "validation_fraction",
+                "minimum_validation_fraction",
+                "minimum_test_fraction",
+            ):
+                saved_settings.setdefault(key, settings[key])
             if saved_settings != settings:
                 raise SystemExit(
                     "Paired preparation settings changed. Use a new output/manifest "
@@ -276,22 +323,47 @@ def main() -> None:
 
     for pair in tqdm(pending, desc="Landsat-Sentinel pairs", unit="pair"):
         print(f"extracting {pair.pair_id}", flush=True)
-        additions = extract_pair_patches(
-            pair,
-            args.output,
-            patch_size=args.patch_size,
-            stride=args.stride,
-            minimum_valid_fraction=args.minimum_valid_fraction,
-            max_day_gap=args.max_day_gap,
-            bandpass_adjustment=args.bandpass_adjustment,
-            validation_prefixes=args.val_prefix,
-            test_prefixes=args.test_prefix,
-            unmatched_split=args.unmatched_split,
-            include_multispectral=args.include_multispectral,
-            show_progress=True,
-        )
+        rejected_windows: list[dict[str, object]] = []
+        try:
+            additions = extract_pair_patches(
+                pair,
+                args.output,
+                patch_size=args.patch_size,
+                stride=args.stride,
+                minimum_valid_fraction=args.minimum_valid_fraction,
+                max_day_gap=args.max_day_gap,
+                bandpass_adjustment=args.bandpass_adjustment,
+                validation_prefixes=args.val_prefix,
+                test_prefixes=args.test_prefix,
+                unmatched_split=args.unmatched_split,
+                include_multispectral=args.include_multispectral,
+                show_progress=True,
+                quarantine=rejected_windows,
+            )
+        except Exception as error:
+            _append_quarantine(
+                quarantine_path,
+                [{
+                    "reason": "pair_extraction_failed",
+                    "sentinel_product": pair.sentinel.name,
+                    "landsat_product": pair.landsat.product_id,
+                    "error_type": type(error).__name__,
+                    "error": str(error),
+                }],
+            )
+            print(f"WARNING: quarantined failed pair {pair.pair_id}: {error}", flush=True)
+            continue
+        _append_quarantine(quarantine_path, rejected_windows)
         records = _merge_records([*records, *additions])
-        _assign_splits(records, args)
+        try:
+            _assign_splits(records, args)
+        except ValueError:
+            if args.split_strategy != "within-tile-spatial":
+                raise
+            print(
+                "Spatial split assignment deferred until more pairs are prepared",
+                flush=True,
+            )
         write_manifest(manifest_path, records)
         completed_pairs.add(pair.pair_id)
         _write_state(state_path, settings, completed_pairs, len(records))

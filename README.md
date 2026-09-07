@@ -18,6 +18,15 @@ Input/output and tensor-shape explainers:
 
 ## Run on Kaggle
 
+For a heterogeneous real-pair study, use
+[`Landsat_Sentinel_Diverse_3x_Dataset_Preparation.ipynb`](colab/Landsat_Sentinel_Diverse_3x_Dataset_Preparation.ipynb)
+to build an uploadable category-labelled dataset, then run
+[`GeoDiff_GAN_Kaggle_Diverse_Tile_MoE_3x.ipynb`](kaggle/GeoDiff_GAN_Kaggle_Diverse_Tile_MoE_3x.ipynb).
+The pair manifest carries `scene_class`, and single-process training can enable
+inverse-frequency scene-class sampling with `data.balance_scene_classes: true`.
+Evaluation preserves class, tile, and source-pair identifiers for stratified metrics
+and clustered uncertainty estimates.
+
 Import [the Kaggle notebook](kaggle/GeoDiff_GAN_Kaggle.ipynb), enable Internet and a GPU
 accelerator, and attach a dataset containing extracted Sentinel-2 L2A `.SAFE` directories. The
 notebook clones this repository, installs it without replacing Kaggle's CUDA PyTorch, prepares

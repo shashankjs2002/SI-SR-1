@@ -387,6 +387,7 @@ def extract_pair_patches(
     unmatched_split: str = "hash",
     include_multispectral: bool = False,
     show_progress: bool = False,
+    quarantine: list[dict[str, object]] | None = None,
 ) -> list[ManifestRecord]:
     try:
         import rasterio
@@ -544,6 +545,17 @@ def extract_pair_patches(
                 valid_hr = sentinel_valid & expanded_landsat_valid
                 valid_fraction = float(valid_hr.mean())
                 if valid_fraction < minimum_valid_fraction:
+                    if quarantine is not None:
+                        quarantine.append({
+                            "reason": "valid_fraction_below_threshold",
+                            "tile_id": tile_id,
+                            "sentinel_product": sentinel_name,
+                            "landsat_product": pair.landsat.product_id,
+                            "row": row,
+                            "col": col,
+                            "valid_fraction": valid_fraction,
+                            "minimum_valid_fraction": minimum_valid_fraction,
+                        })
                     continue
 
                 lr_all = np.stack(

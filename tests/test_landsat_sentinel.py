@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from collections import Counter
@@ -9,6 +10,12 @@ import numpy as np
 import torch
 
 from geodiff_gan.data.dataset import SentinelPatchDataset
+from geodiff_gan.data.diverse import (
+    annotate_scene_classes,
+    export_portable_dataset,
+    infer_scene_class,
+    validate_category_splits,
+)
 from geodiff_gan.data.landsat_sentinel import (
     discover_landsat_products,
     landsat_acquisition_date,
@@ -19,6 +26,7 @@ from geodiff_gan.data.manifest import (
     ManifestRecord,
     assign_within_tile_spatial_splits,
     build_within_tile_spatial_folds,
+    load_manifest,
     validate_within_tile_spatial_isolation,
     write_manifest,
 )
@@ -124,6 +132,42 @@ class LandsatSentinelDatasetTest(unittest.TestCase):
             self.assertEqual(tuple(sample["valid_mask_lr"].shape), (1, 24, 24))
             self.assertTrue(np.allclose(sample["lr"].numpy(), lr))
 
+    def test_diverse_metadata_and_portable_relative_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source" / "pair.npz"
+            source.parent.mkdir()
+            np.savez_compressed(
+                source,
+                lr=np.zeros((3, 8, 8), dtype=np.float32),
+                hr=np.zeros((3, 24, 24), dtype=np.float32),
+            )
+            records = [
+                ManifestRecord(
+                    patch=str(source), tile_id="44RPQ", split=split,
+                    row=index * 24, col=0, valid_fraction=1.0, scale=3,
+                )
+                for index, split in enumerate(("train", "val", "test"))
+            ]
+            records = annotate_scene_classes(
+                records, category_by_tile={"44RPQ": "built-up"}
+            )
+            self.assertTrue(all(record.scene_class == "urban" for record in records))
+            rows = validate_category_splits(records, minimum_test_fraction=0.1)
+            self.assertEqual(rows[0]["test"], 1)
+            manifest = export_portable_dataset(records, root / "portable")
+            text_rows = [json.loads(line) for line in manifest.read_text().splitlines()]
+            self.assertFalse(Path(text_rows[0]["patch"]).is_absolute())
+            loaded = load_manifest(manifest, resolve_paths=True)
+            self.assertTrue(all(Path(record.patch).is_file() for record in loaded))
+
+    def test_scene_class_path_inference_is_conservative(self) -> None:
+        self.assertEqual(infer_scene_class(Path("dataset") / "urban" / "tile"), "urban")
+        self.assertEqual(infer_scene_class(Path("dataset") / "cropland" / "tile"), "agriculture")
+        self.assertIsNone(infer_scene_class(Path("dataset") / "unknown" / "tile"))
+        with self.assertRaises(ValueError):
+            infer_scene_class(Path("dataset") / "urban" / "forest" / "tile")
+
     def test_paired_dataset_loads_real_multispectral_lr(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -215,6 +259,8 @@ class LandsatSentinelDatasetTest(unittest.TestCase):
             patch_size=100,
             train_fraction=0.8,
             validation_fraction=0.1,
+            minimum_validation_fraction=0.05,
+            minimum_test_fraction=0.1,
         )
         counts = {split: 0 for split in ("train", "val", "test", "discard")}
         for record in records:
@@ -223,6 +269,8 @@ class LandsatSentinelDatasetTest(unittest.TestCase):
         self.assertGreater(counts["val"], 0)
         self.assertGreater(counts["test"], 0)
         self.assertGreater(counts["discard"], 0)
+        retained = counts["train"] + counts["val"] + counts["test"]
+        self.assertGreaterEqual(counts["test"] / retained, 0.1)
         self.assertEqual(report["44QLL"]["axis"], "col")
         validate_within_tile_spatial_isolation(records, patch_size=100)
 

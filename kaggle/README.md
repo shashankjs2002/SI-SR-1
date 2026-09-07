@@ -1,5 +1,19 @@
 # Kaggle Usage
 
+For the category-aware MoE study, first run the Colab notebook
+`colab/Landsat_Sentinel_Diverse_3x_Dataset_Preparation.ipynb`, upload its exported
+dataset archive to Kaggle, then import
+`GeoDiff_GAN_Kaggle_Diverse_Tile_MoE_3x.ipynb`. The training notebook compares the
+previous GeoDiff control, residual base, one expert, generic MoE, reliability MoE,
+balanced adversarial MoE, and bicubic on one immutable manifest. It saves overall
+and per-class remote-sensing metrics, source-pair confidence intervals, routing
+specialization, parameter/runtime measurements, figures, and a downloadable report.
+
+The preparation notebook stores each sample once as a compressed NPZ below
+`train/`, `val/`, or `test/`, followed by scene class and tile. Each NPZ contains
+both the real Landsat LR and Sentinel HR. The default leakage-safe spatial split
+targets 78/10/12 and enforces at least 10% test patches for every represented class.
+
 For real cross-sensor 3x super-resolution, import
 `GeoDiff_GAN_Kaggle_Landsat30m_Sentinel10m_3x.ipynb`. It pairs Landsat 8/9
 Collection 2 Level-2 30 m RGB with overlapping Sentinel-2 L2A 10 m RGB,
