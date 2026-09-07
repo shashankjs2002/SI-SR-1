@@ -1,5 +1,19 @@
 # Kaggle Usage
 
+## New diffusion-free study
+
+1. Run `Landsat_Sentinel_TrustMoE_Dataset_Preparation.ipynb` on your raw paired tiles.
+   It exports real LR/HR NPZ pairs, masks, labels and guarded train/val/test splits.
+2. Upload the exported dataset and `geodiff_trust_moe_source.zip` to Kaggle input.
+3. Run `GeoDiff_TrustMoE_Transformer_3x.ipynb` with a GPU. Its controls are epochs,
+   batch size, experts/top-k, crop size and region coverage, not time/update caps.
+4. Download the final result/resume ZIP and executed notebook. Save a Kaggle version
+   with outputs before ending the session. Set `RESTORE_SUITE_FROM` in a new session.
+
+The new model bypasses diffusion entirely. Old notebooks are unchanged. See
+`learning/GeoDiff_TrustMoE_Research_Protocol.md` for the matched-control experiment
+matrix, close prior work, metrics, test protocol and limits on novelty claims.
+
 For the category-aware MoE study, first run the Colab notebook
 `colab/Landsat_Sentinel_Diverse_3x_Dataset_Preparation.ipynb`, upload its exported
 dataset archive to Kaggle, then import

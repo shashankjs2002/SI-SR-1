@@ -18,6 +18,22 @@ Input/output and tensor-shape explainers:
 
 ## Run on Kaggle
 
+### Diffusion-free Transformer-router study
+
+Use [the new paired-tile preparation notebook](kaggle/Landsat_Sentinel_TrustMoE_Dataset_Preparation.ipynb),
+upload its exported dataset to Kaggle, then run
+[GeoDiff-TrustMoE](kaggle/GeoDiff_TrustMoE_Transformer_3x.ipynb).
+Attach `kaggle/geodiff_trust_moe_source.zip` as well when the local changes have not
+been pushed to GitHub. Rebuild it with `python scripts/build_kaggle_trust_moe_notebooks.py`.
+
+This separate model uses one residual-Swin base, a contextual Transformer router,
+actually dispatched regional CNN experts and RGB trust. It has no diffusion/VAE or
+PixelShuffle. It preserves the old model for comparisons. The notebook provides
+epoch/batch controls, resumable training, eight residual ablations, validation budget
+selection, locked test comparisons, routing/quality/speed reports and result downloads.
+See [the research protocol and limitations](learning/GeoDiff_TrustMoE_Research_Protocol.md).
+Accuracy, speed and publication novelty are experimental questions, not guarantees.
+
 For a heterogeneous real-pair study, use
 [`Landsat_Sentinel_Diverse_3x_Dataset_Preparation.ipynb`](colab/Landsat_Sentinel_Diverse_3x_Dataset_Preparation.ipynb)
 to build an uploadable category-labelled dataset, then run

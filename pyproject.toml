@@ -44,6 +44,7 @@ geodiff-baselines = "geodiff_gan.cli.baselines:main"
 geodiff-debug = "geodiff_gan.cli.debug:main"
 geodiff-parameters = "geodiff_gan.cli.parameters:main"
 geodiff-benchmark-sota = "geodiff_gan.cli.benchmark_sota:main"
+geodiff-trust-moe = "geodiff_gan.cli.trust_moe:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
