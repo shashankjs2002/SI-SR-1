@@ -10,10 +10,9 @@ import zipfile
 import numpy as np
 
 from geodiff_gan.data.gee_pairs import (
-    CLASSES, IndiaPairConfig, aligned_grids, block_assignment,
-    export_datasets, export_geotiff_datasets, make_selection, save_json,
+    CLASSES, IndiaPairConfig, IndiaPairDownloader, aligned_grids, block_assignment,
+    export_geotiff_datasets, make_selection, save_json, write_pair_tiff,
 )
-from geodiff_gan.experiments.trust_moe import prepare_manifest
 
 
 class IndiaPairTests(unittest.TestCase):
@@ -25,7 +24,7 @@ class IndiaPairTests(unittest.TestCase):
                 for i in range(count):
                     pid = f'{split}_{label}_{i}'
                     self.rows.append(dict(pair_id=pid, location_id=pid, block=f'block_{split}',
-                        split=split, scene_class=label, npz=f'master/{pid}.npz',
+                        split=split, scene_class=label, lr_path=f'master/LR/{pid}.tif', hr_path=f'master/HR/{pid}.tif',
                         grid=dict(row=0, col=0, crs='EPSG:32644',
                                   lr_transform=[30, 0, 300000, 0, -30, 3000000],
                                   hr_transform=[10, 0, 300000, 0, -10, 3000000]),
@@ -84,19 +83,34 @@ class IndiaPairTests(unittest.TestCase):
         self.assertEqual(block_assignment(100001, 200001, self.config),
                          block_assignment(100002, 200002, self.config))
 
+    def test_projection_cached_and_legacy_supported(self):
+        from unittest.mock import MagicMock
+        with tempfile.TemporaryDirectory() as tmp:
+            downloader = object.__new__(IndiaPairDownloader)
+            downloader.root = Path(tmp)
+            downloader.ee = MagicMock()
+            projection = dict(crs='EPSG:32644', transform=[30, 0, 0, 0, -30, 0])
+            query = downloader.ee.Image.return_value.select.return_value.projection.return_value.getInfo
+            query.return_value = projection
+            self.assertEqual(downloader.pair_projection({'landsat': 'scene'}),
+                             (projection['crs'], projection['transform']))
+            downloader.pair_projection({'landsat': 'scene'})
+            downloader.pair_projection(dict(landsat='old', **projection))
+            self.assertEqual(query.call_count, 1)
+
     def test_export_and_training_audit(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / 'master').mkdir()
             for i, row in enumerate(self.rows):
-                np.savez_compressed(root / row['npz'],
-                    lr=np.full((3, 8, 8), (i + 1) / 100, dtype=np.float32),
-                    hr=np.full((3, 24, 24), (i + 1) / 100, dtype=np.float32),
-                    valid_mask_lr=np.ones((1, 8, 8), dtype=np.float32),
-                    valid_mask_hr=np.ones((1, 24, 24), dtype=np.float32))
+                for key, side in [('lr', 8), ('hr', 24)]:
+                    image = np.full((3, side, side), (i + 1) / 100, dtype=np.float32)
+                    image[:, 0, 0] = 0  # Valid black pixel must not become nodata.
+                    mask = np.ones((1, side, side), dtype=np.float32)
+                    mask[:, -1, -1] = 0
+                    write_pair_tiff(root / row[f'{key}_path'], image, mask, row, key)
                 save_json(root / 'accepted' / f"{row['pair_id']}.json", row)
             save_json(root / 'fixed_selection.json', make_selection(self.rows, self.config))
-            archives = export_datasets(root, self.config)
             import rasterio
             from rasterio.io import MemoryFile
             tiffs = export_geotiff_datasets(root, self.config, sizes=(20,))
@@ -112,26 +126,20 @@ class IndiaPairTests(unittest.TestCase):
                         self.assertEqual(image.crs.to_epsg(), 32644)
                         self.assertEqual(image.res, (resolution, resolution))
                         self.assertEqual(image.dtypes, ('float32',) * 3)
-                        self.assertTrue((image.dataset_mask() == 255).all())
-                        with np.load(root / f"master/{pair['pair_id']}.npz") as source:
-                            np.testing.assert_array_equal(image.read(), source[key])
+                        self.assertEqual(image.dataset_mask()[0, 0], 255)
+                        self.assertEqual(image.dataset_mask()[-1, -1], 0)
+                        with rasterio.open(root / f"master/{key.upper()}/{pair['pair_id']}.tif") as source:
+                            np.testing.assert_array_equal(image.read(), source.read())
                         bounds.append(image.bounds)
                 self.assertEqual(bounds[0], bounds[1])
-            self.assertEqual(len(archives), 3)
-            self.assertEqual(archives, export_datasets(root, self.config))
-            with zipfile.ZipFile(archives[0]) as handle:
-                self.assertIsNone(handle.testzip())
-                self.assertEqual(sum(n.endswith('.npz') for n in handle.namelist()), 20)
-                handle.extractall(root / 'portable')
-            report = prepare_manifest(root / 'portable/manifest.jsonl', root / 'audit/manifest.jsonl',
-                                      spatial_audit=False, disjoint_tiles=True)
-            self.assertTrue(report['disjoint_blocks'])
-            self.assertEqual(report['counts'], {'train': 5, 'val': 5, 'test': 10})
+            self.assertFalse(list(root.rglob('*.npz')))
+            with zipfile.ZipFile(tiffs[0]) as handle:
+                self.assertFalse(any(n.endswith('.npz') for n in handle.namelist()))
             lock = json.loads((root / 'fixed_selection.json').read_text())
             lock['20'].reverse()
             save_json(root / 'fixed_selection.json', lock)
-            with self.assertRaisesRegex(ValueError, 'fixed_selection'):
-                export_datasets(root, self.config)
+            with self.assertRaisesRegex(ValueError, 'Fixed selection'):
+                export_geotiff_datasets(root, self.config)
 
 
 if __name__ == '__main__':

@@ -66,7 +66,7 @@ EE_PROJECT = 'YOUR_EARTH_ENGINE_CLOUD_PROJECT_ID'
 REPOSITORY_URL = 'https://github.com/shashankjs2002/SI-SR-1.git'
 REPOSITORY_BRANCH = '3x-continued'
 REPOSITORY = Path('/content/geodiff-gee-github')
-OUTPUT = Path('/content/drive/MyDrive/thesis/gee_india_fixed_v1')
+OUTPUT = Path('/content/drive/MyDrive/thesis/gee_india_tiff_v1')
 OUTPUT.mkdir(parents=True, exist_ok=True)
 if not REPOSITORY.exists():
     subprocess.run(['git', 'clone', '--depth', '1', '--single-branch', '--branch',
@@ -83,7 +83,7 @@ if not (REPOSITORY / 'src/geodiff_gan/data/gee_pairs.py').exists():
     raise RuntimeError('Downloader is missing. Commit and push the new code to GitHub, then clone into a new REPOSITORY path.')
 print('Repository revision:', git_value('rev-parse', 'HEAD'))
 sys.path.insert(0, str(REPOSITORY / 'src'))
-from geodiff_gan.data.gee_pairs import IndiaPairConfig, IndiaPairDownloader, export_datasets, export_geotiff_datasets
+from geodiff_gan.data.gee_pairs import IndiaPairConfig, IndiaPairDownloader, export_geotiff_datasets
 CONFIG = IndiaPairConfig()
 CONFIG.validate()
 print('Output:', OUTPUT)
@@ -134,7 +134,7 @@ print('Sites:', len(sites), 'blocks:', site_table.block.nunique())
 ''')
 code('''
 # Rerun this cell after a connection/session interruption, with the SAME OUTPUT.
-# Completed NPZs, scene lists and acceptance/rejection receipts are preserved.
+# Completed TIFFs, scene lists and acceptance/rejection receipts are preserved.
 SELECTION = downloader.collect()
 print('Fixed selections saved:', OUTPUT / 'fixed_selection.json')
 ''')
@@ -150,7 +150,9 @@ table.drop(columns=['grid']).to_csv(OUTPUT / 'accepted_pairs.csv', index=False)
 def show_pair(index=0, split='train'):
     selected = [r for r in rows if r['split'] == split]
     row = selected[index]
-    with np.load(OUTPUT / row['npz'], allow_pickle=False) as data:
+    import rasterio
+    with rasterio.open(OUTPUT / row['lr_path']) as low, rasterio.open(OUTPUT / row['hr_path']) as high:
+        data = dict(lr=low.read(), hr=high.read(), valid_mask_hr=high.dataset_mask()[None] / 255)
         fig, axes = plt.subplots(1, 3, figsize=(13, 4))
         for axis, key in zip(axes[:2], ['lr', 'hr']):
             image = data[key]
@@ -173,7 +175,7 @@ These ZIPs contain georeferenced float32 RGB TIFFs under `train/LR/<class>/`,
 `train/HR/<class>/`, and equivalent `val/` and `test/` directories. TIFFs retain
 the CRS, pixel transform and internal validity mask. `pairs.jsonl` records paired
 relative paths and acquisition metadata. No display stretch is applied to TIFFs.
-Master NPZ files remain in OUTPUT for restart and optional training export.
+Master TIFF files remain in OUTPUT for restart; no NPZ files are written.
 Writing all three ZIPs uses extra storage. Upload one ZIP at a time if your Drive
 quota is small; the code never automatically deletes old files to make room.
 ''')
@@ -191,17 +193,11 @@ transfer. Run the following cell for one archive when needed. For each training 
 attach only the intended dataset or set PREPARED_MANIFEST explicitly. Use a separate
 SUITE_ROOT for each size; never mix checkpoints between data-size experiments.
 
-```python
-DATASET_PROTOCOL = 'spatial_blocks'
-DISPLAY_MAX = 0.3
-PREPARED_MANIFEST = Path('/kaggle/input/YOUR_DATASET/manifest.jsonl')
-SUITE_ROOT = Path('/kaggle/working/trust_moe_india_2000')  # or 4000 / 6000
-```
-
-The current TrustMoE loader expects NPZ, not this TIFF layout. When training with
-that notebook, additionally run `export_datasets(OUTPUT, CONFIG, sizes=(2000,))`
-(or the other sizes) to create the compatible NPZ archive with identical pair IDs.
-Use the updated TrustMoE training notebook. Preserve the collection config,
+This notebook creates TIFFs only, including its persistent master files. Existing
+training notebooks expecting NPZ cannot consume this layout directly; a TIFF-aware
+loader is needed. The manifest is `pairs.jsonl`, with separate LR/HR paths.
+Use a new OUTPUT for this version if the old collection used NPZ. Old files are
+never deleted automatically. Preserve the collection config,
 candidate sites, scene lists and fixed_selection.json. A seed alone cannot preserve a
 live satellite catalog forever. More data can change model quality; it does not guarantee
 that the 6,000-pair model is best. Only held-out results can establish that.

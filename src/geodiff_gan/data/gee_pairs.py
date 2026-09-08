@@ -17,7 +17,6 @@ import zipfile
 
 import numpy as np
 
-from .manifest import ManifestRecord
 
 
 CLASSES = {10: "forest", 40: "agriculture", 50: "urban", 60: "barren", 80: "water_wetland"}
@@ -216,16 +215,24 @@ class IndiaPairDownloader:
             return ee.Dictionary(dict(landsat=ls.get("asset"), landsat_date=date.format("YYYY-MM-dd"),
                 sentinel=s2.toList(cfg.sentinel_candidates).map(info)))
         values = self.retry(lambda: landsats.toList(cfg.landsat_candidates).map(describe).getInfo())
-        for row in values:
-            # Projection.transform() is WKT, not the six affine coefficients.
-            projection = self.retry(lambda: ee.Image(row["landsat"]).select("SR_B4").projection().getInfo())
-            row.update(crs=projection["crs"], transform=projection["transform"])
         pairs = [{**{k: v for k, v in row.items() if k != "sentinel"}, "sentinel": s2["asset"],
                   "sentinel_date": s2["date"], "gap_seconds": s2["gap_seconds"]}
                  for row in values for s2 in row["sentinel"]]
         pairs.sort(key=lambda r: identity([cfg.seed, r["landsat"], r["sentinel"]]))
         save_json(path, pairs)
         return pairs
+
+    def pair_projection(self, pair):
+        """Fetch only a scene actually attempted, reusing its native grid across sites."""
+        if 'crs' in pair and 'transform' in pair:
+            return pair['crs'], pair['transform']
+        path = self.root / 'projection_cache' / (identity(pair['landsat']) + '.json')
+        if path.exists():
+            projection = json.loads(path.read_text())
+        else:
+            projection = self.retry(lambda: self.ee.Image(pair['landsat']).select('SR_B4').projection().getInfo())
+            save_json(path, projection)
+        return projection['crs'], projection['transform']
 
     def image(self, asset, landsat):
         ee = self.ee
@@ -265,8 +272,11 @@ class IndiaPairDownloader:
     def accepted(self):
         rows = [json.loads(p.read_text()) for p in sorted((self.root / "accepted").glob("*.json"))]
         for row in rows:
-            if not (self.root / row["npz"]).is_file():
-                raise FileNotFoundError(f"Accepted pair is missing; restore its NPZ: {row['npz']}")
+            for key in ("lr_path", "hr_path"):
+                if key not in row:
+                    raise ValueError("Legacy collection detected. Use a new OUTPUT folder for TIFF-only collection; old files are preserved.")
+                if not (self.root / row[key]).is_file():
+                    raise FileNotFoundError(f"Accepted TIFF missing: {row[key]}")
         return rows
 
     def collect(self):
@@ -298,15 +308,22 @@ class IndiaPairDownloader:
                 if pair_id in seen or (self.root / "rejected" / f"{pair_id}.json").exists():
                     continue
                 try:
-                    grid = aligned_grids(site["lon"], site["lat"], pair["crs"], pair["transform"], cfg)
+                    crs, transform = self.pair_projection(pair)
+                    grid = aligned_grids(site["lon"], site["lat"], crs, transform, cfg)
                 except ValueError as exc:
                     save_json(self.root / "rejected" / f"{pair_id}.json", dict(pair_id=pair_id, reason=str(exc)))
                     continue
                 try:
                     region = ee.Geometry.Rectangle(grid["bounds"], proj=grid["crs"], geodesic=False)
-                    fraction = self.retry(lambda: self.cover.eq(site["code"]).reduceRegion(
-                        reducer=ee.Reducer.mean(), geometry=region, scale=30, maxPixels=100000,
-                        crs=grid["crs"]).get("Map").getInfo())
+                    fraction_path = self.root / 'class_fraction_cache' / (identity(
+                        [site['code'], grid['crs'], grid['bounds']]) + '.json')
+                    if fraction_path.exists():
+                        fraction = json.loads(fraction_path.read_text())['fraction']
+                    else:
+                        fraction = self.retry(lambda: self.cover.eq(site["code"]).reduceRegion(
+                            reducer=ee.Reducer.mean(), geometry=region, scale=30, maxPixels=100000,
+                            crs=grid["crs"]).get("Map").getInfo())
+                        save_json(fraction_path, dict(fraction=fraction))
                     if fraction is None or fraction < cfg.minimum_class_fraction:
                         save_json(self.root / "rejected" / f"{pair_id}.json", dict(pair_id=pair_id, reason="weak_class_fraction", fraction=fraction))
                         continue
@@ -318,13 +335,12 @@ class IndiaPairDownloader:
                     if min(float(ml.mean()), float(mh.mean())) < cfg.minimum_valid:
                         save_json(self.root / "rejected" / f"{pair_id}.json", dict(pair_id=pair_id, reason="valid_fraction", lr=float(ml.mean()), hr=float(mh.mean())))
                         continue
-                    path = self.root / "master" / f"{pair_id}.npz"
-                    path.parent.mkdir(exist_ok=True)
-                    temporary = path.with_suffix(".tmp.npz")
-                    np.savez_compressed(temporary, lr=lr * ml, hr=hr * mh, valid_mask_lr=ml, valid_mask_hr=mh)
-                    temporary.replace(path)
-                    row = dict(**site, **pair, pair_id=pair_id, grid=grid, valid_fraction=float(mh.mean()),
-                        class_fraction=float(fraction), npz=str(path.relative_to(self.root)))
+                    row = dict(**site, **pair, pair_id=pair_id, grid=grid,
+                        valid_fraction=float(mh.mean()), class_fraction=float(fraction))
+                    for band_key, image, mask in (("lr", lr, ml), ("hr", hr, mh)):
+                        path = self.root / "master" / band_key.upper() / f"{pair_id}.tif"
+                        write_pair_tiff(path, image * mask, mask, row, band_key)
+                        row[f"{band_key}_path"] = path.relative_to(self.root).as_posix()
                     save_json(self.root / "accepted" / f"{pair_id}.json", row)
                     seen.add(pair_id); records.append(row); counts[key] += 1; locations[site["location_id"]] += 1
                     consecutive_errors = 0
@@ -345,12 +361,30 @@ class IndiaPairDownloader:
         return selections
 
 
-def export_geotiff_datasets(root, config=IndiaPairConfig(), sizes=None):
-    """Export float32 RGB GeoTIFF pairs with internal validity masks, without redownloading."""
+def write_pair_tiff(path, image, mask, row, key):
+    """Atomically store RGB reflectance and an internal mask; never an NPZ."""
     import rasterio
-    from rasterio.io import MemoryFile
     from affine import Affine
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix('.tmp.tif')
+    with rasterio.Env(GDAL_TIFF_INTERNAL_MASK=True):
+        with rasterio.open(temporary, 'w', driver='GTiff', width=image.shape[2],
+                height=image.shape[1], count=3, dtype='float32', crs=row['grid']['crs'],
+                transform=Affine(*row['grid'][f'{key}_transform']),
+                compress='deflate', predictor=3) as dst:
+            dst.write(image.astype(np.float32))
+            dst.write_mask((mask.reshape(image.shape[1:]) > 0.5).astype(np.uint8) * 255)
+            for band, label in enumerate(('Red', 'Green', 'Blue'), 1):
+                dst.set_band_description(band, label)
+            dst.update_tags(pair_id=row['pair_id'], units='surface_reflectance',
+                sensor='Landsat' if key == 'lr' else 'Sentinel-2',
+                acquisition=row['landsat_date' if key == 'lr' else 'sentinel_date'])
+    temporary.replace(path)
 
+
+def export_geotiff_datasets(root, config=IndiaPairConfig(), sizes=None):
+    """Package stored TIFF pairs; no array format conversion or NPZ output."""
     root = Path(root)
     rows = [json.loads(p.read_text()) for p in (root / "accepted").glob("*.json")]
     selections = make_selection(rows, config)
@@ -359,6 +393,13 @@ def export_geotiff_datasets(root, config=IndiaPairConfig(), sizes=None):
     lookup = {r["pair_id"]: r for r in rows}
     archives = []
     for size in sizes or config.sizes:
+        chosen = [lookup[pid] for pid in selections[str(size)]]
+        for row in chosen:
+            for key in ('lr_path', 'hr_path'):
+                if key not in row:
+                    raise ValueError("Legacy collection: choose a new OUTPUT for TIFF-only collection; existing data is preserved.")
+                if not (root / row[key]).is_file():
+                    raise FileNotFoundError(root / row[key])
         archive = root / f"india_pairs_{size}_geotiff.zip"
         if archive.exists():
             with zipfile.ZipFile(archive) as z:
@@ -366,97 +407,32 @@ def export_geotiff_datasets(root, config=IndiaPairConfig(), sizes=None):
                     raise ValueError(f"Archive verification failed: {archive}")
             archives.append(archive)
             continue
-        required = size * config.lr_size ** 2 * 10 * 16 + 500 * 2**20
+        required = sum((root / r[k]).stat().st_size for r in chosen
+                       for k in ('lr_path', 'hr_path')) + 500 * 2**20
         if shutil.disk_usage(root).free < required:
-            raise OSError("Insufficient free space for GeoTIFF export; no files were deleted")
+            raise OSError("Insufficient space for TIFF export; no files were deleted")
         metadata = []
         temporary = archive.with_suffix('.tmp.zip')
         with zipfile.ZipFile(temporary, 'w', zipfile.ZIP_STORED, allowZip64=True) as z:
-            for pid in selections[str(size)]:
-                row = lookup[pid]
-                entry = {k: v for k, v in row.items() if k != 'npz'}
-                with np.load(root / row['npz'], allow_pickle=False) as data:
-                    for key in ('lr', 'hr'):
-                        name = f"{row['split']}/{key.upper()}/{row['scene_class']}/{pid}.tif"
-                        image = data[key].astype(np.float32)
-                        mask = (data[f'valid_mask_{key}'][0] > 0.5).astype(np.uint8) * 255
-                        with rasterio.Env(GDAL_TIFF_INTERNAL_MASK=True), MemoryFile() as mem:
-                            with mem.open(driver='GTiff', width=image.shape[2], height=image.shape[1],
-                                          count=3, dtype='float32', crs=row['grid']['crs'],
-                                          transform=Affine(*row['grid'][f'{key}_transform']),
-                                          compress='deflate', predictor=3) as dst:
-                                dst.write(image)
-                                dst.write_mask(mask)
-                                for band, label in enumerate(('Red', 'Green', 'Blue'), 1):
-                                    dst.set_band_description(band, label)
-                                dst.update_tags(pair_id=pid, units='surface_reflectance',
-                                                sensor='Landsat' if key == 'lr' else 'Sentinel-2',
-                                                acquisition=row['landsat_date' if key == 'lr' else 'sentinel_date'])
-                            z.writestr(name, mem.read())
-                        entry[f'{key}_path'] = name
+            for row in chosen:
+                entry = dict(row)
+                for key in ('lr', 'hr'):
+                    name = f"{row['split']}/{key.upper()}/{row['scene_class']}/{row['pair_id']}.tif"
+                    z.write(root / row[f'{key}_path'], name)
+                    entry[f'{key}_path'] = name
                 metadata.append(entry)
             z.writestr('pairs.jsonl', ''.join(json.dumps(r) + '\n' for r in metadata))
             z.writestr('pair_ids.json', json.dumps(selections[str(size)]))
             z.writestr('dataset_card.json', json.dumps(dict(format='RGB float32 GeoTIFF with internal masks',
                 counts=dict(Counter(r['split'] for r in metadata)), config=asdict(config),
-                selection_sha256=identity(selections[str(size)])), indent=2))
-            z.writestr('README.txt', 'Real sensor pairs; RGB float32 reflectance, not display-stretched.\n'
-                'Internal masks distinguish invalid pixels from valid zero reflectance.\n'
-                'pairs.jsonl contains relative LR/HR paths and acquisition/grid metadata.\n'
-                'Keep fixed splits. The existing TrustMoE loader needs NPZ; use the optional NPZ export for training.\n'
-                'Acknowledge USGS, Copernicus, ESA WorldCover and FAO GAUL; review source redistribution licenses.\n')
+                selection_sha256=identity(selections[str(size)]),
+                label_note='WorldCover 2021 weak labels, not verified acquisition-time ground truth',
+                sources=['LANDSAT/LC08/C02/T1_L2', 'LANDSAT/LC09/C02/T1_L2',
+                         'COPERNICUS/S2_SR_HARMONIZED', 'ESA/WorldCover/v200', 'FAO/GAUL/2015/level0']),
+                indent=2))
+            z.writestr('README.txt', 'RGB float32 reflectance GeoTIFF pairs with internal validity masks.\n'
+                'Relative paired paths and acquisition metadata: pairs.jsonl. Keep fixed splits.\n'
+                'Acknowledge USGS, Copernicus, ESA WorldCover and FAO GAUL; review redistribution licenses.\n')
         temporary.replace(archive)
         archives.append(archive)
     return archives
-
-
-def export_datasets(root, config=IndiaPairConfig(), sizes=None):
-    """Materialize portable ZIPs without keeping three extra uncompressed data copies."""
-    root = Path(root)
-    records = [json.loads(p.read_text()) for p in (root / "accepted").glob("*.json")]
-    lookup = {r["pair_id"]: r for r in records}
-    selections = make_selection(records, config)
-    lock = root / "fixed_selection.json"
-    if not lock.exists() or json.loads(lock.read_text()) != selections:
-        raise ValueError("Finish collection and preserve fixed_selection.json before exporting")
-    result = []
-    for size in sizes or config.sizes:
-        chosen = [lookup[p] for p in selections[str(size)]]
-        archive = root / f"india_pairs_{size}.zip"
-        if archive.exists():
-            with zipfile.ZipFile(archive) as handle:
-                if json.loads(handle.read("pair_ids.json")) != selections[str(size)] or handle.testzip():
-                    raise ValueError(f"Existing archive failed verification: {archive}")
-            result.append(archive); continue
-        needed = sum((root / r["npz"]).stat().st_size for r in chosen)
-        if shutil.disk_usage(root).free < needed * 1.1 + 500 * 2**20:
-            raise OSError(f"Insufficient space to write {archive.name}; need about {needed / 2**30:.2f} GiB plus reserve. No files were deleted.")
-        manifest = []
-        for r in chosen:
-            path = f"{r['split']}/{r['scene_class']}/{r['pair_id']}.npz"
-            grid = r["grid"]
-            manifest.append(asdict(ManifestRecord(patch=path, tile_id=r["block"], split=r["split"],
-                row=grid["row"], col=grid["col"], valid_fraction=r["valid_fraction"],
-                source="earth_engine_landsat_sentinel_real_pairs", license_id="USGS-and-Copernicus",
-                source_product=r["landsat"] + "|" + r["sentinel"], landsat_product=r["landsat"],
-                sentinel_product=r["sentinel"], landsat_acquisition=r["landsat_date"], sentinel_acquisition=r["sentinel_date"],
-                day_gap=int(math.ceil(r["gap_seconds"] / 86400)), scale=3,
-                target_crs=grid["crs"], target_transform=grid["hr_transform"], scene_class=r["scene_class"])))
-        card = dict(size=size, counts=dict(Counter(r["split"] for r in chosen)),
-            split_strategy="fixed_6933_spatial_blocks", block_m=config.block_m, guard_m=config.guard_m,
-            config=asdict(config), selection_sha256=identity(selections[str(size)]),
-            label_note="WorldCover 2021 weak patch labels, not verified contemporary semantic ground truth",
-            pixel_protocol="Actual Landsat RGB native 30 m grid; Sentinel RGB bilinearly resampled to aligned 10 m subgrid; raw reflectance [0,1]",
-            sources=["LANDSAT/LC08/C02/T1_L2", "LANDSAT/LC09/C02/T1_L2", "COPERNICUS/S2_SR_HARMONIZED", "ESA/WorldCover/v200", "FAO/GAUL/2015/level0"])
-        temporary = archive.with_suffix(".tmp.zip")
-        with zipfile.ZipFile(temporary, "w", zipfile.ZIP_STORED, allowZip64=True) as handle:
-            handle.writestr("manifest.jsonl", "".join(json.dumps(r) + "\n" for r in manifest))
-            handle.writestr("dataset_card.json", json.dumps(card, indent=2))
-            handle.writestr("pair_ids.json", json.dumps(selections[str(size)]))
-            handle.writestr("pair_metadata.json", json.dumps(chosen, indent=2))
-            handle.writestr("README.txt", "Each NPZ contains lr, hr and their validity masks. No LR synthesis.\nKeep val/test fixed across sizes; training sets are nested.\nUse TrustMoE DATASET_PROTOCOL='spatial_blocks', DISPLAY_MAX=0.3.\nAcknowledge USGS Landsat, Copernicus Sentinel, ESA WorldCover and FAO GAUL. Review their source licenses before redistribution.\n")
-            for r, record in zip(chosen, manifest):
-                handle.write(root / r["npz"], record["patch"])
-        temporary.replace(archive)
-        result.append(archive)
-    return result

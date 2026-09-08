@@ -1,5 +1,29 @@
 # Fixed India Landsat/Sentinel datasets from Earth Engine
 
+## Faster Alternative: Export Overlaps Once
+
+Use [the tile-first Colab notebook](../colab/GEE_India_Tile_First_TIFF_Datasets.ipynb)
+when per-patch Earth Engine requests are too slow. It exports a large scene-overlap
+rectangle for each chosen Landsat/Sentinel pair, then uses local TIFF windows to
+create patches. Three batch tasks per overlap replace per-patch image requests.
+The third export supplies land-cover labels; sensor TIFFs include a validity band.
+Final paired TIFFs contain RGB with an internal validity mask.
+
+It is not a raw full-scene archive: only the common overlap is relevant, Sentinel
+is aligned to the native Landsat grid, and pixels outside overlap/India are masked.
+Budget substantial Drive space; batch jobs can queue, so no speedup is guaranteed.
+The notebook shows an uncompressed storage estimate before submitting jobs.
+
+Use a new OUTPUT. This changes the sampling population and must not be mixed with
+an existing point-first experiment. Scene plans and task IDs are saved; cropping
+processes only the ready prefix of the plan so export completion order cannot
+change selection. Rerun setup, queue monitoring and cropping after interruption.
+The same 600 test and 200 validation pairs are shared across the new three sizes.
+Insufficient class quotas cause a clear shortfall, never duplication. Existing
+NPZ-based training code still needs a TIFF-aware loader for either TIFF workflow.
+
+Source: [Earth Engine batch exports and explicit grids](https://developers.google.com/earth-engine/guides/exporting_images).
+
 ## What is being created?
 
 The [Colab notebook](../colab/GEE_India_Landsat_Sentinel_Fixed_Datasets.ipynb)
@@ -111,13 +135,13 @@ Persistent output contains:
 collection_config.json      configuration lock
 candidate_sites/            fixed sampled coordinates
 scene_lists/                cached acquisition candidates
-master/                    accepted paired NPZ files
+master/                    accepted LR/HR GeoTIFF files
 accepted/                  one metadata receipt per completed pair
 rejected/                  quality/guard rejection reasons
 fixed_selection.json        exact IDs for all three datasets
-india_pairs_2000.zip
-india_pairs_4000.zip
-india_pairs_6000.zip
+india_pairs_2000_geotiff.zip
+india_pairs_4000_geotiff.zip
+india_pairs_6000_geotiff.zip
 ```
 
 After a session restart, rerun setup/authentication and collection using the SAME
@@ -127,7 +151,7 @@ temporary files before their completion receipts. No cleanup deletes data.
 
 A seed alone cannot freeze a changing satellite catalog, so preserve the cached
 coordinates, scene lists and final selection. Changing collection settings requires
-a different output root. If an accepted NPZ is missing, restore it from backup.
+a different output root. If an accepted TIFF is missing, restore it from backup.
 
 Exact counts are conditional on finding enough valid candidates in every category
 and split. If all candidates are exhausted, the script reports the shortfall rather
@@ -159,40 +183,28 @@ dataset_card.json
 TIFFs contain three float32 RGB reflectance bands, CRS, affine transform and an
 internal validity mask. Valid zero reflectance is not treated as nodata. LR and
 HR filenames match. No gamma correction, display stretching or uint8 conversion
-is applied. Existing master NPZs are reused: there is no need to download again.
-The new ZIP names leave earlier NPZ ZIPs untouched. Interrupted ZIP creation can
-be rerun without collecting data again.
+is applied. Master storage also uses TIFFs: `master/LR/` and `master/HR/`.
+There is no NPZ export or NPZ cache in this workflow. Downloaded arrays are
+processed in memory before being written as TIFF.
 
-The existing training loader still requires NPZ. Optional compatible exports use
-`export_datasets(OUTPUT, CONFIG, sizes=(2000, 4000, 6000))`, or CLI `--format npz`.
-The following manifest/settings instructions apply to that **NPZ export**, not
-directly to the GeoTIFF ZIP. Both exports contain the same fixed pair IDs.
+Use the new default OUTPUT `gee_india_tiff_v1` when starting this version. An
+older collection containing NPZ receipts is rejected rather than silently reused.
+No old files are deleted. Preserve old collections separately.
 
-Each ZIP has `manifest.jsonl`, `dataset_card.json`, pair IDs, source metadata and
-`train/<class>/*.npz`, `val/<class>/*.npz`, `test/<class>/*.npz`.
-Each NPZ contains `lr`, `hr`, `valid_mask_lr`, `valid_mask_hr`. Separate HR/LR TIFF
-or PNG copies are not needed by the current model. This saves duplicate storage
-and keeps the real sensor pair together. Manifest paths are relative to the ZIP root.
+Interrupted collection skips pairs only after both TIFFs and their metadata receipt
+have been written. Interrupted ZIP export can be rerun without collecting again.
+ZIPs contain TIFF imagery and JSON metadata only. They duplicate common holdouts
+intentionally so each of the three datasets is self-contained.
 
-Master pairs and ZIPs coexist. The three ZIPs duplicate shared pairs intentionally
-so each dataset is self-contained. Check Drive's account quota, not just filesystem
-free space. Export one size at a time when needed; nothing is deleted automatically.
+The existing TrustMoE training notebook currently expects NPZ manifests. It cannot
+directly read this TIFF layout; a TIFF-aware paired loader is required. Do not point
+that notebook at `pairs.jsonl` and assume compatibility. No optional NPZ export is
+provided in this version.
 
-In the updated [TrustMoE training notebook](../kaggle/GeoDiff_TrustMoE_Transformer_3x.ipynb):
-
-```python
-DATASET_PROTOCOL = 'spatial_blocks'
-PREPARED_MANIFEST = Path('/kaggle/input/YOUR_DATASET/manifest.jsonl')
-DISPLAY_MAX = 0.3
-SUITE_ROOT = Path('/kaggle/working/trust_moe_india_2000')
-```
-
-Use distinct run roots for 2000/4000/6000 and keep the same model, seeds and training
-policy for data-size comparisons. Full epochs on larger data imply more optimizer
-updates: report this extra training cost rather than calling the compute identical.
-Select settings on validation, then report the common test once per locked experiment.
-All numeric metrics use stored reflectance, not display-enhanced images. They are
-not directly comparable to OLI2MSI clip03-normalized metrics without matching protocols.
+Keep the same fixed train/val/test IDs in any downstream loader. Use separate run
+roots per dataset size and select settings on validation. Full epochs on larger
+datasets imply more optimizer updates, so report the additional training cost.
+Numeric metrics must use stored reflectance, not enhanced display images.
 
 ## Attribution and verification status
 
