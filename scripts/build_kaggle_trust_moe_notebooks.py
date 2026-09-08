@@ -60,7 +60,7 @@ PREPARED_MANIFEST = None  # Or Path('/kaggle/input/.../manifest.jsonl').
 RESTORE_SUITE_FROM = None  # Attached previous suite folder or downloaded results ZIP.
 IMPORT_BASE_CHECKPOINT = None  # Optional compatible residual-Swin base, same data/range/splits.
 
-DATASET_PROTOCOL = "own_tiles"  # "provided_benchmark" only for an already-prepared benchmark manifest.
+DATASET_PROTOCOL = "own_tiles"  # "spatial_blocks" for new GEE India exports; "provided_benchmark" for official prepared benchmarks.
 DISPLAY_MAX = 0.3  # Raw surface reflectance. Use 1.0 for clip(0,.3)/.3-normalized benchmarks.
 EPOCHS = {"base": 30, "residual": 15}
 BATCH_SIZE = 4
@@ -80,7 +80,7 @@ if sys.version_info < (3, 10):
     raise RuntimeError('Use a Python 3.10+ Kaggle kernel.')
 if not 1 <= TOP_K <= NUM_EXPERTS or not 0 < REGION_FRACTION <= 1:
     raise ValueError('Invalid expert count/top-k/region fraction')
-if DATASET_PROTOCOL not in ('own_tiles', 'provided_benchmark'):
+if DATASET_PROTOCOL not in ('own_tiles', 'spatial_blocks', 'provided_benchmark'):
     raise ValueError(DATASET_PROTOCOL)
 SUITE_ROOT.mkdir(parents=True, exist_ok=True)
 
@@ -160,6 +160,10 @@ regions inside every tile. Categories are metadata for analysis, **not forced ex
 labels**. Directory-derived categories are weak scene labels, not pixel annotations.
 No LR synthesis, per-image normalization, or target calibration occurs here.
 
+For the new Earth Engine India exports use `DATASET_PROTOCOL='spatial_blocks'`.
+Their geographic blocks belong to only one split; they do not put all three splits
+inside every block. Retain `DISPLAY_MAX=0.3` for their raw reflectance arrays.
+
 For a provided official benchmark, point to its existing *prepared paired NPZ manifest*,
 set `DATASET_PROTOCOL='provided_benchmark'` and the appropriate `DISPLAY_MAX`.
 That option preserves the official split without requiring 10% test or claiming
@@ -178,7 +182,8 @@ PREPARED_MANIFEST = Path(PREPARED_MANIFEST)
 MANIFEST = SUITE_ROOT / 'runtime_manifest.jsonl'
 AUDIT = prepare_manifest(PREPARED_MANIFEST, MANIFEST,
     spatial_audit=DATASET_PROTOCOL == 'own_tiles',
-    minimum_test_fraction=0.10 if DATASET_PROTOCOL == 'own_tiles' else 0)
+    minimum_test_fraction=0.10 if DATASET_PROTOCOL != 'provided_benchmark' else 0,
+    disjoint_tiles=DATASET_PROTOCOL == 'spatial_blocks')
 print(json.dumps(AUDIT, indent=2))
 for name in ('dataset_card.json', 'source_pairs.csv', 'category_split_summary.csv', 'numerical_audit.csv'):
     path = PREPARED_MANIFEST.parent / name
@@ -590,6 +595,10 @@ def build():
                        ROOT / 'kaggle/Landsat_Sentinel_TrustMoE_Dataset_Preparation.ipynb',
                        ROOT / 'learning/GeoDiff_TrustMoE_Research_Protocol.md', ROOT / 'tests/test_trust_moe.py'])
     inventory = []
+    candidates.extend((ROOT / 'learning/trust_moe').glob('*.md'))
+    candidates.extend([ROOT / 'learning/GEE_India_Fixed_Pair_Datasets.md',
+                       ROOT / 'colab/GEE_India_Landsat_Sentinel_Fixed_Datasets.ipynb',
+                       ROOT / 'tests/test_gee_pairs.py'])
     with zipfile.ZipFile(archive, 'w', zipfile.ZIP_DEFLATED) as handle:
         for path in sorted(set(candidates)):
             if not path.is_file():

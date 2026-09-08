@@ -1,5 +1,13 @@
 # GeoDiff-GAN Learning Course
 
+## New Diffusion-Free Model
+
+For the current Transformer-router model, start with the separate
+[GeoDiff-TrustMoE learning guide](trust_moe/README.md). It covers the implemented
+architecture, tensor shapes, sparse routing, trust, losses, parameters, experiments,
+and supervisor questions. The diffusion/VAE chapters below describe the older model;
+those modules are not part of TrustMoE.
+
 This folder is a sequential, self-contained course for understanding, training, debugging, and
 researching GeoDiff-GAN. Read the chapters in numerical order. Each chapter contains:
 

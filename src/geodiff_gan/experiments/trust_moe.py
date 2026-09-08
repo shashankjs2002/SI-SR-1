@@ -16,7 +16,8 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader
 
 from ..data.dataset import SentinelPatchDataset
-from ..data.manifest import load_manifest, write_manifest, validate_within_tile_spatial_isolation
+from ..data.manifest import (load_manifest, write_manifest, validate_within_tile_spatial_isolation,
+                             validate_tile_split_isolation)
 from ..losses import charbonnier, mse_loss, ssim, discriminator_hinge, generator_hinge
 from ..metrics import basic_metrics
 from ..models.discriminators import PatchDiscriminator
@@ -52,7 +53,8 @@ def seed_all(seed):
         torch.cuda.manual_seed_all(seed)
 
 
-def prepare_manifest(source, destination, *, spatial_audit=True, minimum_test_fraction=0.1):
+def prepare_manifest(source, destination, *, spatial_audit=True, minimum_test_fraction=0.1,
+                     disjoint_tiles=False):
     """Validate an already prepared paired dataset; retain its original splits."""
     records = load_manifest(source, resolve_paths=True)
     records = [r for r in records if r.split in ("train", "val", "test")]
@@ -89,6 +91,10 @@ def prepare_manifest(source, destination, *, spatial_audit=True, minimum_test_fr
         identity = asdict(record)
         identity.pop("patch")
         fingerprint.update((content_hash + json.dumps(identity, sort_keys=True)).encode())
+    if spatial_audit and disjoint_tiles:
+        raise ValueError("Choose within-tile spatial or disjoint-block auditing, not both")
+    if disjoint_tiles:
+        validate_tile_split_isolation(records)
     if spatial_audit:
         if len(sizes) != 1:
             raise ValueError("Use one frame size for the spatial split audit")
@@ -97,7 +103,10 @@ def prepare_manifest(source, destination, *, spatial_audit=True, minimum_test_fr
     report = {"dataset_id": fingerprint.hexdigest(), "counts": dict(counts),
               "categories": dict(Counter(r.scene_class for r in records)),
               "scale": 3, "frames_hr": sorted(sizes), "spatial_audit": spatial_audit,
-              "split_interpretation": "within-tile held-out regions" if spatial_audit else "provided benchmark split; geographic independence not established"}
+              "disjoint_blocks": disjoint_tiles,
+              "split_interpretation": ("disjoint geographic block IDs; footprint guards audited during preparation" if disjoint_tiles
+                                        else "within-tile held-out regions" if spatial_audit
+                                        else "provided benchmark split; geographic independence not established")}
     write_json(Path(destination).with_suffix(".audit.json"), report)
     return report
 
