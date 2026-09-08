@@ -598,6 +598,8 @@ def build():
     candidates.extend((ROOT / 'learning/trust_moe').glob('*.md'))
     candidates.extend([ROOT / 'learning/GEE_India_Fixed_Pair_Datasets.md',
                        ROOT / 'colab/GEE_India_Tile_First_TIFF_Datasets.ipynb',
+                       ROOT / 'kaggle/GeoDiff_TrustMoE_OLI2MSI_128x128_3x.ipynb',
+                       ROOT / 'tests/test_oli2msi_128.py',
                        ROOT / 'tests/test_gee_tiles.py',
                        ROOT / 'colab/GEE_India_Landsat_Sentinel_Fixed_Datasets.ipynb',
                        ROOT / 'tests/test_gee_pairs.py'])

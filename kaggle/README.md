@@ -1,5 +1,11 @@
 # Kaggle Usage
 
+For the diffusion-free model on the official OLI2MSI benchmark with an exact
+`128 x 128 -> 384 x 384` model input, run
+`GeoDiff_TrustMoE_OLI2MSI_128x128_3x.ipynb`. It uses random aligned training crops,
+fixed center validation/test crops, a hash-fixed validation subset, and all 100
+official test pairs. Keep its results separate from full-frame OLI2MSI experiments.
+
 ## New diffusion-free study
 
 1. Run `Landsat_Sentinel_TrustMoE_Dataset_Preparation.ipynb` on your raw paired tiles.

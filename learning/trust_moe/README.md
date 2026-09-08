@@ -42,3 +42,9 @@ Use the [Earth Engine India dataset guide](../GEE_India_Fixed_Pair_Datasets.md)
 for 2,000 / 4,000 / 6,000 real pairs with common validation/test IDs and nested
 training subsets. It includes a resumable Colab notebook and explains weak labels,
 native grids, geographic blocks, masks and source attribution.
+
+Before collecting new Earth Engine data, use the
+[OLI2MSI 128 x 128 benchmark notebook](../../kaggle/GeoDiff_TrustMoE_OLI2MSI_128x128_3x.ipynb)
+to test the architecture on the official 3x cross-sensor dataset. This is a
+center-crop evaluation protocol and must not be compared directly with earlier
+full-frame results unless every method is reevaluated on the same crops.
