@@ -11,7 +11,7 @@ import numpy as np
 
 from geodiff_gan.data.gee_pairs import (
     CLASSES, IndiaPairConfig, aligned_grids, block_assignment,
-    export_datasets, make_selection, save_json,
+    export_datasets, export_geotiff_datasets, make_selection, save_json,
 )
 from geodiff_gan.experiments.trust_moe import prepare_manifest
 
@@ -26,7 +26,9 @@ class IndiaPairTests(unittest.TestCase):
                     pid = f'{split}_{label}_{i}'
                     self.rows.append(dict(pair_id=pid, location_id=pid, block=f'block_{split}',
                         split=split, scene_class=label, npz=f'master/{pid}.npz',
-                        grid=dict(row=0, col=0, crs='EPSG:32644', hr_transform=[10, 0, 0, 0, -10, 0]),
+                        grid=dict(row=0, col=0, crs='EPSG:32644',
+                                  lr_transform=[30, 0, 300000, 0, -30, 3000000],
+                                  hr_transform=[10, 0, 300000, 0, -10, 3000000]),
                         valid_fraction=1., landsat='LS/' + pid, sentinel='S2/' + pid,
                         landsat_date='2024-01-01', sentinel_date='2024-01-02', gap_seconds=86400))
 
@@ -95,6 +97,26 @@ class IndiaPairTests(unittest.TestCase):
                 save_json(root / 'accepted' / f"{row['pair_id']}.json", row)
             save_json(root / 'fixed_selection.json', make_selection(self.rows, self.config))
             archives = export_datasets(root, self.config)
+            import rasterio
+            from rasterio.io import MemoryFile
+            tiffs = export_geotiff_datasets(root, self.config, sizes=(20,))
+            self.assertEqual(tiffs, export_geotiff_datasets(root, self.config, sizes=(20,)))
+            with zipfile.ZipFile(tiffs[0]) as handle:
+                self.assertEqual(sum(n.endswith('.tif') for n in handle.namelist()), 40)
+                pair = json.loads(handle.read('pairs.jsonl').decode().splitlines()[0])
+                bounds = []
+                for key, pixels, resolution in [('lr', 8, 30), ('hr', 24, 10)]:
+                    with MemoryFile(handle.read(pair[f'{key}_path'])) as mem, mem.open() as image:
+                        self.assertEqual(image.count, 3)
+                        self.assertEqual(image.width, pixels)
+                        self.assertEqual(image.crs.to_epsg(), 32644)
+                        self.assertEqual(image.res, (resolution, resolution))
+                        self.assertEqual(image.dtypes, ('float32',) * 3)
+                        self.assertTrue((image.dataset_mask() == 255).all())
+                        with np.load(root / f"master/{pair['pair_id']}.npz") as source:
+                            np.testing.assert_array_equal(image.read(), source[key])
+                        bounds.append(image.bounds)
+                self.assertEqual(bounds[0], bounds[1])
             self.assertEqual(len(archives), 3)
             self.assertEqual(archives, export_datasets(root, self.config))
             with zipfile.ZipFile(archives[0]) as handle:

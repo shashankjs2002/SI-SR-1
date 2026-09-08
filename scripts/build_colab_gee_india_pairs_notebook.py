@@ -56,7 +56,7 @@ overwriting local edits or automatically changing its revision.
 code('''
 import sys, subprocess
 subprocess.run([sys.executable, '-m', 'pip', 'install', '-q',
-                'earthengine-api', 'requests', 'pyproj', 'numpy', 'Pillow', 'PyYAML', 'tqdm', 'pandas', 'matplotlib'], check=True)
+                'earthengine-api', 'requests', 'pyproj', 'rasterio', 'numpy', 'Pillow', 'PyYAML', 'tqdm', 'pandas', 'matplotlib'], check=True)
 from google.colab import drive
 drive.mount('/content/drive')
 from pathlib import Path
@@ -83,7 +83,7 @@ if not (REPOSITORY / 'src/geodiff_gan/data/gee_pairs.py').exists():
     raise RuntimeError('Downloader is missing. Commit and push the new code to GitHub, then clone into a new REPOSITORY path.')
 print('Repository revision:', git_value('rev-parse', 'HEAD'))
 sys.path.insert(0, str(REPOSITORY / 'src'))
-from geodiff_gan.data.gee_pairs import IndiaPairConfig, IndiaPairDownloader, export_datasets
+from geodiff_gan.data.gee_pairs import IndiaPairConfig, IndiaPairDownloader, export_datasets, export_geotiff_datasets
 CONFIG = IndiaPairConfig()
 CONFIG.validate()
 print('Output:', OUTPUT)
@@ -169,15 +169,17 @@ show_pair(0)
 ''')
 md('''
 ## 5. Export three portable Kaggle datasets
-These ZIPs contain their own fixed manifests and actual NPZs under `train/`, `val/`
-and `test/`. Every NPZ contains both `lr` and `hr`; separate TIFF/PNG copies are
-unnecessary. The master files remain in OUTPUT, so no downloaded data is deleted.
+These ZIPs contain georeferenced float32 RGB TIFFs under `train/LR/<class>/`,
+`train/HR/<class>/`, and equivalent `val/` and `test/` directories. TIFFs retain
+the CRS, pixel transform and internal validity mask. `pairs.jsonl` records paired
+relative paths and acquisition metadata. No display stretch is applied to TIFFs.
+Master NPZ files remain in OUTPUT for restart and optional training export.
 Writing all three ZIPs uses extra storage. Upload one ZIP at a time if your Drive
 quota is small; the code never automatically deletes old files to make room.
 ''')
 code('''
 EXPORT_SIZES = (2000, 4000, 6000)
-archives = export_datasets(OUTPUT, CONFIG, sizes=EXPORT_SIZES)
+archives = export_geotiff_datasets(OUTPUT, CONFIG, sizes=EXPORT_SIZES)
 for archive in archives:
     print(archive, f'{archive.stat().st_size / 2**30:.2f} GiB')
 print('Download these ZIP files from the OUTPUT folder in Google Drive, then upload each as a Kaggle dataset.')
@@ -196,6 +198,9 @@ PREPARED_MANIFEST = Path('/kaggle/input/YOUR_DATASET/manifest.jsonl')
 SUITE_ROOT = Path('/kaggle/working/trust_moe_india_2000')  # or 4000 / 6000
 ```
 
+The current TrustMoE loader expects NPZ, not this TIFF layout. When training with
+that notebook, additionally run `export_datasets(OUTPUT, CONFIG, sizes=(2000,))`
+(or the other sizes) to create the compatible NPZ archive with identical pair IDs.
 Use the updated TrustMoE training notebook. Preserve the collection config,
 candidate sites, scene lists and fixed_selection.json. A seed alone cannot preserve a
 live satellite catalog forever. More data can change model quality; it does not guarantee
@@ -206,7 +211,7 @@ DOWNLOAD_TO_BROWSER = False
 DOWNLOAD_SIZE = 2000
 if DOWNLOAD_TO_BROWSER:
     from google.colab import files
-    files.download(str(OUTPUT / f'india_pairs_{DOWNLOAD_SIZE}.zip'))
+    files.download(str(OUTPUT / f'india_pairs_{DOWNLOAD_SIZE}_geotiff.zip'))
 ''')
 
 

@@ -345,6 +345,71 @@ class IndiaPairDownloader:
         return selections
 
 
+def export_geotiff_datasets(root, config=IndiaPairConfig(), sizes=None):
+    """Export float32 RGB GeoTIFF pairs with internal validity masks, without redownloading."""
+    import rasterio
+    from rasterio.io import MemoryFile
+    from affine import Affine
+
+    root = Path(root)
+    rows = [json.loads(p.read_text()) for p in (root / "accepted").glob("*.json")]
+    selections = make_selection(rows, config)
+    if json.loads((root / "fixed_selection.json").read_text()) != selections:
+        raise ValueError("Fixed selection differs; preserve the original split")
+    lookup = {r["pair_id"]: r for r in rows}
+    archives = []
+    for size in sizes or config.sizes:
+        archive = root / f"india_pairs_{size}_geotiff.zip"
+        if archive.exists():
+            with zipfile.ZipFile(archive) as z:
+                if json.loads(z.read('pair_ids.json')) != selections[str(size)] or z.testzip():
+                    raise ValueError(f"Archive verification failed: {archive}")
+            archives.append(archive)
+            continue
+        required = size * config.lr_size ** 2 * 10 * 16 + 500 * 2**20
+        if shutil.disk_usage(root).free < required:
+            raise OSError("Insufficient free space for GeoTIFF export; no files were deleted")
+        metadata = []
+        temporary = archive.with_suffix('.tmp.zip')
+        with zipfile.ZipFile(temporary, 'w', zipfile.ZIP_STORED, allowZip64=True) as z:
+            for pid in selections[str(size)]:
+                row = lookup[pid]
+                entry = {k: v for k, v in row.items() if k != 'npz'}
+                with np.load(root / row['npz'], allow_pickle=False) as data:
+                    for key in ('lr', 'hr'):
+                        name = f"{row['split']}/{key.upper()}/{row['scene_class']}/{pid}.tif"
+                        image = data[key].astype(np.float32)
+                        mask = (data[f'valid_mask_{key}'][0] > 0.5).astype(np.uint8) * 255
+                        with rasterio.Env(GDAL_TIFF_INTERNAL_MASK=True), MemoryFile() as mem:
+                            with mem.open(driver='GTiff', width=image.shape[2], height=image.shape[1],
+                                          count=3, dtype='float32', crs=row['grid']['crs'],
+                                          transform=Affine(*row['grid'][f'{key}_transform']),
+                                          compress='deflate', predictor=3) as dst:
+                                dst.write(image)
+                                dst.write_mask(mask)
+                                for band, label in enumerate(('Red', 'Green', 'Blue'), 1):
+                                    dst.set_band_description(band, label)
+                                dst.update_tags(pair_id=pid, units='surface_reflectance',
+                                                sensor='Landsat' if key == 'lr' else 'Sentinel-2',
+                                                acquisition=row['landsat_date' if key == 'lr' else 'sentinel_date'])
+                            z.writestr(name, mem.read())
+                        entry[f'{key}_path'] = name
+                metadata.append(entry)
+            z.writestr('pairs.jsonl', ''.join(json.dumps(r) + '\n' for r in metadata))
+            z.writestr('pair_ids.json', json.dumps(selections[str(size)]))
+            z.writestr('dataset_card.json', json.dumps(dict(format='RGB float32 GeoTIFF with internal masks',
+                counts=dict(Counter(r['split'] for r in metadata)), config=asdict(config),
+                selection_sha256=identity(selections[str(size)])), indent=2))
+            z.writestr('README.txt', 'Real sensor pairs; RGB float32 reflectance, not display-stretched.\n'
+                'Internal masks distinguish invalid pixels from valid zero reflectance.\n'
+                'pairs.jsonl contains relative LR/HR paths and acquisition/grid metadata.\n'
+                'Keep fixed splits. The existing TrustMoE loader needs NPZ; use the optional NPZ export for training.\n'
+                'Acknowledge USGS, Copernicus, ESA WorldCover and FAO GAUL; review source redistribution licenses.\n')
+        temporary.replace(archive)
+        archives.append(archive)
+    return archives
+
+
 def export_datasets(root, config=IndiaPairConfig(), sizes=None):
     """Materialize portable ZIPs without keeping three extra uncompressed data copies."""
     root = Path(root)

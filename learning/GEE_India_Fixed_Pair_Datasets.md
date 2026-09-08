@@ -45,7 +45,7 @@ For a configured local Python environment, the equivalent script is
 
 ```bash
 python -m pip install -e . --no-deps
-python -m pip install earthengine-api requests pyproj
+python -m pip install earthengine-api requests pyproj rasterio
 python scripts/download_gee_india_pairs.py --project YOUR_PROJECT --root /YOUR/PERSISTENT/FOLDER --authenticate
 ```
 
@@ -141,6 +141,32 @@ of manually launched export tasks. [Download API limits](https://developers.goog
 and [account quotas](https://developers.google.com/earth-engine/guides/usage) still apply.
 
 ## Portable format and training
+
+**Default export is now GeoTIFF**, in `india_pairs_<size>_geotiff.zip`:
+
+```text
+train/LR/<class>/<pair_id>.tif
+train/HR/<class>/<pair_id>.tif
+val/LR/<class>/<pair_id>.tif
+val/HR/<class>/<pair_id>.tif
+test/LR/<class>/<pair_id>.tif
+test/HR/<class>/<pair_id>.tif
+pairs.jsonl
+pair_ids.json
+dataset_card.json
+```
+
+TIFFs contain three float32 RGB reflectance bands, CRS, affine transform and an
+internal validity mask. Valid zero reflectance is not treated as nodata. LR and
+HR filenames match. No gamma correction, display stretching or uint8 conversion
+is applied. Existing master NPZs are reused: there is no need to download again.
+The new ZIP names leave earlier NPZ ZIPs untouched. Interrupted ZIP creation can
+be rerun without collecting data again.
+
+The existing training loader still requires NPZ. Optional compatible exports use
+`export_datasets(OUTPUT, CONFIG, sizes=(2000, 4000, 6000))`, or CLI `--format npz`.
+The following manifest/settings instructions apply to that **NPZ export**, not
+directly to the GeoTIFF ZIP. Both exports contain the same fixed pair IDs.
 
 Each ZIP has `manifest.jsonl`, `dataset_card.json`, pair IDs, source metadata and
 `train/<class>/*.npz`, `val/<class>/*.npz`, `test/<class>/*.npz`.
