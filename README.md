@@ -20,6 +20,15 @@ Input/output and tensor-shape explainers:
 
 ### Diffusion-free Transformer-router study
 
+For the near-zero residual gains in the OLI2MSI study, use
+[the residual-recovery notebook](kaggle/GeoDiff_TrustMoE_OLI2MSI_Residual_Recovery_3x.ipynb).
+It reuses the trained base, checks learning on eight training crops, trains an
+HR-conditioned single expert, and compares sparse correction-benefit routing with
+error ranking, uniform coverage, and trust controls. It retains 128x128 -> 384x384
+geometry and provides compact epoch logs, checkpoint resume, validation screens,
+indexed outputs, and a results download. See
+[the rationale, protocol, and novelty limitations](learning/trust_moe/07_residual_recovery_v2.md).
+
 Use [the new paired-tile preparation notebook](kaggle/Landsat_Sentinel_TrustMoE_Dataset_Preparation.ipynb),
 upload its exported dataset to Kaggle, then run
 [GeoDiff-TrustMoE](kaggle/GeoDiff_TrustMoE_Transformer_3x.ipynb).

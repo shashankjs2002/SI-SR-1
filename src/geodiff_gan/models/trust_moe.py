@@ -73,6 +73,38 @@ class ResidualTileExpert(nn.Module):
         return self.bound * torch.tanh(self.rgb(features))
 
 
+class ExpertResidualBlock(nn.Module):
+    def __init__(self, width):
+        super().__init__()
+        self.body = nn.Sequential(nn.Conv2d(width, width, 3, padding=1), nn.GELU(),
+                                  nn.Conv2d(width, width, 3, padding=1))
+
+    def forward(self, x):
+        return x + 0.2 * self.body(x)
+
+
+class HRConditionedTileExpert(nn.Module):
+    """Refine signed HR base detail, preserving spatial phase inside each tile."""
+
+    def __init__(self, width, scale, residual_bound, blocks=2):
+        super().__init__()
+        self.scale, self.bound = scale, residual_bound
+        hidden = max(8, width // 2)
+        self.body = nn.Sequential(*(ExpertResidualBlock(width) for _ in range(blocks)))
+        self.project = nn.Conv2d(width, hidden, 1)
+        # HR cues: base RGB, signed high-pass RGB, and base-minus-bicubic RGB.
+        self.refine = nn.Sequential(nn.Conv2d(hidden + 9, hidden, 3, padding=1),
+                                     nn.GELU(), ExpertResidualBlock(hidden))
+        self.rgb = nn.Conv2d(hidden, 3, 3, padding=1)
+        nn.init.normal_(self.rgb.weight, std=0.01)
+        nn.init.zeros_(self.rgb.bias)
+
+    def forward(self, features, hr_cues):
+        features = F.interpolate(self.project(self.body(features)), scale_factor=self.scale,
+                                 mode="bilinear", align_corners=False)
+        return self.bound * torch.tanh(self.rgb(self.refine(torch.cat((features, hr_cues), 1))).float())
+
+
 class TrustMoESR(nn.Module):
     """One base pass + selected tile experts + a per-band trust gate.
 
@@ -85,7 +117,8 @@ class TrustMoESR(nn.Module):
                  router_depth=2, routing="reliability", use_trust=True,
                  residual_bound=0.1, base_embed_dim=32, base_depth=2,
                  base_groups=2, base_heads=4, window_size=8, dispatch_chunk=128,
-                 adaptive_k=False):
+                 adaptive_k=False, expert_kind="legacy", expert_blocks=2,
+                 detach_router_features=False):
         super().__init__()
         if not 1 <= top_k <= num_experts or not 0 <= coverage <= 1:
             raise ValueError("Require 1 <= top_k <= num_experts and 0 <= coverage <= 1")
@@ -93,12 +126,18 @@ class TrustMoESR(nn.Module):
             raise ValueError("Invalid tile geometry, input channels or dispatch chunk")
         if routing not in ("reliability", "uniform"):
             raise ValueError("routing must be reliability or uniform")
+        if expert_kind not in ("legacy", "hr_residual") or expert_blocks < 1:
+            raise ValueError("Invalid expert kind/depth")
+        if expert_kind == "hr_residual" and halo < 2 * expert_blocks + 2:
+            raise ValueError("HR-conditioned experts need halo >= 2 * expert_blocks + 2")
         self.scale, self.input_channels = scale, input_channels
         self.num_experts, self.top_k = num_experts, top_k
         self.tile_size, self.halo, self.coverage = tile_size, halo, coverage
         self.routing, self.use_trust = routing, use_trust
         self.dispatch_chunk = dispatch_chunk
         self.adaptive_k = adaptive_k
+        self.expert_kind = expert_kind
+        self.detach_router_features = detach_router_features
         self.base = ResidualSwinBase(3, base_embed_dim, base_depth, base_heads,
                                     window_size, scale, 3, base_groups)
         # Cues are observable at inference: LR, base on LR grid, HF energy,
@@ -108,8 +147,9 @@ class TrustMoESR(nn.Module):
                                      nn.GELU())
         self.router = ContextRouter(width, num_experts, router_kind, depth=router_depth)
         self.experts = nn.ModuleList([
-            ResidualTileExpert(width, scale, residual_bound) for _ in range(num_experts)
-        ])
+            HRConditionedTileExpert(width, scale, residual_bound, expert_blocks)
+            if expert_kind == "hr_residual" else ResidualTileExpert(width, scale, residual_bound)
+            for _ in range(num_experts)])
         self.trust_head = nn.Sequential(nn.Conv2d(width + 6, width, 1), nn.GELU(),
                                         nn.Conv2d(width, 3, 1))
         nn.init.constant_(self.trust_head[-1].bias, 1.0)
@@ -126,7 +166,7 @@ class TrustMoESR(nn.Module):
         return self
 
     def forward(self, lr, *, coverage=None, top_k=None, residual_scale=1.0,
-                explore=0.0, base_only=False):
+                explore=0.0, base_only=False, bypass_trust=False):
         coverage = self.coverage if coverage is None else float(coverage)
         top_k = self.top_k if top_k is None else int(top_k)
         if not 0 <= coverage <= 1 or not 1 <= top_k <= self.num_experts:
@@ -149,7 +189,8 @@ class TrustMoESR(nn.Module):
         cues = torch.cat((lr, small_base, small_hf, discrepancy, variation), 1)
         features = self.encoder(cues)
         padded = F.pad(features, (0, pw - w, 0, ph - h), mode="replicate")
-        logits, risk = self.router(F.avg_pool2d(padded, t, t))
+        pooled = F.avg_pool2d(padded, t, t)
+        logits, risk = self.router(pooled.detach() if self.detach_router_features else pooled)
         probabilities = logits.float().softmax(-1)
         count = math.ceil(n * coverage)
         if self.routing == "uniform":
@@ -187,6 +228,15 @@ class TrustMoESR(nn.Module):
         patches = F.pad(padded, (halo, halo, halo, halo), mode="replicate")
         patches = patches.unfold(2, t + 2 * halo, t).unfold(3, t + 2 * halo, t)
         patches = patches.permute(0, 2, 3, 1, 4, 5)
+        hr_patches = None
+        if self.expert_kind == "hr_residual":
+            smooth = F.avg_pool2d(F.pad(base.float(), (2, 2, 2, 2), mode="replicate"), 5, 1)
+            anchor = F.interpolate(lr[:, :3], size=base.shape[-2:], mode="bicubic", align_corners=False)
+            hr_cues = torch.cat((base.float(), base.float() - smooth, base.float() - anchor), 1)
+            hr_cues = F.pad(hr_cues, (0, (pw - w) * s, 0, (ph - h) * s), mode="replicate")
+            hr_patches = F.pad(hr_cues, (halo * s,) * 4, mode="replicate")
+            hr_patches = hr_patches.unfold(2, (t + 2 * halo) * s, t * s).unfold(3, (t + 2 * halo) * s, t * s)
+            hr_patches = hr_patches.permute(0, 2, 3, 1, 4, 5)
         merged = base.new_zeros(b * n, 3, t * s, t * s)
         dispatched = assignments.sum().long()
         for k, expert in enumerate(self.experts):
@@ -194,7 +244,8 @@ class TrustMoESR(nn.Module):
             for start in range(0, len(batch_ids), self.dispatch_chunk):
                 bi, ti = batch_ids[start:start + self.dispatch_chunk], token_ids[start:start + self.dispatch_chunk]
                 inputs = patches[bi, ti // gw, ti % gw]
-                proposal = expert(inputs)
+                proposal = (expert(inputs, hr_patches[bi, ti // gw, ti % gw])
+                            if hr_patches is not None else expert(inputs))
                 offset = halo * s
                 proposal = proposal[:, :, offset:offset + t * s, offset:offset + t * s]
                 weight = gates[bi, ti, k, None, None, None].to(proposal.dtype)
@@ -206,7 +257,7 @@ class TrustMoESR(nn.Module):
         active = active[:, :, :h * s, :w * s]
         trust_input = torch.cat((features, F.interpolate(residual, size=(h, w), mode="area"), discrepancy), 1)
         trust = F.interpolate(self.trust_head(trust_input), size=base.shape[-2:], mode="bilinear", align_corners=False).sigmoid()
-        if not self.use_trust:
+        if not self.use_trust or bypass_trust:
             trust = torch.ones_like(base)
         image = (base + float(residual_scale) * trust * residual).clamp(0, 1)
         return TrustMoEOutput(image, base, residual, trust, active, risk,

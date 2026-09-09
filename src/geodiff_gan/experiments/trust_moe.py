@@ -213,6 +213,8 @@ def validate(model, dataset, device, *, base_only=False, amp=False):
 
 
 def train(config, device=None):
+    from .trust_recovery import (correction_diagnostics, curriculum, fixed_training_subset,
+                                 initialize_residual, module_gradient_norms)
     root = Path(config["root"])
     root.mkdir(parents=True, exist_ok=True)
     train_cfg = config["training"]
@@ -228,6 +230,9 @@ def train(config, device=None):
         raise ValueError("Residual training requires the shared trained base checkpoint")
     else:
         import_base(model, config["parent"])
+    initializer = config.get("residual_initializer")
+    if initializer and not base_only:
+        initialize_residual(model, initializer, dataset_id=config["dataset_id"])
     frozen_base = {k: v.detach().cpu().clone() for k, v in model.base.state_dict().items()}
     parameters = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(parameters, lr=train_cfg["learning_rate"], weight_decay=0)
@@ -236,12 +241,16 @@ def train(config, device=None):
     discriminator = PatchDiscriminator(base_channels=24).to(device) if adversarial and not base_only else None
     d_optimizer = torch.optim.AdamW(discriminator.parameters(), lr=2e-5, weight_decay=0) if discriminator else None
     ema = {k: v.detach().clone() for k, v in model.state_dict().items()}
-    start, best = 0, -float("inf")
+    start, best, optimizer_steps = 0, -float("inf"), 0
     last = root / "last.pt"
     # Epoch count and runtime paths may change on resume. Model/data/loss/batch/crop
     # changes require another experiment, not silently altered optimizer history.
     signature = {k: copy.deepcopy(config[k]) for k in ("profile", "seed", "model", "dataset_id", "losses")}
     signature["training"] = {k: v for k, v in train_cfg.items() if k not in ("epochs", "num_workers")}
+    if initializer:
+        signature["residual_initializer_sha256"] = digest_file(initializer)
+    lineage = {"parent_sha256": digest_file(config["parent"]) if config.get("parent") else None,
+               "initializer_sha256": digest_file(initializer) if initializer else None}
     if last.exists():
         saved = torch.load(last, map_location=device, weights_only=False)
         if saved["signature"] != signature:
@@ -252,6 +261,7 @@ def train(config, device=None):
             scaler.load_state_dict(saved["scaler"])
         ema = saved["ema"]
         start, best = saved["epoch"], saved["best_psnr"]
+        optimizer_steps = saved.get("optimizer_steps", 0)
         if discriminator:
             discriminator.load_state_dict(saved["discriminator"])
             d_optimizer.load_state_dict(saved["d_optimizer"])
@@ -259,10 +269,18 @@ def train(config, device=None):
             raise ValueError("The parent base changed since this residual run. Use the original parent or a new root.")
     write_json(root / "config.json", config)
     train_data, val_data = dataset_for(config, "train"), dataset_for(config, "val")
+    diagnostic_count = int(train_cfg.get("diagnostic_overfit_pairs", 0))
+    if diagnostic_count:
+        train_data = fixed_training_subset(config, diagnostic_count)
+        val_data = train_data
+        print("Diagnostic only: validation below measures memorization of fixed TRAIN crops.", flush=True)
     if not len(train_data):
         raise ValueError("Training split is empty")
     print(f"[{config['profile']}] train={len(train_data)} val={len(val_data)} epochs={start}->{train_cfg['epochs']} batch={train_cfg['batch_size']} device={device}", flush=True)
     for epoch in range(start, int(train_cfg["epochs"])):
+        weights, forward_options, warming = curriculum(config, epoch)
+        for group in optimizer.param_groups:
+            group["lr"] = train_cfg["learning_rate"] * train_cfg.get("lr_epoch_decay", 1.0) ** epoch
         # Epoch-addressed RNG makes an interrupted epoch reproducible on restart.
         seed_all(config["seed"] + epoch)
         generator = torch.Generator().manual_seed(config["seed"] + epoch)
@@ -270,19 +288,22 @@ def train(config, device=None):
                             num_workers=train_cfg["num_workers"], generator=generator,
                             pin_memory=device.type == "cuda", drop_last=False)
         model.train()
-        totals, tick = Counter(), time.perf_counter()
+        totals, tick, gradient_report = Counter(), time.perf_counter(), {}
         for step, batch in enumerate(loader, 1):
             lr, target, mask = (batch[key].to(device) for key in ("lr", "hr", "valid_mask"))
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device.type, enabled=amp):
-                output = model(lr, base_only=base_only, explore=0.3 if epoch < train_cfg["exploration_epochs"] else 0.05)
+                output = model(lr, base_only=base_only,
+                               explore=0.3 if epoch < train_cfg["exploration_epochs"] else 0.05,
+                               **forward_options)
             if base_only:
                 loss = 100 * mse_loss(output.image.float(), target, mask) + 0.5 * charbonnier(output.image.float(), target, mask=mask)
                 losses = {"reconstruction": loss}
             else:
                 loss, losses = trust_moe_losses(output, target, mask, model.tile_size,
-                                               model.scale, config["losses"], model.use_trust)
-            if discriminator:
+                                               model.scale, weights, model.use_trust and not warming,
+                                               train_cfg.get("risk_target", "error"))
+            if discriminator and weights.get("adversarial", 0):
                 discriminator.train().requires_grad_(True)
                 d_optimizer.zero_grad(set_to_none=True)
                 # Invalid pixels are replaced with the same base in real/fake inputs.
@@ -294,55 +315,81 @@ def train(config, device=None):
                 d_optimizer.step()
                 discriminator.eval().requires_grad_(False)
                 losses["adversarial"] = generator_hinge(discriminator(fake, lr))
-                loss = loss + adversarial * losses["adversarial"]
+                loss = loss + weights["adversarial"] * losses["adversarial"]
             if not bool(torch.isfinite(loss)):
                 raise FloatingPointError(f"Nonfinite loss in epoch {epoch + 1}, batch {step}; last checkpoint preserved")
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
+            if step == 1 and not base_only:
+                gradient_report = module_gradient_norms(model)
+                diagnostic_report = correction_diagnostics(output, target, mask)
             torch.nn.utils.clip_grad_norm_(parameters, 1.0)
+            previous_scale = scaler.get_scale()
             scaler.step(optimizer)
             scaler.update()
+            step_applied = not amp or scaler.get_scale() >= previous_scale
+            optimizer_steps += int(step_applied)
             with torch.no_grad():
+                decay = train_cfg["ema_decay"]
+                if train_cfg.get("ema_warmup"):
+                    decay = min(decay, (1 + optimizer_steps) / (10 + optimizer_steps))
                 for key, value in model.state_dict().items():
                     if value.is_floating_point() and not (key.startswith("base.") and not base_only):
-                        ema[key].lerp_(value.detach(), 1 - train_cfg["ema_decay"])
+                        if step_applied:
+                            ema[key].lerp_(value.detach(), 1 - decay)
                     else:
                         ema[key].copy_(value)
             for key, value in {**losses, "total": loss}.items():
                 totals[key] += float(value.detach())
-            if step == len(loader) or step == max(1, len(loader) // 2):
+            if train_cfg.get("progress") != "compact" and (step == len(loader) or step == max(1, len(loader) // 2)):
                 print(f"[{config['profile']}] epoch {epoch+1}/{train_cfg['epochs']} batch {step}/{len(loader)} loss={totals['total']/step:.5f}", flush=True)
         raw_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
         model.load_state_dict(ema)
         model.eval()
         val_psnr, val_ssim = validate(model, val_data, device, base_only=base_only, amp=amp)
         model.load_state_dict(raw_state)
-        improved = val_psnr > best
-        best = max(best, val_psnr)
+        # Warm-up uses a different dispatch policy; select only deployed-policy epochs.
+        improved = not warming and val_psnr > best
+        if improved:
+            best = val_psnr
         saved = {"config": config, "signature": signature, "epoch": epoch + 1,
                  "model": raw_state, "ema": ema, "optimizer": optimizer.state_dict(),
                  "scaler": scaler.state_dict(), "best_psnr": best,
-                 "validation": {"psnr": val_psnr, "ssim": val_ssim}}
+                 "validation": {"psnr": val_psnr, "ssim": val_ssim},
+                 "optimizer_steps": optimizer_steps, "lineage": lineage}
         if discriminator:
             saved.update(discriminator=discriminator.state_dict(), d_optimizer=d_optimizer.state_dict())
         _save_checkpoint(last, saved)
         if improved:
             _save_checkpoint(root / "best.pt", saved)
         row = {"epoch": epoch + 1, "val_psnr": val_psnr, "val_ssim": val_ssim,
-               "seconds": time.perf_counter() - tick, **{f"loss_{k}": v / step for k, v in totals.items()}}
+               "seconds": time.perf_counter() - tick, "warmup": warming,
+               "optimizer_steps": optimizer_steps, "learning_rate": optimizer.param_groups[0]["lr"],
+               "weighted_objective": weights,
+               **{f"loss_{k}": v / step for k, v in totals.items()}}
+        if not base_only:
+            row.update(first_batch_diagnostics=diagnostic_report, first_batch_gradient_norms=gradient_report)
         # One receipt per completed epoch also makes summary rebuilding idempotent.
         write_json(root / "history" / f"epoch_{epoch+1:04d}.json", row)
-        print(f"[{config['profile']}] epoch {epoch+1} val_psnr={val_psnr:.4f} val_ssim={val_ssim:.5f} best={best:.4f} elapsed={row['seconds']:.0f}s", flush=True)
+        suffix = ""
+        if not base_only:
+            suffix = f" correction={diagnostic_report['correction_abs_mean']:.2e}"
+        print(f"[{config['profile']}] epoch {epoch+1}/{train_cfg['epochs']} loss={totals['total']/step:.5f} val_psnr={val_psnr:.4f} val_ssim={val_ssim:.5f} best={best:.4f}{suffix} warmup={warming} elapsed={row['seconds']:.0f}s", flush=True)
+    if not (root / "best.pt").exists():
+        raise RuntimeError("Only warm-up epochs completed. Increase epochs beyond residual_warmup_epochs and resume.")
     return root / "best.pt"
 
 
 @torch.inference_mode()
 def evaluate(checkpoint, output_root, split="val", *, device=None, coverage=None,
              top_k=None, save_images=True, manifest=None):
+    from .trust_recovery import correction_diagnostics
     device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     model, config = load_model(checkpoint, device)
     if manifest:
         config["manifest"] = str(manifest)
+    if config["training"].get("diagnostic_overfit_pairs"):
+        raise ValueError("Memorization checkpoints are diagnostic only; do not evaluate them on validation/test.")
     dataset = dataset_for(config, split)
     root = Path(output_root)
     root.mkdir(parents=True, exist_ok=True)
@@ -350,6 +397,9 @@ def evaluate(checkpoint, output_root, split="val", *, device=None, coverage=None
                "dataset_id": config["dataset_id"], "coverage": coverage,
                "top_k": top_k, "save_images": save_images, "device": str(device),
                "torch": torch.__version__, "amp": bool(config["training"]["amp"] and device.type == "cuda")}
+    # V2 explicitly versions its evaluator and identifies the actual manifest used.
+    if config.get("format") == "trust-recovery-v2":
+        request.update(evaluator="trust-recovery-v2", manifest_sha256=digest_file(config["manifest"]))
     receipt = root / "request.json"
     if receipt.exists() and json.loads(receipt.read_text()) != request:
         raise ValueError("Evaluation settings/checkpoint changed. Use another output subfolder.")
@@ -379,6 +429,7 @@ def evaluate(checkpoint, output_root, split="val", *, device=None, coverage=None
                    active_fraction=float(result.active.mean()),
                    expert_tile_calls=int(result.dispatched_tiles),
                    expert_load=result.assignments.sum((0, 1)).cpu().tolist())
+        row.update(correction_diagnostics(result, target, mask))
         if save_images:
             image_path.parent.mkdir(parents=True, exist_ok=True)
             temporary = image_path.with_suffix(".tmp.npz")
