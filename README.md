@@ -28,6 +28,10 @@ error ranking, uniform coverage, and trust controls. It retains 128x128 -> 384x3
 geometry and provides compact epoch logs, checkpoint resume, validation screens,
 indexed outputs, and a results download. See
 [the rationale, protocol, and novelty limitations](learning/trust_moe/07_residual_recovery_v2.md).
+For your actual Landsat/Sentinel tile archives or an existing portable paired
+manifest, use [the tile recovery notebook](kaggle/GeoDiff_TrustMoE_Tiles_Residual_Recovery_3x.ipynb).
+It prepares raw products when needed, preserves fixed within-tile spatial splits,
+requires at least 10% test pairs, and reports results by scene class and source tile.
 
 Use [the new paired-tile preparation notebook](kaggle/Landsat_Sentinel_TrustMoE_Dataset_Preparation.ipynb),
 upload its exported dataset to Kaggle, then run

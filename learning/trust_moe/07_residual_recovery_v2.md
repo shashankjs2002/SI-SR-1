@@ -196,6 +196,14 @@ previous run, or provide exact `BASE_CHECKPOINTS`. Set epochs and batch size in 
 evaluation only after reviewing validation. A failed learning screen still allows
 the final bundle cell to run.
 
+For your own data, use
+`kaggle/GeoDiff_TrustMoE_Tiles_Residual_Recovery_3x.ipynb`. It accepts raw Landsat
+C2 L2 and Sentinel-2 L2A products/archives under `/kaggle/input`, or a portable
+prepared manifest. Raw inputs are paired, quarantined, and divided into fixed
+within-tile spatial train/validation/test regions with at least 10% test pairs.
+Scene classes come from directory names or explicit tile/product overrides and are
+used for reporting, not as forced router labels.
+
 The notebook saves metrics per image, bootstrap comparisons, module-gradient audits,
 correction/target ratios, routing utilization, training history, synchronized latency,
 parameter counts, plots, example LR/HR TIFFs, code, and best/last checkpoints. Exact

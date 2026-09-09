@@ -245,3 +245,25 @@ def test_new_notebook_executes_training_through_download(tmp_path, monkeypatch):
     # Indexed visualization defaults to test after the run, including LR and HR.
     scope["show_result"](0)
     assert (suite / "figures/test_42_000000.png").exists()
+
+
+def test_tile_recovery_notebook_is_clean_and_integrates_raw_preparation():
+    import ast
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[1]
+    notebook = json.loads((root / "kaggle/GeoDiff_TrustMoE_Tiles_Residual_Recovery_3x.ipynb").read_text())
+    source = "\n".join("".join(cell["source"]) for cell in notebook["cells"])
+    for cell in notebook["cells"]:
+        if cell["cell_type"] == "code":
+            ast.parse("".join(cell["source"]))
+            assert cell["outputs"] == [] and cell["execution_count"] is None
+    assert "git', 'clone'" in source and "3x-continued" in source
+    assert "prepare_landsat_sentinel" in source
+    assert "bandpass-adjustment', 'none'" in source
+    assert "spatial_audit=True" in source
+    assert "minimum_test_fraction=MINIMUM_TEST_FRACTION" in source
+    assert "scores['count'] != AUDIT['counts']['test']" in source
+    assert "sparse_gain" in source and "sparse_error" in source
+    assert "RUN_TEST_EVALUATION = False" in source
+    assert "GeoDiff_TrustMoE_Tiles_Residual_Recovery_3x.ipynb" in source
+    assert "100 official" not in source and "4,970" not in source
