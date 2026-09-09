@@ -65,7 +65,10 @@ def source_product_name(product: str | Path) -> str:
 def discover_safe_products(root: str | Path) -> list[Path]:
     root = Path(root)
     candidates = list(root.rglob("*.SAFE"))
-    if root.suffix.casefold() == ".safe":
+    # Kaggle and manually copied datasets sometimes strip the .SAFE suffix while
+    # retaining the complete Level-2A directory. Its contents define validity.
+    candidates.extend(path.parent for path in root.rglob("manifest.safe"))
+    if is_safe_product_root(root):
         candidates.insert(0, root)
     products: dict[str, Path] = {}
     for candidate in sorted(set(candidates)):

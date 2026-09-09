@@ -89,10 +89,11 @@ def build():
         CATEGORY_BY_PRODUCT = {
             # 'S2A_MSIL2A_202...': 'agriculture',
         }
+        DEFAULT_SCENE_CLASS = 'unlabeled'
 
         # Fixed data protocol. Change only for a new prepared-dataset version.
         PATCH_SIZE, PATCH_STRIDE = 384, 288
-        MAX_DAY_GAP = 3
+        MAX_DAY_GAP = 15  # The shown 2026-05-17 / 2026-05-27 pair is 10 days apart.
         MINIMUM_OVERLAP_FRACTION = 0.10
         MINIMUM_VALID_FRACTION = 0.95
         TRAIN_FRACTION, VALIDATION_FRACTION = 0.78, 0.10
@@ -277,7 +278,8 @@ def build():
                 matches = [(prefix, value) for prefix, value in CATEGORY_BY_PRODUCT.items()
                            if product.name.casefold().startswith(prefix.casefold())]
                 return (normalize_scene_class(max(matches, key=lambda x: len(x[0]))[1])
-                        if matches else infer_scene_class(product))
+                        if matches else (infer_scene_class(product) or
+                                         normalize_scene_class(DEFAULT_SCENE_CLASS)))
 
             pair_categories, pair_rows = {}, []
             for pair in pairs:
@@ -289,9 +291,12 @@ def build():
                     overlap=pair.overlap_fraction))
             pair_table = pd.DataFrame(pair_rows)
             display(pair_table)
-            if pair_table.empty or pair_table.scene_class.eq('UNLABELED').any():
-                display(pair_table[pair_table.scene_class.eq('UNLABELED')])
-                raise ValueError('Label every source using class directories or CATEGORY overrides')
+            if pair_table.empty:
+                raise RuntimeError('No date/overlap-compatible Landsat/Sentinel pair was found')
+            if pair_table.scene_class.eq('unlabeled').any():
+                print('Scene class is unknown; using unlabeled. Add a CATEGORY override only when known.')
+            if pair_table.day_gap.max() > 3:
+                print('WARNING: at least one pair is more than 3 days apart. Temporal land/atmosphere changes can limit attainable PSNR.')
             pair_table.to_csv(build / 'source_pairs.csv', index=False)
             print('Products:', len(sentinels), 'Sentinel,', len(landsats), 'Landsat')
             print('Compatible pairs:', len(pairs), 'unmatched Sentinel:', len(unmatched))

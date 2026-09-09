@@ -202,7 +202,13 @@ C2 L2 and Sentinel-2 L2A products/archives under `/kaggle/input`, or a portable
 prepared manifest. Raw inputs are paired, quarantined, and divided into fixed
 within-tile spatial train/validation/test regions with at least 10% test pairs.
 Scene classes come from directory names or explicit tile/product overrides and are
-used for reporting, not as forced router labels.
+used for reporting, not as forced router labels. Flat Kaggle product directories are
+accepted and receive the class `unlabeled`; the notebook does not guess land cover
+from the target. Complete Sentinel products are recognized from `manifest.safe` and
+`GRANULE` even if Kaggle strips the `.SAFE` directory suffix. The default 15-day
+pairing window includes the shown 10-day pair and records its day gap. Such temporal
+difference can lower attainable PSNR because real changes are not recoverable from
+the earlier image.
 
 The notebook saves metrics per image, bootstrap comparisons, module-gradient audits,
 correction/target ratios, routing utilization, training history, synchronized latency,

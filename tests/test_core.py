@@ -573,6 +573,14 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(canonical_product_id(wrapper), canonical_name)
             self.assertTrue(product_matches_prefix(product, ["AYODHYA"]))
 
+    def test_safe_discovery_accepts_suffixless_kaggle_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            product = root / "S2C_MSIL2A_20260517T050651_N0512_R019_T44QLL_20260517T101010"
+            (product / "GRANULE").mkdir(parents=True)
+            (product / "manifest.safe").write_text("", encoding="utf-8")
+            self.assertEqual(discover_safe_products(root), [product])
+
     def test_safe_product_split_reassignment_prevents_tile_leakage(self) -> None:
         records = [
             ManifestRecord(

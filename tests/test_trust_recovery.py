@@ -260,6 +260,8 @@ def test_tile_recovery_notebook_is_clean_and_integrates_raw_preparation():
     assert "git', 'clone'" in source and "3x-continued" in source
     assert "prepare_landsat_sentinel" in source
     assert "bandpass-adjustment', 'none'" in source
+    assert "MAX_DAY_GAP = 15" in source
+    assert "DEFAULT_SCENE_CLASS = 'unlabeled'" in source
     assert "spatial_audit=True" in source
     assert "minimum_test_fraction=MINIMUM_TEST_FRACTION" in source
     assert "scores['count'] != AUDIT['counts']['test']" in source
