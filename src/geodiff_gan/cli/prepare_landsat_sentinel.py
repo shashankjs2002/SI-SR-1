@@ -54,8 +54,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--include-multispectral",
         action="store_true",
         help=(
-            "Also store Landsat [R,G,B,NIR,SWIR1,SWIR2] as lr_ms for "
-            "six-channel conditioning."
+            "Also store matched [R,G,B,NIR,SWIR1,SWIR2] tensors as lr_ms "
+            "and hr_ms. Sentinel B11/B12 are resampled from 20 m to the "
+            "10 m target grid."
         ),
     )
     parser.add_argument("--max-pairs", type=int)

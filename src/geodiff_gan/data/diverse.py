@@ -38,7 +38,11 @@ def normalize_scene_class(value: str) -> str:
 
 def infer_scene_class(path: str | Path) -> str | None:
     """Infer a conservative class only from directory names, never image pixels."""
-    parts = [normalize_scene_class(part) for part in Path(path).parts if part]
+    parts = []
+    for part in Path(path).parts:
+        token = re.sub(r"[^a-z0-9]+", "_", str(part).strip().casefold()).strip("_")
+        if token:
+            parts.append(normalize_scene_class(token))
     matches = []
     for canonical, aliases in SCENE_CLASS_ALIASES.items():
         accepted = {canonical, *(normalize_scene_class(alias) for alias in aliases)}

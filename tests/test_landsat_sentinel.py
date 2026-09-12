@@ -164,6 +164,12 @@ class LandsatSentinelDatasetTest(unittest.TestCase):
     def test_scene_class_path_inference_is_conservative(self) -> None:
         self.assertEqual(infer_scene_class(Path("dataset") / "urban" / "tile"), "urban")
         self.assertEqual(infer_scene_class(Path("dataset") / "cropland" / "tile"), "agriculture")
+        self.assertIsNone(
+            infer_scene_class("/kaggle/input/jbp-sentinel/S2C_MSIL2A_product.SAFE")
+        )
+        self.assertEqual(
+            infer_scene_class("/kaggle/input/urban/S2C_MSIL2A_product.SAFE"), "urban"
+        )
         self.assertIsNone(infer_scene_class(Path("dataset") / "unknown" / "tile"))
         with self.assertRaises(ValueError):
             infer_scene_class(Path("dataset") / "urban" / "forest" / "tile")
@@ -216,6 +222,39 @@ class LandsatSentinelDatasetTest(unittest.TestCase):
             self.assertEqual(tuple(sample["lr_rgb"].shape), (3, 24, 24))
             self.assertTrue(np.allclose(sample["lr"].numpy(), lr_ms))
             self.assertTrue(np.allclose(sample["lr_rgb"].numpy(), lr))
+
+    def test_paired_dataset_loads_multispectral_input_and_target(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            patch = root / "pair_ms_target.npz"
+            rng = np.random.default_rng(23)
+            lr_ms = rng.random((6, 24, 24)).astype(np.float32)
+            hr_ms = rng.random((6, 72, 72)).astype(np.float32)
+            np.savez_compressed(
+                patch,
+                lr=lr_ms[:3],
+                hr=hr_ms[:3],
+                clean_lr=lr_ms[:3],
+                lr_ms=lr_ms,
+                clean_lr_ms=lr_ms,
+                hr_ms=hr_ms,
+                valid_mask_hr=np.ones((1, 72, 72), dtype=np.float32),
+                valid_mask_lr=np.ones((1, 24, 24), dtype=np.float32),
+            )
+            manifest = root / "manifest.jsonl"
+            write_manifest(manifest, [ManifestRecord(
+                patch=str(patch), tile_id="44RPQ", split="test", row=0,
+                col=0, valid_fraction=1.0, scale=3,
+            )])
+            sample = SentinelPatchDataset(
+                manifest, split="test", scale=3, condition_key="lr_ms",
+                target_key="hr_ms", input_mode="paired", output_channels=6,
+                augment=False,
+            )[0]
+            self.assertEqual(tuple(sample["lr"].shape), (6, 24, 24))
+            self.assertEqual(tuple(sample["hr"].shape), (6, 72, 72))
+            self.assertTrue(np.allclose(sample["lr"].numpy(), lr_ms))
+            self.assertTrue(np.allclose(sample["hr"].numpy(), hr_ms))
 
     def test_resize_conv_base_supports_three_x(self) -> None:
         model = SwinIRBase(

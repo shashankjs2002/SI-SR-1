@@ -47,6 +47,7 @@ LANDSAT_MULTISPECTRAL_LAYERS = (
 )
 LANDSAT_MULTISPECTRAL_BAND_NUMBERS = (4, 3, 2, 5, 6, 7)
 SENTINEL_RGB_BANDS = ("B04", "B03", "B02")
+SENTINEL_MULTISPECTRAL_BANDS = ("B04", "B03", "B02", "B08", "B11", "B12")
 
 # HLS v2 coefficients adjust Sentinel-2 MSI reflectance to the Landsat OLI
 # spectral reference. NASA currently publishes these coefficients for S2A/B.
@@ -260,7 +261,14 @@ def sentinel_radiometry(product: Path) -> tuple[float, dict[str, float]]:
                 fallback_offsets.append(float(text))
             else:
                 indexed_offsets[int(band_id)] = float(text)
-    band_indices = {"B02": 1, "B03": 2, "B04": 3}
+    band_indices = {
+        "B02": 1,
+        "B03": 2,
+        "B04": 3,
+        "B08": 7,
+        "B11": 11,
+        "B12": 12,
+    }
     offsets: dict[str, float] = {}
     for band, index in band_indices.items():
         if index in indexed_offsets:
@@ -401,6 +409,11 @@ def extract_pair_patches(
         raise ValueError("patch_size and stride must be divisible by 3")
     if patch_size % 8:
         raise ValueError("patch_size must be divisible by the VAE factor 8")
+    if include_multispectral and bandpass_adjustment != "none":
+        raise ValueError(
+            "Multispectral targets require --bandpass-adjustment none because "
+            "the configured HLS coefficients cover RGB only"
+        )
     lr_size = patch_size // 3
     sentinel = pair.sentinel
     landsat = pair.landsat
@@ -418,9 +431,14 @@ def extract_pair_patches(
     destination.mkdir(parents=True, exist_ok=True)
     quantification, sentinel_offsets = sentinel_radiometry(sentinel)
     platform = sentinel_platform(sentinel)
+    sentinel_bands = (
+        SENTINEL_MULTISPECTRAL_BANDS
+        if include_multispectral
+        else SENTINEL_RGB_BANDS
+    )
     sentinel_paths = [
         _find_band(sentinel, SENTINEL_BAND_PATTERNS[band])
-        for band in SENTINEL_RGB_BANDS
+        for band in sentinel_bands
     ]
     landsat_signal_layers = (
         LANDSAT_MULTISPECTRAL_LAYERS
@@ -465,10 +483,38 @@ def extract_pair_patches(
                 window = Window(col, row, patch_size, patch_size)
                 hr_transform = window_transform(window, reference.transform)
                 lr_transform = hr_transform * Affine.scale(3, 3)
-                sentinel_dn = np.stack(
-                    [dataset.read(1, window=window) for dataset in sentinel_datasets]
-                )
-                sentinel_valid = (sentinel_dn != 0).all(axis=0)
+                sentinel_dn = []
+                sentinel_band_valid = []
+                for dataset in sentinel_datasets:
+                    same_grid = (
+                        dataset.crs == reference.crs
+                        and dataset.transform == reference.transform
+                        and dataset.shape == reference.shape
+                    )
+                    if same_grid:
+                        values = dataset.read(1, window=window)
+                        valid_values = dataset.read_masks(1, window=window) > 0
+                    else:
+                        values = _reproject_band(
+                            rasterio.band(dataset, 1),
+                            (patch_size, patch_size),
+                            hr_transform,
+                            reference.crs,
+                            Resampling.bilinear,
+                            np.float32,
+                        )
+                        valid_values = _reproject_band(
+                            rasterio.band(dataset, 1),
+                            (patch_size, patch_size),
+                            hr_transform,
+                            reference.crs,
+                            Resampling.nearest,
+                            np.float32,
+                        ) != 0
+                    sentinel_dn.append(values)
+                    sentinel_band_valid.append(valid_values & (values != 0))
+                sentinel_dn = np.stack(sentinel_dn)
+                sentinel_valid = np.stack(sentinel_band_valid).all(axis=0)
                 scl_values = _reproject_band(
                     rasterio.band(scl, 1),
                     (patch_size, patch_size),
@@ -478,7 +524,7 @@ def extract_pair_patches(
                     np.uint8,
                 )
                 sentinel_valid &= ~np.isin(scl_values, list(INVALID_SCL_CLASSES))
-                hr = np.stack(
+                hr_all = np.stack(
                     [
                         sentinel_reflectance(
                             values,
@@ -488,7 +534,7 @@ def extract_pair_patches(
                             platform,
                             bandpass_adjustment,
                         )
-                        for values, band in zip(sentinel_dn, SENTINEL_RGB_BANDS)
+                        for values, band in zip(sentinel_dn, sentinel_bands)
                     ]
                 )
 
@@ -569,7 +615,8 @@ def extract_pair_patches(
                         )
                     ]
                 )
-                hr = np.clip(hr, 0, 1).astype(np.float32)
+                hr_all = np.clip(hr_all, 0, 1).astype(np.float32)
+                hr = hr_all[:3]
                 lr_all = np.clip(lr_all, 0, 1).astype(np.float32)
                 lr = lr_all[:3]
                 platform_condition = 1.0 if landsat.platform == "LC09" else 0.0
@@ -594,6 +641,7 @@ def extract_pair_patches(
                 if include_multispectral:
                     arrays["lr_ms"] = lr_all
                     arrays["clean_lr_ms"] = lr_all
+                    arrays["hr_ms"] = hr_all
                 np.savez_compressed(patch_path, **arrays)
                 records.append(
                     ManifestRecord(

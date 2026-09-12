@@ -127,6 +127,49 @@ def test_per_band_trust_oracle():
     assert local_trust_target(residual * 0, target, mask).count_nonzero() == 0
 
 
+def test_six_band_geometry_and_trust():
+    model = tiny_model(input_channels=6, output_channels=6).eval()
+    result = model(torch.rand(1, 6, 16, 16))
+    assert result.image.shape == (1, 6, 48, 48)
+    assert result.base.shape == result.residual.shape == result.trust.shape == result.image.shape
+    assert model.base_input_channels == model.output_channels == 6
+
+
+def test_six_band_training_and_index_evaluation(tmp_path):
+    records = []
+    for index, split in enumerate(("train", "val", "test")):
+        lr_ms = np.random.default_rng(index + 50).random((6, 24, 24), dtype=np.float32) * 0.8 + 0.1
+        hr_ms = np.repeat(np.repeat(lr_ms, 3, 1), 3, 2)
+        path = tmp_path / f"{split}_ms.npz"
+        np.savez_compressed(
+            path, lr=lr_ms[:3], hr=hr_ms[:3], lr_ms=lr_ms, hr_ms=hr_ms,
+            clean_lr=lr_ms[:3], clean_lr_ms=lr_ms,
+            valid_mask_lr=np.ones((1, 24, 24), np.float32),
+            valid_mask_hr=np.ones((1, 72, 72), np.float32),
+        )
+        records.append(ManifestRecord(str(path), "tile", split, 0, index * 100,
+                                      1.0, scale=3, scene_class="mixed"))
+    manifest = tmp_path / "manifest_ms.jsonl"
+    write_manifest(manifest, records)
+    config = make_config(
+        manifest, tmp_path / "base_ms", profile="base", epochs=1,
+        batch_size=1, crop_size=24, dataset_id="ms-fixture",
+        input_channels=6, output_channels=6, condition_key="lr_ms",
+        target_key="hr_ms",
+        band_names=("red", "green", "blue", "nir", "swir1", "swir2"),
+    )
+    config["model"].update(width=8, base_embed_dim=8, base_heads=2,
+                           base_depth=1, base_groups=1, router_depth=1)
+    config["training"].update(num_workers=0, amp=False, ema_decay=0.9)
+    checkpoint = train(config, "cpu")
+    result = evaluate(checkpoint, tmp_path / "evaluation_ms", split="test", device="cpu")
+    assert result["count"] == 1
+    assert all(key in result for key in (
+        "rgb_psnr", "red_psnr", "nir_psnr", "ndvi_mae",
+        "ndwi_mae", "ndbi_mae", "ndvi_mae_improvement_vs_bicubic",
+    ))
+
+
 def test_audit_crop_alignment_and_duplicates(tmp_path):
     manifest = fixture_manifest(tmp_path, size=64)
     report = prepare_manifest(manifest, tmp_path / "runtime.jsonl")

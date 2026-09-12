@@ -113,10 +113,13 @@ def prepare_manifest(source, destination, *, spatial_audit=True, minimum_test_fr
 
 def make_config(manifest, root, *, profile="sparse_transformer", seed=42,
                 epochs=15, batch_size=4, crop_size=64, experts=5, top_k=2,
-                dataset_id="", parent=None, base_model=None):
+                dataset_id="", parent=None, base_model=None, input_channels=3,
+                output_channels=3, condition_key="lr", target_key="hr",
+                band_names=None):
     if profile not in (*PROFILES, "base"):
         raise ValueError(profile)
     model = {"num_experts": experts, "top_k": top_k, "coverage": 0.5,
+             "input_channels": input_channels, "output_channels": output_channels,
              "router_kind": "transformer", "routing": "reliability", "use_trust": True}
     model.update(base_model or {})
     if profile == "single_expert":
@@ -134,6 +137,8 @@ def make_config(manifest, root, *, profile="sparse_transformer", seed=42,
     return {"format": "trust-moe-v1", "profile": profile, "seed": seed,
             "manifest": str(manifest), "dataset_id": dataset_id, "root": str(root),
             "model": model, "parent": str(parent) if parent else None,
+            "data": {"condition_key": condition_key, "target_key": target_key,
+                     "band_names": list(band_names or [])},
             "training": {"epochs": epochs, "batch_size": batch_size, "crop_size": crop_size,
                          "num_workers": 2, "learning_rate": 1e-4, "amp": True,
                          "ema_decay": 0.999, "exploration_epochs": 3},
@@ -145,8 +150,13 @@ def make_config(manifest, root, *, profile="sparse_transformer", seed=42,
 
 
 def dataset_for(config, split):
+    data = config.get("data", {})
+    model = config.get("model", {})
     return SentinelPatchDataset(config["manifest"], split, scale=3, input_mode="paired",
-                                condition_key="lr", augment=split == "train",
+                                condition_key=data.get("condition_key", "lr"),
+                                target_key=data.get("target_key", "hr"),
+                                output_channels=int(model.get("output_channels", 3)),
+                                augment=split == "train",
                                 random_degradation=False,
                                 paired_lr_crop_size=config["training"]["crop_size"] if split == "train" else None)
 
@@ -238,7 +248,14 @@ def train(config, device=None):
     optimizer = torch.optim.AdamW(parameters, lr=train_cfg["learning_rate"], weight_decay=0)
     scaler = torch.amp.GradScaler("cuda", enabled=amp)
     adversarial = float(config["losses"].get("adversarial", 0))
-    discriminator = PatchDiscriminator(base_channels=24).to(device) if adversarial and not base_only else None
+    discriminator = (
+        PatchDiscriminator(
+            base_channels=24,
+            output_channels=model.output_channels,
+            condition_channels=model.input_channels,
+        ).to(device)
+        if adversarial and not base_only else None
+    )
     d_optimizer = torch.optim.AdamW(discriminator.parameters(), lr=2e-5, weight_decay=0) if discriminator else None
     ema = {k: v.detach().clone() for k, v in model.state_dict().items()}
     start, best, optimizer_steps = 0, -float("inf"), 0
@@ -421,9 +438,33 @@ def evaluate(checkpoint, output_root, split="val", *, device=None, coverage=None
         record = dataset.records[index]
         row = {"index": index, "patch": record.patch, "tile_id": record.tile_id,
                "source_product": record.source_product, "scene_class": record.scene_class}
+        band_names = config.get("data", {}).get("band_names", [])
         for name, prediction in predictions.items():
             metrics = basic_metrics(prediction, target, lr, tensors["degradation"], scale=3,
                                     mask=mask, lr_mask=tensors["valid_mask_lr"])
+            if prediction.shape[1] > 3:
+                rgb_metrics = basic_metrics(
+                    prediction[:, :3], target[:, :3], lr[:, :3],
+                    tensors["degradation"], scale=3, mask=mask,
+                    lr_mask=tensors["valid_mask_lr"],
+                )
+                metrics.update({f"rgb_{key}": value for key, value in rgb_metrics.items()})
+            if band_names and len(band_names) == prediction.shape[1]:
+                from ..metrics import psnr
+
+                for channel, band in enumerate(band_names):
+                    metrics[f"{str(band).casefold()}_psnr"] = float(
+                        psnr(prediction[:, channel:channel + 1],
+                             target[:, channel:channel + 1], mask=mask)
+                    )
+                if {"red", "green", "nir", "swir1"}.issubset(
+                    {str(value).casefold() for value in band_names}
+                ):
+                    from ..spectral_indices import spectral_index_metrics
+
+                    metrics.update(spectral_index_metrics(
+                        prediction, target, lr, band_names, mask=mask
+                    ))
             row.update({key if name == "model" else f"{name}_{key}": value for key, value in metrics.items()})
         row.update(psnr_delta_vs_base=row["psnr"] - row["base_psnr"],
                    active_fraction=float(result.active.mean()),

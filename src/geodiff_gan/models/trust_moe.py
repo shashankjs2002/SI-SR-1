@@ -57,12 +57,12 @@ class ContextRouter(nn.Module):
 
 
 class ResidualTileExpert(nn.Module):
-    def __init__(self, width, scale, residual_bound):
+    def __init__(self, width, scale, residual_bound, output_channels=3):
         super().__init__()
         self.scale, self.bound = scale, residual_bound
         self.body = nn.Sequential(nn.Conv2d(width, width, 3, padding=1), nn.GELU(),
                                   nn.Conv2d(width, width, 3, padding=1), nn.GELU())
-        self.rgb = nn.Conv2d(width, 3, 3, padding=1)
+        self.rgb = nn.Conv2d(width, output_channels, 3, padding=1)
         # Small independent proposals give the gate a signal without a large initial correction.
         nn.init.normal_(self.rgb.weight, std=1e-3)
         nn.init.zeros_(self.rgb.bias)
@@ -86,16 +86,16 @@ class ExpertResidualBlock(nn.Module):
 class HRConditionedTileExpert(nn.Module):
     """Refine signed HR base detail, preserving spatial phase inside each tile."""
 
-    def __init__(self, width, scale, residual_bound, blocks=2):
+    def __init__(self, width, scale, residual_bound, blocks=2, output_channels=3):
         super().__init__()
         self.scale, self.bound = scale, residual_bound
         hidden = max(8, width // 2)
         self.body = nn.Sequential(*(ExpertResidualBlock(width) for _ in range(blocks)))
         self.project = nn.Conv2d(width, hidden, 1)
-        # HR cues: base RGB, signed high-pass RGB, and base-minus-bicubic RGB.
-        self.refine = nn.Sequential(nn.Conv2d(hidden + 9, hidden, 3, padding=1),
+        # HR cues: base bands, signed high-pass bands, and base-minus-bicubic bands.
+        self.refine = nn.Sequential(nn.Conv2d(hidden + 3 * output_channels, hidden, 3, padding=1),
                                      nn.GELU(), ExpertResidualBlock(hidden))
-        self.rgb = nn.Conv2d(hidden, 3, 3, padding=1)
+        self.rgb = nn.Conv2d(hidden, output_channels, 3, padding=1)
         nn.init.normal_(self.rgb.weight, std=0.01)
         nn.init.zeros_(self.rgb.bias)
 
@@ -112,7 +112,8 @@ class TrustMoESR(nn.Module):
     selected feature tiles (including their halos) enter expert networks.
     """
 
-    def __init__(self, scale=3, input_channels=3, width=32, num_experts=5, top_k=2,
+    def __init__(self, scale=3, input_channels=3, output_channels=3,
+                 base_input_channels=None, width=32, num_experts=5, top_k=2,
                  tile_size=8, halo=4, coverage=0.5, router_kind="transformer",
                  router_depth=2, routing="reliability", use_trust=True,
                  residual_bound=0.1, base_embed_dim=32, base_depth=2,
@@ -122,7 +123,10 @@ class TrustMoESR(nn.Module):
         super().__init__()
         if not 1 <= top_k <= num_experts or not 0 <= coverage <= 1:
             raise ValueError("Require 1 <= top_k <= num_experts and 0 <= coverage <= 1")
-        if tile_size < 2 or halo < 3 or input_channels < 3 or dispatch_chunk < 1:
+        base_input_channels = output_channels if base_input_channels is None else int(base_input_channels)
+        if (tile_size < 2 or halo < 3 or output_channels < 3
+                or base_input_channels < output_channels
+                or input_channels < base_input_channels or dispatch_chunk < 1):
             raise ValueError("Invalid tile geometry, input channels or dispatch chunk")
         if routing not in ("reliability", "uniform"):
             raise ValueError("routing must be reliability or uniform")
@@ -131,6 +135,7 @@ class TrustMoESR(nn.Module):
         if expert_kind == "hr_residual" and halo < 2 * expert_blocks + 2:
             raise ValueError("HR-conditioned experts need halo >= 2 * expert_blocks + 2")
         self.scale, self.input_channels = scale, input_channels
+        self.output_channels, self.base_input_channels = output_channels, base_input_channels
         self.num_experts, self.top_k = num_experts, top_k
         self.tile_size, self.halo, self.coverage = tile_size, halo, coverage
         self.routing, self.use_trust = routing, use_trust
@@ -138,20 +143,27 @@ class TrustMoESR(nn.Module):
         self.adaptive_k = adaptive_k
         self.expert_kind = expert_kind
         self.detach_router_features = detach_router_features
-        self.base = ResidualSwinBase(3, base_embed_dim, base_depth, base_heads,
-                                    window_size, scale, 3, base_groups)
+        self.base = ResidualSwinBase(base_input_channels, base_embed_dim, base_depth,
+                                    base_heads, window_size, scale, output_channels,
+                                    base_groups)
         # Cues are observable at inference: LR, base on LR grid, HF energy,
         # base-vs-observation discrepancy, and LR local variation.
-        self.encoder = nn.Sequential(nn.Conv2d(input_channels + 10, width, 3, padding=1),
+        cue_channels = input_channels + 3 * output_channels + 1
+        self.encoder = nn.Sequential(nn.Conv2d(cue_channels, width, 3, padding=1),
                                      nn.GELU(), nn.Conv2d(width, width, 3, padding=1),
                                      nn.GELU())
         self.router = ContextRouter(width, num_experts, router_kind, depth=router_depth)
         self.experts = nn.ModuleList([
-            HRConditionedTileExpert(width, scale, residual_bound, expert_blocks)
-            if expert_kind == "hr_residual" else ResidualTileExpert(width, scale, residual_bound)
+            HRConditionedTileExpert(width, scale, residual_bound, expert_blocks,
+                                    output_channels)
+            if expert_kind == "hr_residual" else ResidualTileExpert(
+                width, scale, residual_bound, output_channels
+            )
             for _ in range(num_experts)])
-        self.trust_head = nn.Sequential(nn.Conv2d(width + 6, width, 1), nn.GELU(),
-                                        nn.Conv2d(width, 3, 1))
+        self.trust_head = nn.Sequential(
+            nn.Conv2d(width + 2 * output_channels, width, 1), nn.GELU(),
+            nn.Conv2d(width, output_channels, 1)
+        )
         nn.init.constant_(self.trust_head[-1].bias, 1.0)
         self.freeze_base()
 
@@ -175,7 +187,11 @@ class TrustMoESR(nn.Module):
         t, s, halo = self.tile_size, self.scale, self.halo
         gh, gw = math.ceil(h / t), math.ceil(w / t)
         n, ph, pw = gh * gw, gh * t, gw * t
-        base = self.base(lr[:, :3])
+        if lr.shape[1] < self.input_channels:
+            raise ValueError(
+                f"Expected at least {self.input_channels} LR channels, got {lr.shape[1]}"
+            )
+        base = self.base(lr[:, :self.base_input_channels])
         if base_only or residual_scale == 0 or coverage == 0:
             zeros = base.new_zeros(b, n)
             return TrustMoEOutput(base, base, torch.zeros_like(base), torch.zeros_like(base),
@@ -184,8 +200,9 @@ class TrustMoESR(nn.Module):
         small_base = F.interpolate(base, size=(h, w), mode="area")
         hf = base - F.avg_pool2d(base, 5, 1, 2)
         small_hf = F.interpolate(hf.abs(), size=(h, w), mode="area")
-        variation = (lr[:, :3] - F.avg_pool2d(lr[:, :3], 3, 1, 1)).abs().mean(1, keepdim=True)
-        discrepancy = small_base - lr[:, :3]
+        observed = lr[:, :self.output_channels]
+        variation = (observed - F.avg_pool2d(observed, 3, 1, 1)).abs().mean(1, keepdim=True)
+        discrepancy = small_base - observed
         cues = torch.cat((lr, small_base, small_hf, discrepancy, variation), 1)
         features = self.encoder(cues)
         padded = F.pad(features, (0, pw - w, 0, ph - h), mode="replicate")
@@ -231,13 +248,13 @@ class TrustMoESR(nn.Module):
         hr_patches = None
         if self.expert_kind == "hr_residual":
             smooth = F.avg_pool2d(F.pad(base.float(), (2, 2, 2, 2), mode="replicate"), 5, 1)
-            anchor = F.interpolate(lr[:, :3], size=base.shape[-2:], mode="bicubic", align_corners=False)
+            anchor = F.interpolate(observed, size=base.shape[-2:], mode="bicubic", align_corners=False)
             hr_cues = torch.cat((base.float(), base.float() - smooth, base.float() - anchor), 1)
             hr_cues = F.pad(hr_cues, (0, (pw - w) * s, 0, (ph - h) * s), mode="replicate")
             hr_patches = F.pad(hr_cues, (halo * s,) * 4, mode="replicate")
             hr_patches = hr_patches.unfold(2, (t + 2 * halo) * s, t * s).unfold(3, (t + 2 * halo) * s, t * s)
             hr_patches = hr_patches.permute(0, 2, 3, 1, 4, 5)
-        merged = base.new_zeros(b * n, 3, t * s, t * s)
+        merged = base.new_zeros(b * n, self.output_channels, t * s, t * s)
         dispatched = assignments.sum().long()
         for k, expert in enumerate(self.experts):
             batch_ids, token_ids = torch.where(assignments[..., k] > 0)
@@ -250,8 +267,10 @@ class TrustMoESR(nn.Module):
                 proposal = proposal[:, :, offset:offset + t * s, offset:offset + t * s]
                 weight = gates[bi, ti, k, None, None, None].to(proposal.dtype)
                 merged = merged.index_add(0, bi * n + ti, (proposal * weight).to(merged.dtype))
-        residual = merged.reshape(b, gh, gw, 3, t * s, t * s)
-        residual = residual.permute(0, 3, 1, 4, 2, 5).reshape(b, 3, ph * s, pw * s)
+        residual = merged.reshape(b, gh, gw, self.output_channels, t * s, t * s)
+        residual = residual.permute(0, 3, 1, 4, 2, 5).reshape(
+            b, self.output_channels, ph * s, pw * s
+        )
         residual = residual[:, :, :h * s, :w * s]
         active = active_tokens.reshape(b, 1, gh, gw).repeat_interleave(t * s, 2).repeat_interleave(t * s, 3)
         active = active[:, :, :h * s, :w * s]
